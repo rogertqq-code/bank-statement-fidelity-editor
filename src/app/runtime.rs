@@ -523,14 +523,17 @@ pub enum JobResult {
 }
 
 impl JobResult {
+    /// True only for results that definitively end a tracked job lifecycle.
+    /// Intermediate payloads must be enumerated by consumers, not inferred as
+    /// terminal merely because they are not progress messages.
     pub fn is_terminal(&self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Self::Progress { .. }
-                | Self::WorkflowStageChanged { .. }
-                | Self::WorkflowParseValidated { .. }
-                | Self::FontCascadeUsed(_)
-                | Self::WatchdogEvent(_)
+            Self::Error { .. }
+                | Self::Cancelled { .. }
+                | Self::WorkflowComplete(_)
+                | Self::WorkflowFailed(_)
+                | Self::JobCompleted(_)
         )
     }
 }
@@ -555,10 +558,28 @@ impl TerminalTracker {
 
     #[allow(clippy::result_large_err)]
     pub fn send(&self, res: JobResult) -> Result<(), std::sync::mpsc::SendError<JobResult>> {
-        if res.is_terminal() {
-            self.0
+        use std::sync::atomic::Ordering;
+
+        if self.0.terminal_sent.load(Ordering::Acquire) {
+            tracing::warn!(
+                "[runtime] suppressing result emitted after terminal event for {}: {:?}",
+                self.0.label,
+                res
+            );
+            return Ok(());
+        }
+        if res.is_terminal()
+            && self
+                .0
                 .terminal_sent
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            tracing::warn!(
+                "[runtime] suppressing duplicate terminal event for {}: {:?}",
+                self.0.label,
+                res
+            );
+            return Ok(());
         }
         self.0.tx.send(res)
     }
@@ -568,7 +589,7 @@ impl Drop for TerminalTrackerInner {
     fn drop(&mut self) {
         if !self
             .terminal_sent
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::Acquire)
         {
             let _ = self.tx.send(JobResult::Error {
                 job_label: self.label.clone(),
@@ -4967,6 +4988,8 @@ async fn process_job_inner(
                                     fraction: 1.0,
                                 });
                             }
+                            let _ =
+                                res_tx.send(JobResult::JobCompleted("BalanceAndApplyAll".into()));
                         }
                         Err(crate::engine::statement::EngineError::LowConfidence(c)) => {
                             let _ = res_tx.send(JobResult::Error { job_label: "balance_and_apply_all".into(), message: format!("Gemini confidence {c:.2} below 0.7 threshold; not enough certainty to auto-apply adjustments.") });
@@ -5061,6 +5084,7 @@ async fn process_job_inner(
                             fraction: 1.0,
                         });
                     }
+                    let _ = res_tx.send(JobResult::JobCompleted("BalanceAndApplyAll".into()));
                 }
             });
         }
@@ -6984,6 +7008,12 @@ async fn process_job_inner(
                                         is_borderline,
                                     },
                             });
+                            let _ = res_tx.send(JobResult::WorkflowFailed(
+                                crate::engine::workflow::WorkflowFailure::VisualNotConverged {
+                                    last_score: report.visual_diff_score,
+                                    attempts: attempt,
+                                },
+                            ));
                             return;
                         } else {
                             // Vision flagged something -> retry with
@@ -7153,14 +7183,14 @@ async fn process_job_inner(
                                 ),
                             };
                 rollback.commit();
-                let _ = res_tx.send(JobResult::WorkflowComplete(outcome.clone()));
                 let _ = res_tx.send(JobResult::WorkflowStageChanged {
-                    stage: crate::engine::workflow::WorkflowStage::Complete(outcome),
+                    stage: crate::engine::workflow::WorkflowStage::Complete(outcome.clone()),
                 });
                 let _ = res_tx.send(JobResult::Progress {
                     label: "Done".into(),
                     fraction: 1.0,
                 });
+                let _ = res_tx.send(JobResult::WorkflowComplete(outcome));
 
                 // Stage 4 / Item #13: refine the matched bank template
                 // from the actual edited bboxes. Background task - we
@@ -7292,6 +7322,112 @@ mod tests {
         let c = alloc_job_id();
         assert!(a < b);
         assert!(b < c);
+    }
+
+    #[test]
+    fn job_result_terminal_classification_is_explicit() {
+        let intermediate =
+            JobResult::WorkflowVisualAttempt(crate::engine::workflow::VisualAttempt {
+                attempt: 1,
+                max_attempts: 3,
+                diff_score: 0.01,
+                threshold: 0.02,
+                only_intended: true,
+                message: "intermediate".into(),
+            });
+        assert!(!intermediate.is_terminal());
+        assert!(!JobResult::WorkflowParseValidated {
+            validation: crate::engine::workflow::ParseValidation {
+                total_pages: 1,
+                transactions_found: 1,
+                opening_balance: rust_decimal::Decimal::ZERO,
+                closing_balance: rust_decimal::Decimal::ZERO,
+                account_number: None,
+                completeness_score: 1.0,
+                completeness_notes: String::new(),
+                missing_rows: Vec::new(),
+            },
+            transactions: Vec::new(),
+        }
+        .is_terminal());
+        assert!(
+            JobResult::WorkflowFailed(crate::engine::workflow::WorkflowFailure::Other(
+                "failed".into()
+            ))
+            .is_terminal()
+        );
+        assert!(JobResult::JobCompleted("done".into()).is_terminal());
+    }
+
+    #[test]
+    fn terminal_tracker_emits_exactly_one_terminal_and_suppresses_followups() {
+        let (tx, rx) = mpsc::channel();
+        let tracker = TerminalTracker::new(tx, "exactly-once-test");
+        tracker
+            .send(JobResult::WorkflowVisualAttempt(
+                crate::engine::workflow::VisualAttempt {
+                    attempt: 1,
+                    max_attempts: 3,
+                    diff_score: 0.01,
+                    threshold: 0.02,
+                    only_intended: true,
+                    message: "intermediate".into(),
+                },
+            ))
+            .unwrap();
+        tracker
+            .send(JobResult::WorkflowFailed(
+                crate::engine::workflow::WorkflowFailure::Other("expected failure".into()),
+            ))
+            .unwrap();
+        tracker
+            .send(JobResult::Error {
+                job_label: "duplicate".into(),
+                message: "must be suppressed".into(),
+            })
+            .unwrap();
+        tracker
+            .send(JobResult::Progress {
+                label: "after terminal".into(),
+                fraction: 1.0,
+            })
+            .unwrap();
+        drop(tracker);
+
+        let results: Vec<_> = rx.try_iter().collect();
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0], JobResult::WorkflowVisualAttempt(_)));
+        assert!(matches!(results[1], JobResult::WorkflowFailed(_)));
+        assert_eq!(
+            results.iter().filter(|result| result.is_terminal()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_tracker_drop_emits_one_failure_after_only_intermediate_results() {
+        let (tx, rx) = mpsc::channel();
+        let tracker = TerminalTracker::new(tx, "silent-task");
+        tracker
+            .send(JobResult::Progress {
+                label: "started".into(),
+                fraction: 0.1,
+            })
+            .unwrap();
+        drop(tracker);
+
+        let results: Vec<_> = rx.try_iter().collect();
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0], JobResult::Progress { .. }));
+        assert!(matches!(
+            &results[1],
+            JobResult::Error { job_label, message }
+                if job_label == "silent-task" && message.contains("without a terminal result")
+        ));
+        assert_eq!(
+            results.iter().filter(|result| result.is_terminal()).count(),
+            1
+        );
     }
 
     #[test]
