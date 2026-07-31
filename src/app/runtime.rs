@@ -3846,10 +3846,16 @@ async fn process_job_inner(
                             "[runtime] LRU cache HIT for ExtractTransactions: {}",
                             cache_key
                         );
-                        let _ = res_tx.send(JobResult::TransactionsExtracted(
-                            cached_stmt.transactions.clone(),
-                        ));
-                        return;
+                        if !cached_stmt.transactions.is_empty() {
+                            let _ = res_tx.send(JobResult::TransactionsExtracted(
+                                cached_stmt.transactions.clone(),
+                            ));
+                            return;
+                        }
+                        tracing::warn!(
+                            "[runtime] ignoring invalid zero-row extraction cache entry: {}",
+                            cache_key
+                        );
                     }
                 }
 
@@ -3981,6 +3987,15 @@ async fn process_job_inner(
                         return;
                     }
                 };
+
+                if report.transactions.is_empty() {
+                    let _ = res_tx.send(JobResult::Error {
+                        job_label: "extract_transactions".into(),
+                        message: "Extraction incomplete: no transaction rows were found. No empty result was published."
+                            .into(),
+                    });
+                    return;
+                }
 
                 let mut full_stmt = crate::ai::document_ai::BankStatement {
                     total_pages: 0,
@@ -4163,6 +4178,15 @@ async fn process_job_inner(
                         }
                         stmt_res
                     };
+
+                    if stmt.transactions.is_empty() {
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "balance_statement".into(),
+                            message: "Balance analysis incomplete: no transaction rows were found. The statement cannot be declared balanced."
+                                .into(),
+                        });
+                        return;
+                    }
 
                     let _ = res_tx.send(JobResult::Progress {
                         label: "Computing balance chain locally...".to_string(),
@@ -5037,6 +5061,15 @@ async fn process_job_inner(
                             return;
                         }
                     };
+
+                    if stmt.transactions.is_empty() {
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "balance_and_apply_all".into(),
+                            message: "Balance analysis incomplete: no transaction rows were found. No changes were proposed or applied."
+                                .into(),
+                        });
+                        return;
+                    }
 
                     let _ = res_tx.send(JobResult::Progress {
                         label: "Computing balance chain locally...".to_string(),

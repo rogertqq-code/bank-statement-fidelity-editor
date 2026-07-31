@@ -168,3 +168,65 @@ fn confirm_and_render_rejects_unbalanced_ledger_before_output_mutation() {
     assert!(rejected, "missing deterministic imbalance rejection");
     assert_eq!(std::fs::read(&output).unwrap(), output_before);
 }
+
+#[test]
+fn zero_row_statement_is_never_reported_as_extraction_or_balance_success() {
+    let workspace = tempfile::tempdir().unwrap();
+    let input = workspace.path().join("non-statement.pdf");
+    fixtures::generate_test_pdf(2, &input);
+
+    let config = Arc::new(dual_core_pdf_pipeline::app::config::AppConfig::default());
+    let audit_log = dual_core_pdf_pipeline::app::audit::AuditLog::open(workspace.path()).unwrap();
+    let (_runtime, job_tx, result_rx) =
+        dual_core_pdf_pipeline::app::runtime::Runtime::start(audit_log, config);
+
+    job_tx
+        .send(Job::ExtractTransactions {
+            path: input.clone(),
+        })
+        .unwrap();
+    let extract_deadline = Instant::now() + Duration::from_secs(45);
+    let mut extraction_rejected = false;
+    while Instant::now() < extract_deadline {
+        match result_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(JobResult::TransactionsExtracted(transactions)) => {
+                panic!("zero-row fixture reported extraction success: {transactions:?}")
+            }
+            Ok(JobResult::Error { job_label, message }) if job_label == "extract_transactions" => {
+                assert!(message.contains("no transaction rows"));
+                extraction_rejected = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("result channel failed: {error}"),
+        }
+    }
+    assert!(extraction_rejected, "zero-row extraction did not fail");
+
+    job_tx
+        .send(Job::BalanceStatement {
+            path: input.clone(),
+        })
+        .unwrap();
+    let balance_deadline = Instant::now() + Duration::from_secs(45);
+    let mut balance_rejected = false;
+    while Instant::now() < balance_deadline {
+        match result_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(JobResult::BalanceProposed { imbalance, changes }) => {
+                panic!(
+                    "zero-row fixture reported balance success: imbalance={imbalance}, changes={changes:?}"
+                )
+            }
+            Ok(JobResult::Error { job_label, message }) if job_label == "balance_statement" => {
+                assert!(message.contains("no transaction rows"));
+                balance_rejected = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("result channel failed: {error}"),
+        }
+    }
+    assert!(balance_rejected, "zero-row balance analysis did not fail");
+}

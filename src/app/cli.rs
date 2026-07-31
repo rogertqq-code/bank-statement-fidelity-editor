@@ -943,9 +943,10 @@ pub fn run_inner(
                     }
 
                     if auto_approve {
+                        let expected_changes = changes.len();
                         println!(
                             "\n--auto-approve flag is set. Applying all {} changes...",
-                            changes.len()
+                            expected_changes
                         );
                         let _ = job_tx.send(Job::ApplyProposedChanges {
                             input,
@@ -958,14 +959,32 @@ pub fn run_inner(
                                 changes_applied,
                                 failures,
                             }) => {
-                                println!("✅ Successfully applied {changes_applied} changes.");
                                 if !failures.is_empty() {
-                                    eprintln!("⚠️ {} change(s) failed:", failures.len());
-                                    for (i, f) in failures.iter().enumerate() {
-                                        eprintln!("   {}. {}", i + 1, f);
+                                    eprintln!("❌ {} change(s) failed:", failures.len());
+                                    for (i, failure) in failures.iter().enumerate() {
+                                        eprintln!("   {}. {}", i + 1, failure);
                                     }
                                     return Ok(1);
                                 }
+                                if changes_applied != expected_changes {
+                                    tracing::error!(
+                                        "❌ Exact apply count mismatch: requested {}, applied {}",
+                                        expected_changes,
+                                        changes_applied
+                                    );
+                                    return Ok(1);
+                                }
+                                let output_is_durable = std::fs::metadata(&output)
+                                    .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                                    .unwrap_or(false);
+                                if !output_is_durable {
+                                    tracing::error!(
+                                        "❌ Runtime reported success but the requested output artifact is missing or empty: {:?}",
+                                        output
+                                    );
+                                    return Ok(1);
+                                }
+                                println!("✅ Successfully applied {changes_applied} changes.");
                                 println!("Output saved to: {output:?}");
                                 Ok(0)
                             }

@@ -133,6 +133,11 @@ impl SmartDocumentEngine {
         // 3. Hybrid Merge
         let report = self.merger.merge(bank_stmt.transactions, geometries);
         self.all_transactions = report.transactions.clone();
+        if self.all_transactions.is_empty() {
+            return Err(EngineError::AiPlanFailed(
+                "balance analysis incomplete: no transaction rows were found".into(),
+            ));
+        }
 
         // 4. Calculate current global balance status
         let imbalance = self.calculate_global_imbalance();
