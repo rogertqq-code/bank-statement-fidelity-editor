@@ -219,6 +219,14 @@ impl AuditLog {
         Ok((object_path, evidence))
     }
 
+    pub fn verify_artifact_matches_snapshot(
+        &self,
+        artifact: &Path,
+        evidence: &crate::engine::history::SnapshotEvidence,
+    ) -> AuditResult<()> {
+        verify_snapshot_file(artifact, &evidence.sha256, evidence.size_bytes)
+    }
+
     pub fn verify_snapshot_record(&self, record: &ChangeRecord) -> AuditResult<()> {
         let path = record.snapshot_path.as_ref().ok_or_else(|| {
             AuditError::snapshot(

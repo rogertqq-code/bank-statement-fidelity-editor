@@ -3,6 +3,7 @@
 pub mod api_verification;
 pub mod audit;
 pub mod cli;
+pub mod commit;
 pub mod config;
 pub mod config_v2;
 pub mod env_spec;

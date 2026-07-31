@@ -5,7 +5,7 @@ use crate::engine::segments::{GlobalEdit, SegmentManager, SegmentMap};
 use crate::pdf::engine::PdfEngine;
 use crate::pdf::ReplaceOutcome;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -3503,11 +3503,30 @@ async fn process_job_inner(
                     }
                 }
 
-                // Run blocking apply_change with cloned-only inputs.
+                // Every mutation is staged first. The live output and segment
+                // files remain untouched until the complete commit barrier passes.
                 let input_for_blocking = input.clone();
-                let output_for_blocking = output.clone();
                 let new_text_for_blocking = new_text.clone();
                 let old_text_for_blocking = old_text.clone();
+                let output_parent = output
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let staged_output = match crate::app::commit::staging_path(
+                    output_parent,
+                    ".dcpp-output-",
+                    ".pdf",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_change".into(),
+                            message: format!("Failed to create staged output: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let staged_output_for_blocking = staged_output.to_path_buf();
 
                 let outcome = tokio::task::spawn_blocking(move || {
                     if let (Some(map), Some(temp_dir)) = (map_opt, mgr_opt) {
@@ -3517,14 +3536,21 @@ async fn process_job_inner(
                             ))
                         })?;
 
-                        let seg_path = &map.segments[seg_idx].path;
-                        let temp_seg_out =
-                            temp_dir.join(format!("seg_{}_edited_{}.pdf", seg_idx, Uuid::new_v4()));
+                        let segment_path = map.segments[seg_idx].path.clone();
+                        let staged_segment = crate::app::commit::staging_path(
+                            &temp_dir,
+                            &format!(".dcpp-segment-{seg_idx}-"),
+                            ".pdf",
+                        )
+                        .map_err(|error| {
+                            crate::pdf::EngineError::ApplyFailed(format!(
+                                "Failed to create staged segment: {error}"
+                            ))
+                        })?;
 
-                        // 1. Apply to segment
                         eng.apply_change(
-                            seg_path,
-                            &temp_seg_out,
+                            &segment_path,
+                            staged_segment.as_ref(),
                             local_page,
                             bbox,
                             &new_text_for_blocking,
@@ -3532,41 +3558,38 @@ async fn process_job_inner(
                             font_path.as_deref(),
                         )?;
 
-                        // 2. Overwrite segment file
-                        std::fs::rename(&temp_seg_out, seg_path).map_err(|e| {
-                            crate::pdf::EngineError::ApplyFailed(format!(
-                                "Failed to update segment file: {e}"
-                            ))
-                        })?;
-
-                        // 3. Merge all segments to final output
-                        let ordered_paths = map.ordered_merge_paths();
+                        let mut ordered_paths = map.ordered_merge_paths();
+                        ordered_paths[seg_idx] = staged_segment.to_path_buf();
                         crate::engine::pdf_split_merge::merge_pdfs(
                             &ordered_paths,
-                            &output_for_blocking,
+                            &staged_output_for_blocking,
                         )
-                        .map_err(|e| {
+                        .map_err(|error| {
                             crate::pdf::EngineError::ApplyFailed(format!(
-                                "Failed to merge segments: {e}"
+                                "Failed to merge staged segments: {error}"
                             ))
                         })?;
 
-                        Ok(ReplaceOutcome {
-                            success: true,
-                            font_used: "Helvetica".into(),
-                            overflow: false,
-                            obj_id: None,
-                        })
+                        Ok((
+                            ReplaceOutcome {
+                                success: true,
+                                font_used: "Helvetica".into(),
+                                overflow: false,
+                                obj_id: None,
+                            },
+                            Some((staged_segment, segment_path)),
+                        ))
                     } else {
                         eng.apply_change(
                             &input_for_blocking,
-                            &output_for_blocking,
+                            &staged_output_for_blocking,
                             page,
                             bbox,
                             &new_text_for_blocking,
                             &old_text_for_blocking,
                             font_path.as_deref(),
                         )
+                        .map(|result| (result, None))
                     }
                 })
                 .await
@@ -3577,7 +3600,7 @@ async fn process_job_inner(
                 });
 
                 match outcome {
-                    Ok(o) => {
+                    Ok((o, staged_segment_update)) => {
                         let requires_visual_review = o.overflow;
                         let mut h = match history_clone.lock() {
                             Ok(g) => g,
@@ -3610,13 +3633,10 @@ async fn process_job_inner(
                         );
                         final_record.obj_id = o.obj_id;
 
-                        // Historical evidence is stored as a content-addressed,
-                        // independently allocated object with a hash/size/parent
-                        // manifest that must verify before the audit record is written.
                         let (snapshot_path, snapshot_evidence) = match a
                             .create_content_addressed_snapshot(
                                 final_record.id,
-                                &output,
+                                staged_output.as_ref(),
                                 Some(&input),
                             ) {
                             Ok(snapshot) => snapshot,
@@ -3629,7 +3649,7 @@ async fn process_job_inner(
                             }
                         };
                         final_record.snapshot_path = Some(snapshot_path);
-                        final_record.snapshot_evidence = Some(snapshot_evidence);
+                        final_record.snapshot_evidence = Some(snapshot_evidence.clone());
                         if let Err(error) = a.verify_snapshot_record(&final_record) {
                             let _ = res_tx.send(JobResult::Error {
                                 job_label: "apply_change".into(),
@@ -3637,7 +3657,78 @@ async fn process_job_inner(
                             });
                             return;
                         }
-                        if let Err(e) = a.write(
+
+                        let mut staged_history_state = h.clone();
+                        staged_history_state.push_record(final_record.clone());
+                        let autosave_path = PathBuf::from("audit").join("history.json");
+                        let autosave_parent = autosave_path
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."));
+                        let staged_history = match crate::app::commit::staging_path(
+                            autosave_parent,
+                            ".dcpp-history-",
+                            ".json",
+                        ) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                let _ = res_tx.send(JobResult::Error {
+                                    job_label: "apply_change".into(),
+                                    message: format!("History staging failed: {error}"),
+                                });
+                                return;
+                            }
+                        };
+                        if let Err(error) =
+                            staged_history_state.save_to_file(staged_history.as_ref())
+                        {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_change".into(),
+                                message: format!("History staging failed: {error}"),
+                            });
+                            return;
+                        }
+
+                        let mut commit_barrier = crate::app::commit::FileCommitBarrier::new();
+                        if let Some((staged_segment, segment_path)) = staged_segment_update.as_ref()
+                        {
+                            if let Err(error) =
+                                commit_barrier.publish(staged_segment.as_ref(), segment_path)
+                            {
+                                let _ = res_tx.send(JobResult::Error {
+                                    job_label: "apply_change".into(),
+                                    message: format!("Segment commit failed: {error}"),
+                                });
+                                return;
+                            }
+                        }
+                        if let Err(error) = commit_barrier.publish(staged_output.as_ref(), &output)
+                        {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_change".into(),
+                                message: format!("Output commit failed: {error}"),
+                            });
+                            return;
+                        }
+                        if let Err(error) =
+                            a.verify_artifact_matches_snapshot(&output, &snapshot_evidence)
+                        {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_change".into(),
+                                message: format!("Published output verification failed: {error}"),
+                            });
+                            return;
+                        }
+                        if let Err(error) =
+                            commit_barrier.publish(staged_history.as_ref(), &autosave_path)
+                        {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_change".into(),
+                                message: format!("History commit failed: {error}"),
+                            });
+                            return;
+                        }
+                        if let Err(error) = a.write(
                             &final_record,
                             &input,
                             &output,
@@ -3646,18 +3737,14 @@ async fn process_job_inner(
                         ) {
                             let _ = res_tx.send(JobResult::Error {
                                 job_label: "apply_change".into(),
-                                message: format!("Audit write failed: {e}"),
+                                message: format!("Audit commit failed: {error}"),
                             });
                             return;
                         }
 
-                        h.push_record(final_record.clone());
-                        // Best-effort autosave so the user can resume the session.
-                        let autosave_path = std::path::PathBuf::from("audit").join("history.json");
-                        if let Err(e) = h.save_to_file(&autosave_path) {
-                            tracing::warn!("[apply_change] autosave history failed: {}", e);
-                        }
-                        // Fire-and-forget webhook notification if configured.
+                        commit_barrier.commit();
+                        *h = staged_history_state;
+
                         if let Some(url) = cfg_clone.webhook_url.clone() {
                             let old = final_record.old_text.clone();
                             let new = final_record.new_text.clone();
@@ -3677,11 +3764,11 @@ async fn process_job_inner(
                                 .await;
                             });
                         }
+                        let h_final = h.clone();
                         let _ = res_tx.send(JobResult::ChangeApplied {
                             record: final_record,
                             requires_visual_review,
                         });
-                        let h_final = h.clone();
                         let _ = res_tx.send(JobResult::HistoryUpdated { history: h_final });
                         let _ = res_tx.send(JobResult::Progress {
                             label: "Done".to_string(),
