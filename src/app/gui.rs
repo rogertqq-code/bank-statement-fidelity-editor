@@ -3389,7 +3389,6 @@ impl MyApp {
             self.workflow_edits.push(edit);
         }
         self.workflow_dirty = true;
-        self.dispatch_instant_background_apply();
     }
 
     /// Drop every queued edit on (page, line) and reset the cell buffers
@@ -3414,27 +3413,6 @@ impl MyApp {
                     line_on_page + 1
                 ),
             );
-            self.dispatch_instant_background_apply();
-        }
-    }
-
-    fn dispatch_instant_background_apply(&mut self) {
-        let edits_to_apply = if let Some(p) = &self.workflow_preview {
-            let (kept, _) = crate::engine::workflow::prune_redundant_edits(&self.workflow_edits, p);
-            kept
-        } else {
-            self.workflow_edits.clone()
-        };
-
-        if let Err(e) = self
-            .job_tx
-            .send(crate::app::runtime::Job::InstantBackgroundApply {
-                input: std::path::PathBuf::from(&self.input_path),
-                output: std::path::PathBuf::from(&self.output_path),
-                edits: edits_to_apply,
-            })
-        {
-            tracing::error!("Failed to dispatch instant background apply: {}", e);
         }
     }
 
