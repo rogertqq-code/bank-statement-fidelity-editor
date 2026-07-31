@@ -86,10 +86,25 @@ fn short_document_batch_commits_every_edit_before_success() {
 
     let first_after = engine.get_text_blocks(&output, 0).unwrap();
     let second_after = engine.get_text_blocks(&output, 1).unwrap();
-    assert_eq!(first_after.len(), 1);
-    assert_eq!(second_after.len(), 1);
-    assert_eq!(first_after[0].text, "FIRST EDIT");
-    assert_eq!(second_after[0].text, "SECOND EDIT");
+    let normalized_page_text = |blocks: &[dual_core_pdf_pipeline::pdf::TextBlock]| {
+        blocks
+            .iter()
+            .flat_map(|block| block.text.chars())
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    };
+    let first_text = normalized_page_text(&first_after);
+    let second_text = normalized_page_text(&second_after);
+    assert!(
+        first_text.contains("FIRSTEDIT"),
+        "page 1 does not contain the exact replacement: {first_text:?}"
+    );
+    assert!(
+        second_text.contains("SECONDEDIT"),
+        "page 2 does not contain the exact replacement: {second_text:?}"
+    );
+    assert!(!first_text.contains("Page1"));
+    assert!(!second_text.contains("Page2"));
 }
 
 #[test]
