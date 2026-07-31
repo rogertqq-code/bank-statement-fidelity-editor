@@ -6,6 +6,7 @@ PyMuPDF Pro Smart Targeted Editor v2.1
 - Robust targeted replacement inside a specific rectangle using redaction
 """
 
+import hashlib
 import os
 import sys
 
@@ -2521,6 +2522,87 @@ def replace_text_in_rect(pdf_path: str, output_path: str, page_num: int, rect: l
     }
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_pdf_text(value: str) -> str:
+    return "".join(str(value).split())
+
+
+def _replacement_text_present(page, rect_obj, expected_text: str) -> bool:
+    """Verify that non-blank replacement text is extractable in the target area."""
+    if not str(expected_text).strip():
+        return True
+    verify_rect = pymupdf.Rect(
+        max(0.0, float(rect_obj.x0) - 3.0),
+        max(0.0, float(rect_obj.y0) - 3.0),
+        min(float(page.rect.x1), float(rect_obj.x1) + 6.0),
+        min(float(page.rect.y1), float(rect_obj.y1) + 6.0),
+    )
+    observed = page.get_text("text", clip=verify_rect)
+    return _normalized_pdf_text(expected_text) in _normalized_pdf_text(observed)
+
+
+def _complete_failed_edit_evidence(edits: list, evidence: list, after_index: int, reason: str):
+    for pending_index in range(after_index + 1, len(edits)):
+        pending = edits[pending_index]
+        pending_rect = [float(value) for value in pending.get("rect", [0, 0, 0, 0])]
+        evidence.append(
+            {
+                "index": pending_index,
+                "page": int(pending.get("page", 0)),
+                "rect": pending_rect,
+                "matched": False,
+                "placed": False,
+                "method": "not-attempted",
+                "warning": reason,
+            }
+        )
+
+
+def _build_apply_report(
+    edits: list,
+    source_sha256: str,
+    evidence: list,
+    warnings: list,
+    review_flags,
+    output_sha256: str = None,
+    output_published: bool = False,
+):
+    matched = sum(1 for item in evidence if item["matched"])
+    placed = sum(1 for item in evidence if item["placed"])
+    requested = len(edits)
+    failed = requested - placed
+    success = (
+        requested > 0
+        and matched == requested
+        and placed == requested
+        and failed == 0
+        and output_published
+        and output_sha256 is not None
+    )
+    return {
+        "schema_version": 1,
+        "success": success,
+        "requested": requested,
+        "matched": matched,
+        "placed": placed,
+        "failed": failed,
+        "warnings": list(warnings),
+        "method_per_edit": [item["method"] for item in evidence],
+        "review_flags": sorted(set(review_flags)),
+        "source_sha256": source_sha256,
+        "output_sha256": output_sha256,
+        "output_published": bool(output_published),
+        "edits": evidence,
+    }
+
+
 def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: str = None):
     """Apply many targeted edits in a single open/save pass.
 
@@ -2539,8 +2621,10 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
             "fill_color": [r, g, b]   (optional, defaults to white)
         }
 
-    Returns: {"success": True, "applied": N, "warnings": [...],
-              "method_per_edit": [...], "review_flags": [local_page, ...]}
+    Returns a schema-versioned exact application report with requested, matched,
+    placed, failed, per-edit evidence, warnings, methods, review flags, source
+    and output hashes, and publication state. A failed edit never publishes the
+    partially modified in-memory document.
     `review_flags` is a sorted list of unique segment-local page numbers whose
     edit could not be reproduced at full fidelity because embedded font
     coverage was insufficient and the edit was completed via the standard-14
@@ -2549,6 +2633,10 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
     Raises ValueError(json) on FONT_COVERAGE_INSUFFICIENT for any edit; the
     error payload includes the index of the failing edit.
     """
+    if not isinstance(edits, list) or not edits:
+        raise ValueError(json.dumps({"error": "EMPTY_EDIT_BATCH"}))
+
+    source_sha256 = _sha256_file(pdf_path)
     # Pro 3-page guard (Req 5): verify the target segment has <=3 pages BEFORE
     # unlocking Pro. An over-limit document raises PRO_PAGE_LIMIT_EXCEEDED and
     # is left unchanged (no unlock, no save).
@@ -2565,7 +2653,7 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
     if font_path and os.path.exists(font_path):
         insert_font_name = "edit_font_" + os.path.splitext(os.path.basename(font_path))[0]
 
-    methods = []
+    evidence = []
     warnings = []
     # Req 18.6: segment-local pages whose edit fell back to a standard-14
     # builtin because embedded font coverage was insufficient. Deduped here
@@ -2586,24 +2674,37 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
 
         span = _find_dominant_span(page, rect_obj)
         if span is None:
-            page.add_redact_annot(rect_obj, fill=fill_color)
-            try:
-                page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
-            except (TypeError, AttributeError):
-                page.apply_redactions()
-            methods.append("no-text")
-            # Improvement #3: the user supplied replacement text but the target
-            # rect overlaps NO text span, so nothing was written — only a blank
-            # redaction. Surface this as a review flag + warning rather than a
-            # silent "success", so the caller/GUI knows the edit had no target.
-            if new_text.strip():
-                review_flag_pages.add(page_num)
-                warnings.append(
-                    f"edit {idx}: target rect {rect} overlaps no text on page "
-                    f"{page_num}; new_text was not placed (blank redaction only). "
-                    f"Check the bounding box."
-                )
-            continue
+            warning = (
+                f"edit {idx}: target rect {rect} overlaps no text on page "
+                f"{page_num}; source preserved and no output published"
+            )
+            warnings.append(warning)
+            review_flag_pages.add(page_num)
+            evidence.append(
+                {
+                    "index": idx,
+                    "page": page_num,
+                    "rect": [float(value) for value in rect],
+                    "matched": False,
+                    "placed": False,
+                    "method": "no-match",
+                    "warning": warning,
+                }
+            )
+            _complete_failed_edit_evidence(
+                edits,
+                evidence,
+                idx,
+                f"not attempted after edit {idx} failed exact target matching",
+            )
+            doc.close()
+            return _build_apply_report(
+                edits,
+                source_sha256,
+                evidence,
+                warnings,
+                review_flag_pages,
+            )
 
         original_size = float(span.get("size", 10.0)) or 10.0
         original_color = _color_int_to_rgb(span.get("color"))
@@ -2762,20 +2863,71 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
                 pass
             method = "embedded-fallback"
 
-        methods.append(method)
+        placed = _replacement_text_present(
+            page,
+            placement["redact_rect"],
+            new_text,
+        )
+        if not placed:
+            warning = (
+                f"edit {idx}: replacement text was not extractable after {method}; "
+                "source preserved and no output published"
+            )
+            warnings.append(warning)
+            review_flag_pages.add(page_num)
+            evidence.append(
+                {
+                    "index": idx,
+                    "page": page_num,
+                    "rect": [float(value) for value in rect],
+                    "matched": True,
+                    "placed": False,
+                    "method": str(method or "unknown"),
+                    "warning": warning,
+                }
+            )
+            _complete_failed_edit_evidence(
+                edits,
+                evidence,
+                idx,
+                f"not attempted after edit {idx} failed replacement verification",
+            )
+            doc.close()
+            return _build_apply_report(
+                edits,
+                source_sha256,
+                evidence,
+                warnings,
+                review_flag_pages,
+            )
+
+        evidence.append(
+            {
+                "index": idx,
+                "page": page_num,
+                "rect": [float(value) for value in rect],
+                "matched": True,
+                "placed": True,
+                "method": str(method or "unknown"),
+                "warning": None,
+            }
+        )
 
     doc.save(output_path, garbage=4, deflate=True, clean=True)
     doc.close()
     del doc
     gc.collect()
+    output_sha256 = _sha256_file(output_path)
 
-    return {
-        "success": True,
-        "applied": len(edits),
-        "warnings": warnings,
-        "method_per_edit": methods,
-        "review_flags": sorted(review_flag_pages),
-    }
+    return _build_apply_report(
+        edits,
+        source_sha256,
+        evidence,
+        warnings,
+        review_flag_pages,
+        output_sha256=output_sha256,
+        output_published=True,
+    )
 
 
 def analyze_background(pdf_path: str, page_num: int, rect: list) -> tuple[bool, tuple[float, float, float]]:

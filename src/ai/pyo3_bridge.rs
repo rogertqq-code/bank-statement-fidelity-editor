@@ -1,6 +1,8 @@
+use crate::ai::apply_report::ApplyReport;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule, PyTuple};
 use std::ffi::CString;
+use std::path::Path;
 
 pub struct PyEngine {
     module: Py<PyModule>,
@@ -333,17 +335,24 @@ impl PyEngine {
     /// Apply many targeted edits in a single open/save pass. See
     /// `python/pymupdf_pro_integration.py::apply_many_edits`.
     /// `edits_json` is a JSON array of `{page, rect, new_text, fill_color?}`.
-    /// Returns the JSON dict the Python function returned, or a structured
-    /// error string on `FONT_COVERAGE_INSUFFICIENT`.
+    /// The Python payload is parsed with unknown-field rejection, validated
+    /// against the exact requested count, and verified against source/output
+    /// file hashes before it can reach the runtime.
     pub fn apply_many_edits(
         &self,
         pdf_path: &str,
         output_path: &str,
         edits_json: &str,
         font_path: Option<&str>,
-    ) -> Result<String, String> {
-        Self::safe_python_with_gil(|py| {
-            let _json_mod = py.import("json").map_err(|e| e.to_string())?;
+    ) -> Result<ApplyReport, String> {
+        let expected_requested = serde_json::from_str::<Vec<serde_json::Value>>(edits_json)
+            .map_err(|error| format!("invalid apply_many_edits request JSON: {error}"))?
+            .len();
+        if expected_requested == 0 {
+            return Err("apply_many_edits requires at least one edit".to_string());
+        }
+
+        let report_json = Self::safe_python_with_gil(|py| {
             let json_mod = py.import("json").map_err(|e: pyo3::PyErr| e.to_string())?;
             let loads = json_mod
                 .getattr("loads")
@@ -372,36 +381,37 @@ impl PyEngine {
                     .map_err(|e| e.to_string())?;
             }
 
-            let result = func.call(py, (), Some(&kwargs));
-            match result {
+            match func.call(py, (), Some(&kwargs)) {
                 Ok(obj) => {
                     let dumps = json_mod.getattr("dumps").map_err(|e| e.to_string())?;
-                    let s: String = dumps
+                    dumps
                         .call1((obj,))
                         .map_err(|e| e.to_string())?
-                        .extract()
-                        .map_err(|e: pyo3::PyErr| e.to_string())?;
-                    Ok(s)
+                        .extract::<String>()
+                        .map_err(|e: pyo3::PyErr| e.to_string())
                 }
-                Err(e) => {
-                    let msg = e.to_string();
+                Err(error) => {
+                    let message = error.to_string();
                     Err(
-                        if msg.contains("FONT_COVERAGE_INSUFFICIENT")
-                            || msg.contains("PDF_NOT_EDITABLE")
-                            || msg.contains("PRO_PAGE_LIMIT_EXCEEDED")
+                        if message.contains("FONT_COVERAGE_INSUFFICIENT")
+                            || message.contains("PDF_NOT_EDITABLE")
+                            || message.contains("PRO_PAGE_LIMIT_EXCEEDED")
                         {
-                            // Already structured (incl. the PyMuPDF Pro 3-page
-                            // limit token from `_assert_within_pro_page_limit`);
-                            // pass the message through unchanged so the runtime
-                            // can match on the stable error token.
-                            msg
+                            message
                         } else {
-                            format!("PyMuPDF apply_many_edits failed: {msg}")
+                            format!("PyMuPDF apply_many_edits failed: {message}")
                         },
                     )
                 }
             }
-        })
+        })?;
+
+        let report = ApplyReport::from_json_exact(&report_json, expected_requested)
+            .map_err(|error| error.to_string())?;
+        report
+            .verify_files(Path::new(pdf_path), Path::new(output_path))
+            .map_err(|error| error.to_string())?;
+        Ok(report)
     }
 
     /// Split a PDF into chunks for Document AI. See

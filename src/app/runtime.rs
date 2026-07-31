@@ -177,6 +177,7 @@ pub enum PythonJob {
 pub enum PythonJobResult {
     Pong,
     Json(String),
+    ApplyReport(crate::ai::apply_report::ApplyReport),
     ReplacedWithReviewWarning { reason: String },
     Success,
     Error(String),
@@ -707,7 +708,7 @@ impl Runtime {
                                         &edits_json,
                                         font_path.as_deref(),
                                     )
-                                    .map(PythonJobResult::Json),
+                                    .map(PythonJobResult::ApplyReport),
                                 PythonJob::ChunkPdfForDocai {
                                     pdf_path,
                                     output_dir,
@@ -2069,36 +2070,44 @@ async fn process_job_inner(
                                             reply_tx,
                                         ));
                                         match reply_rx.await {
-                                            Ok(PythonJobResult::Json(json_str)) => {
-                                                if let Ok(res) =
-                                                    serde_json::from_str::<serde_json::Value>(
-                                                        &json_str,
-                                                    )
-                                                {
-                                                    if res["success"].as_bool().unwrap_or(false) {
-                                                        edits_applied +=
-                                                            res["applied"].as_u64().unwrap_or(0)
-                                                                as usize;
-                                                        if let Some(flags) =
-                                                            res["review_flags"].as_array()
-                                                        {
-                                                            for f in flags {
-                                                                if let Some(pg) = f.as_u64() {
-                                                                    if let Some(gp) = map
-                                                                        .to_global(i, pg as usize)
-                                                                    {
-                                                                        fallback_fonts_used
-                                                                            .push(gp);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
+                                            Ok(PythonJobResult::ApplyReport(report))
+                                                if report.success =>
+                                            {
+                                                edits_applied += report.placed;
+                                                for local_page in report.review_flags {
+                                                    if let Some(global_page) =
+                                                        map.to_global(i, local_page)
+                                                    {
+                                                        fallback_fonts_used.push(global_page);
                                                     }
                                                 }
                                                 final_paths.push(edited_path);
                                             }
-                                            _ => {
-                                                tracing::warn!("[TRANSFER] Batch edit failed on segment {}, pushing unedited", i);
+                                            Ok(PythonJobResult::ApplyReport(report)) => {
+                                                tracing::warn!(
+                                                    segment = i,
+                                                    requested = report.requested,
+                                                    matched = report.matched,
+                                                    placed = report.placed,
+                                                    warnings = ?report.warnings,
+                                                    "[TRANSFER] Exact batch edit failed; preserving unedited segment"
+                                                );
+                                                final_paths.push(seg.path.clone());
+                                            }
+                                            Ok(PythonJobResult::Error(error)) => {
+                                                tracing::warn!(
+                                                    segment = i,
+                                                    %error,
+                                                    "[TRANSFER] Batch edit errored; preserving unedited segment"
+                                                );
+                                                final_paths.push(seg.path.clone());
+                                            }
+                                            other => {
+                                                tracing::warn!(
+                                                    segment = i,
+                                                    result = ?other,
+                                                    "[TRANSFER] Unexpected batch-edit result; preserving unedited segment"
+                                                );
                                                 final_paths.push(seg.path.clone());
                                             }
                                         }
@@ -2167,25 +2176,41 @@ async fn process_job_inner(
                                 ));
 
                                 match reply_rx.await {
-                                                Ok(PythonJobResult::Json(json_str)) => {
-                                                    if let Ok(res) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                                        if res["success"].as_bool().unwrap_or(false) {
-                                                            edits_applied = res["applied"].as_u64().unwrap_or(0) as usize;
-                                                            if let Some(flags) = res["review_flags"].as_array() {
-                                                                for f in flags {
-                                                                    if let Some(pg) = f.as_u64() {
-                                                                        fallback_fonts_used.push(pg as usize);
-                                                                    }
-                                                                }
-                                                            }
-                                                            let _ = std::fs::rename(output_pdf.with_extension("temp.pdf"), &output_pdf);
-                                                            tracing::info!("[TRANSFER] (Python) Batch edit succeeded");
-                                                        }
-                                                    }
-                                                }
-                                                Ok(PythonJobResult::Error(e)) => tracing::error!("[TRANSFER] (Python) Batch edit failed: {}", e),
-                                                _ => tracing::error!("[TRANSFER] (Python) Batch edit failed with unexpected result"),
+                                    Ok(PythonJobResult::ApplyReport(report)) if report.success => {
+                                        let temp_output = output_pdf.with_extension("temp.pdf");
+                                        match std::fs::rename(&temp_output, &output_pdf) {
+                                            Ok(()) => {
+                                                edits_applied = report.placed;
+                                                fallback_fonts_used.extend(report.review_flags);
+                                                tracing::info!(
+                                                    "[TRANSFER] (Python) Exact batch edit succeeded"
+                                                );
                                             }
+                                            Err(error) => {
+                                                tracing::error!(
+                                                    "[TRANSFER] Python output commit failed: {}",
+                                                    error
+                                                );
+                                                let _ = std::fs::remove_file(temp_output);
+                                            }
+                                        }
+                                    }
+                                    Ok(PythonJobResult::ApplyReport(report)) => tracing::error!(
+                                        requested = report.requested,
+                                        matched = report.matched,
+                                        placed = report.placed,
+                                        warnings = ?report.warnings,
+                                        "[TRANSFER] (Python) Exact batch edit failed"
+                                    ),
+                                    Ok(PythonJobResult::Error(error)) => tracing::error!(
+                                        "[TRANSFER] (Python) Batch edit failed: {}",
+                                        error
+                                    ),
+                                    other => tracing::error!(
+                                        result = ?other,
+                                        "[TRANSFER] (Python) Batch edit returned unexpected result"
+                                    ),
+                                }
                             }
                         }
                     }
@@ -4161,7 +4186,6 @@ async fn process_job_inner(
             changes,
         } => {
             let res_tx = result_tx_clone.clone();
-            let job_tx_ref = tokio_job_tx_clone.clone();
             let py_tx = python_tx_clone.clone();
             let semaphore = api_semaphore.clone();
 
@@ -4210,14 +4234,20 @@ async fn process_job_inner(
                                 .cloned()
                                 .collect();
 
-                if usable.is_empty() {
-                    let _ = res_tx.send(JobResult::ProposedChangesApplied {
-                        changes_applied: 0,
-                        failures,
+                if !failures.is_empty() {
+                    let _ = res_tx.send(JobResult::Error {
+                        job_label: "apply_proposed_changes".into(),
+                        message: format!(
+                            "Exact batch apply rejected unresolved changes: {}",
+                            failures.join("; ")
+                        ),
                     });
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: "Done".to_string(),
-                        fraction: 1.0,
+                    return;
+                }
+                if usable.is_empty() {
+                    let _ = res_tx.send(JobResult::Error {
+                        job_label: "apply_proposed_changes".into(),
+                        message: "Exact batch apply requires at least one resolved change".into(),
                     });
                     return;
                 }
@@ -4314,58 +4344,34 @@ async fn process_job_inner(
                             rtx,
                         ));
                         match rrx.await {
-                            Ok(PythonJobResult::Json(_)) | Ok(PythonJobResult::Success) => {
+                            Ok(PythonJobResult::ApplyReport(report)) if report.success => {
                                 seg_paths[si] = edited_out;
-                                applied += edits.len();
+                                applied += report.placed;
                             }
-                            Ok(PythonJobResult::Error(e)) => {
-                                // T2: Native fallback — try OxidizePdfEngine when Python fails.
-                                tracing::warn!(segment = si, python_error = %e, "Python actor failed for segment, attempting native fallback");
+                            Ok(PythonJobResult::ApplyReport(report)) => {
+                                failures.push(format!(
+                                    "segment {si}: exact Python apply failed ({}/{} placed): {}",
+                                    report.placed,
+                                    report.requested,
+                                    report.warnings.join("; ")
+                                ));
+                            }
+                            Ok(PythonJobResult::Error(error)) => {
+                                tracing::warn!(
+                                    segment = si,
+                                    python_error = %error,
+                                    "Python actor errored; attempting exact-count native fallback"
+                                );
+                                let expected = edits.len();
                                 let native_in = seg_paths[si].clone();
-                                let native_out =
+                                let native_path =
                                     tmp.path().join(format!("segment_{si:03}_native.pdf"));
-                                let native_json = json_str_for_fallback.clone();
-                                let native_result = tokio::task::spawn_blocking(move || {
-                                    let native_eng =
-                                        crate::pdf::native_engine::OxidizePdfEngine::new();
-                                    native_eng.apply_many_edits(
-                                        &native_in,
-                                        &native_out,
-                                        &native_json,
-                                        None,
-                                    )
-                                })
-                                .await;
-                                match native_result {
-                                    Ok(Ok(count)) => {
-                                        seg_paths[si] =
-                                            tmp.path().join(format!("segment_{si:03}_native.pdf"));
-                                        applied += count;
-                                        tracing::info!(
-                                            segment = si,
-                                            edits_applied = count,
-                                            "Native fallback succeeded"
-                                        );
-                                    }
-                                    Ok(Err(native_err)) => {
-                                        failures.push(format!("segment {si}: Python failed ({e}), native also failed ({native_err})"));
-                                    }
-                                    Err(panic_err) => {
-                                        failures.push(format!("segment {si}: Python failed ({e}), native panicked ({panic_err})"));
-                                    }
-                                }
-                            }
-                            other => {
-                                // T2: Native fallback for unexpected results too.
-                                tracing::warn!(segment = si, result = ?other, "Python actor returned unexpected result, attempting native fallback");
-                                let native_in = seg_paths[si].clone();
-                                let native_out =
-                                    tmp.path().join(format!("segment_{si:03}_native2.pdf"));
+                                let native_out = native_path.clone();
                                 let native_json = json_str_for_fallback;
                                 let native_result = tokio::task::spawn_blocking(move || {
-                                    let native_eng =
+                                    let native_engine =
                                         crate::pdf::native_engine::OxidizePdfEngine::new();
-                                    native_eng.apply_many_edits(
+                                    native_engine.apply_many_edits(
                                         &native_in,
                                         &native_out,
                                         &native_json,
@@ -4374,25 +4380,45 @@ async fn process_job_inner(
                                 })
                                 .await;
                                 match native_result {
-                                    Ok(Ok(count)) => {
-                                        seg_paths[si] =
-                                            tmp.path().join(format!("segment_{si:03}_native2.pdf"));
+                                    Ok(Ok(count)) if count == expected && native_path.exists() => {
+                                        seg_paths[si] = native_path;
                                         applied += count;
                                         tracing::info!(
                                             segment = si,
                                             edits_applied = count,
-                                            "Native fallback succeeded"
+                                            "Exact-count native fallback succeeded"
                                         );
                                     }
-                                    Ok(Err(native_err)) => {
-                                        failures.push(format!("segment {si}: unexpected Python result, native also failed ({native_err})"));
+                                    Ok(Ok(count)) => {
+                                        let _ = std::fs::remove_file(&native_path);
+                                        failures.push(format!(
+                                            "segment {si}: Python failed ({error}); native applied {count}/{expected} edits"
+                                        ));
                                     }
-                                    Err(panic_err) => {
-                                        failures.push(format!("segment {si}: unexpected Python result, native panicked ({panic_err})"));
-                                    }
+                                    Ok(Err(native_error)) => failures.push(format!(
+                                        "segment {si}: Python failed ({error}); native failed ({native_error})"
+                                    )),
+                                    Err(panic_error) => failures.push(format!(
+                                        "segment {si}: Python failed ({error}); native panicked ({panic_error})"
+                                    )),
                                 }
                             }
+                            other => failures.push(format!(
+                                "segment {si}: unexpected Python batch-edit result: {other:?}"
+                            )),
                         }
+                    }
+
+                    if !failures.is_empty() || applied != usable.len() {
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_proposed_changes".into(),
+                            message: format!(
+                                "Exact batch apply aborted before merge: applied {applied}/{}; {}",
+                                usable.len(),
+                                failures.join("; ")
+                            ),
+                        });
+                        return;
                     }
 
                     // 4) Merge (pure-Rust lopdf) on a blocking task.
@@ -4436,38 +4462,119 @@ async fn process_job_inner(
                     return;
                 }
 
-                // ---- Short document (<=3 pages): direct path ----
-                let mut applied = 0;
-                for (i, change) in usable.iter().enumerate() {
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: format!("Applying change {} of {}", i + 1, usable.len()),
-                        fraction: (i as f32) / (usable.len() as f32),
+                // ---- Short document (<=3 pages): one ordered exact batch ----
+                let _ = res_tx.send(JobResult::Progress {
+                    label: format!(
+                        "Applying {} changes as one document transaction",
+                        usable.len()
+                    ),
+                    fraction: 0.25,
+                });
+                let edit_values: Vec<serde_json::Value> = usable
+                    .iter()
+                    .map(|change| {
+                        let bbox = change.bbox.expect("usable changes have resolved bboxes");
+                        serde_json::json!({
+                            "page": change.page,
+                            "rect": [bbox[0], bbox[1], bbox[2], bbox[3]],
+                            "new_text": change.new_text,
+                        })
+                    })
+                    .collect();
+                let edits_json = match serde_json::to_string(&edit_values) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_proposed_changes".into(),
+                            message: format!("Exact batch serialization failed: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let scratch =
+                    output.with_extension(format!("{}.apply-transaction.pdf", Uuid::new_v4()));
+                let _ = std::fs::remove_file(&scratch);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if py_tx
+                    .send((
+                        PythonJob::ApplyManyEdits {
+                            pdf_path: input.to_string_lossy().to_string(),
+                            output_path: scratch.to_string_lossy().to_string(),
+                            edits_json,
+                            font_path: None,
+                        },
+                        reply_tx,
+                    ))
+                    .is_err()
+                {
+                    let _ = res_tx.send(JobResult::Error {
+                        job_label: "apply_proposed_changes".into(),
+                        message: "Python batch-edit actor is unavailable".into(),
                     });
-                    let Some(bbox) = change.bbox else {
-                        failures.push(format!("change {} missing bbox", i + 1));
-                        continue;
-                    };
-                    let _ = job_tx_ref.send(Job::ApplyChange {
-                        input: input.clone(),
-                        output: output.clone(),
-                        page: change.page,
-                        bbox,
-                        new_text: change.new_text.clone(),
-                        old_text: change.old_text.clone(),
-                        description: change.reason.clone(),
-                        deep_font_replication: false,
-                    });
-                    applied += 1;
+                    return;
                 }
 
-                let _ = res_tx.send(JobResult::ProposedChangesApplied {
-                    changes_applied: applied,
-                    failures,
-                });
-                let _ = res_tx.send(JobResult::Progress {
-                    label: "Done".to_string(),
-                    fraction: 1.0,
-                });
+                match reply_rx.await {
+                    Ok(PythonJobResult::ApplyReport(report)) if report.success => {
+                        if report.placed != usable.len() {
+                            let _ = std::fs::remove_file(&scratch);
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_proposed_changes".into(),
+                                message: format!(
+                                    "Exact batch placed {}/{} changes",
+                                    report.placed,
+                                    usable.len()
+                                ),
+                            });
+                            return;
+                        }
+                        if let Err(error) =
+                            crate::app::audit::snapshot_link_or_copy(&scratch, &output)
+                        {
+                            let _ = std::fs::remove_file(&scratch);
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_proposed_changes".into(),
+                                message: format!("Exact output commit failed: {error}"),
+                            });
+                            return;
+                        }
+                        let _ = std::fs::remove_file(&scratch);
+                        let _ = res_tx.send(JobResult::Progress {
+                            label: "Exact batch committed".to_string(),
+                            fraction: 1.0,
+                        });
+                        let _ = res_tx.send(JobResult::ProposedChangesApplied {
+                            changes_applied: report.placed,
+                            failures: Vec::new(),
+                        });
+                    }
+                    Ok(PythonJobResult::ApplyReport(report)) => {
+                        let _ = std::fs::remove_file(&scratch);
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_proposed_changes".into(),
+                            message: format!(
+                                "Exact batch failed: placed {}/{}; {}",
+                                report.placed,
+                                report.requested,
+                                report.warnings.join("; ")
+                            ),
+                        });
+                    }
+                    Ok(PythonJobResult::Error(error)) => {
+                        let _ = std::fs::remove_file(&scratch);
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_proposed_changes".into(),
+                            message: error,
+                        });
+                    }
+                    other => {
+                        let _ = std::fs::remove_file(&scratch);
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_proposed_changes".into(),
+                            message: format!("Unexpected exact batch result: {other:?}"),
+                        });
+                    }
+                }
             });
         }
         Job::GenerateVisualAlternatives {
@@ -6090,6 +6197,7 @@ async fn process_job_inner(
                         let mut final_paths = Vec::new();
                         let mut ok = true;
                         let mut error_msg = String::new();
+                        let mut segment_applied = 0usize;
 
                         let global_edits: Vec<GlobalEdit> = edits
                             .iter()
@@ -6177,30 +6285,41 @@ async fn process_job_inner(
                                 ));
 
                                 match rx.await {
-                                    Ok(PythonJobResult::Json(json)) => {
-                                        let res: serde_json::Value =
-                                            serde_json::from_str(&json).unwrap_or_default();
-                                        if res["success"].as_bool().unwrap_or(false) {
-                                            let _ = std::fs::rename(&temp_seg_out, &seg.path);
-                                            final_paths.push(seg.path.clone());
-                                        } else {
-                                            ok = false;
-                                            error_msg = res["error"]
-                                                .as_str()
-                                                .unwrap_or("Segment apply failed")
-                                                .to_string();
-                                            break;
+                                    Ok(PythonJobResult::ApplyReport(report)) if report.success => {
+                                        match std::fs::rename(&temp_seg_out, &seg.path) {
+                                            Ok(()) => {
+                                                segment_applied += report.placed;
+                                                final_paths.push(seg.path.clone());
+                                            }
+                                            Err(error) => {
+                                                ok = false;
+                                                error_msg = format!(
+                                                    "segment {i} output commit failed: {error}"
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
-                                    Ok(PythonJobResult::Error(e)) => {
+                                    Ok(PythonJobResult::ApplyReport(report)) => {
                                         ok = false;
-                                        error_msg = e;
+                                        error_msg = format!(
+                                            "segment {i} exact apply failed ({}/{} placed): {}",
+                                            report.placed,
+                                            report.requested,
+                                            report.warnings.join("; ")
+                                        );
                                         break;
                                     }
-                                    _ => {
+                                    Ok(PythonJobResult::Error(error)) => {
                                         ok = false;
-                                        error_msg =
-                                            "Python actor returned unexpected result".into();
+                                        error_msg = error;
+                                        break;
+                                    }
+                                    other => {
+                                        ok = false;
+                                        error_msg = format!(
+                                            "Python actor returned unexpected segment result: {other:?}"
+                                        );
                                         break;
                                     }
                                 }
@@ -6209,33 +6328,34 @@ async fn process_job_inner(
                             }
                         }
 
-                        if ok {
-                            if let Err(e) =
-                                crate::engine::pdf_split_merge::merge_pdfs(&final_paths, &scratch)
+                        if ok && segment_applied == edits.len() {
+                            let expected_pages: usize =
+                                map.segments.iter().map(|segment| segment.page_count).sum();
+                            match crate::engine::pdf_split_merge::merge_pdfs(&final_paths, &scratch)
                             {
-                                apply_result =
-                                    Ok(PythonJobResult::Error(format!("Merge failed: {e}")));
-                            } else {
-                                apply_result =
-                                    Ok(PythonJobResult::Json("{\"success\":true}".into()));
+                                Ok(merged_pages) if merged_pages == expected_pages => {
+                                    apply_result = Ok(PythonJobResult::Success);
+                                }
+                                Ok(merged_pages) => {
+                                    apply_result = Ok(PythonJobResult::Error(format!(
+                                        "Merge produced {merged_pages}/{expected_pages} pages"
+                                    )));
+                                }
+                                Err(error) => {
+                                    apply_result = Ok(PythonJobResult::Error(format!(
+                                        "Merge failed: {error}"
+                                    )));
+                                }
                             }
                         } else {
+                            if ok {
+                                error_msg = format!(
+                                    "Segmented apply placed {segment_applied}/{} edits",
+                                    edits.len()
+                                );
+                            }
                             apply_result = Ok(PythonJobResult::Error(error_msg));
                         }
-                    } else if cached_output.exists() {
-                        tracing::info!(
-                            "[workflow] idempotent re-apply: reusing cached output {}",
-                            cached_output.display()
-                        );
-                        let _ = std::fs::create_dir_all(
-                            scratch
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new(".")),
-                        );
-                        let _ = std::fs::copy(&cached_output, &scratch);
-                        apply_result = Ok(PythonJobResult::Json(
-                            "{\"success\":true,\"cached\":true}".into(),
-                        ));
                     } else {
                         let (tx, rx) = oneshot::channel();
                         let _ = py_tx.send((
@@ -6251,12 +6371,25 @@ async fn process_job_inner(
                         ));
 
                         apply_result = rx.await;
-                        // Cache the successful output for next time.
-                        if let Ok(PythonJobResult::Json(_)) = &apply_result {
+                        // Cache only an exact, hash-verified Python output.
+                        if matches!(
+                            &apply_result,
+                            Ok(PythonJobResult::ApplyReport(report)) if report.success
+                        ) {
                             if let Some(parent) = cached_output.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                                if let Err(error) = std::fs::create_dir_all(parent) {
+                                    tracing::warn!(
+                                        %error,
+                                        "[workflow] exact output succeeded but cache directory creation failed"
+                                    );
+                                }
                             }
-                            let _ = std::fs::copy(&scratch, &cached_output);
+                            if let Err(error) = std::fs::copy(&scratch, &cached_output) {
+                                tracing::warn!(
+                                    %error,
+                                    "[workflow] exact output succeeded but cache write failed"
+                                );
+                            }
                         }
                     }
 
@@ -6378,9 +6511,43 @@ async fn process_job_inner(
                     }
 
                     match apply_result {
-                        Ok(PythonJobResult::Json(_)) => {
-                            // Move scratch -> output. Hard-link first.
-                            let _ = crate::app::audit::snapshot_link_or_copy(&scratch, &output);
+                        Ok(PythonJobResult::ApplyReport(report)) if report.success => {
+                            if let Err(error) =
+                                crate::app::audit::snapshot_link_or_copy(&scratch, &output)
+                            {
+                                all_ok = false;
+                                last_failure =
+                                    Some(crate::engine::workflow::WorkflowFailure::Other(format!(
+                                        "exact output publication failed: {error}"
+                                    )));
+                            }
+                        }
+                        Ok(PythonJobResult::ApplyReport(report)) => {
+                            all_ok = false;
+                            last_failure =
+                                Some(crate::engine::workflow::WorkflowFailure::Other(format!(
+                                    "exact apply failed: placed {}/{}; {}",
+                                    report.placed,
+                                    report.requested,
+                                    report.warnings.join("; ")
+                                )));
+                        }
+                        Ok(PythonJobResult::Success) if scratch.exists() => {
+                            if let Err(error) =
+                                crate::app::audit::snapshot_link_or_copy(&scratch, &output)
+                            {
+                                all_ok = false;
+                                last_failure =
+                                    Some(crate::engine::workflow::WorkflowFailure::Other(format!(
+                                        "verified aggregate output publication failed: {error}"
+                                    )));
+                            }
+                        }
+                        Ok(PythonJobResult::Success) => {
+                            all_ok = false;
+                            last_failure = Some(crate::engine::workflow::WorkflowFailure::Other(
+                                "verified aggregate apply produced no output artifact".into(),
+                            ));
                         }
                         Ok(PythonJobResult::Error(msg)) => {
                             all_ok = false;
@@ -6400,10 +6567,10 @@ async fn process_job_inner(
                                     Some(crate::engine::workflow::WorkflowFailure::Other(msg));
                             }
                         }
-                        _ => {
+                        other => {
                             all_ok = false;
                             last_failure = Some(crate::engine::workflow::WorkflowFailure::Other(
-                                "apply_many_edits returned unexpected result".into(),
+                                format!("untyped or unexpected apply_many_edits result rejected: {other:?}"),
                             ));
                         }
                     }

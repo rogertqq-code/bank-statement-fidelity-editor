@@ -1,3 +1,4 @@
+pub mod apply_report;
 pub mod backend;
 pub mod docai_cache;
 pub mod document_ai;
