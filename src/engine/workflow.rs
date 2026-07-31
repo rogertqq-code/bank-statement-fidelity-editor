@@ -504,7 +504,7 @@ impl WorkflowStage {
 // Stage 3 - pure preview computation. Lives here so we can unit-test it.
 // ---------------------------------------------------------------------------
 
-use crate::engine::balance::{process_and_reconcile, ONE_CENT};
+use crate::engine::balance::{recalculate_and_validate, ONE_CENT};
 use crate::engine::model::Transaction;
 
 /// Apply `edits` to `original` and rebuild the running ledger. Returns the
@@ -545,10 +545,11 @@ pub fn build_preview(
         }
     }
 
-    // 2. Recompute running balances.
-    let (recomputed, msg) =
-        process_and_reconcile(working.clone(), opening_balance, expected_closing)
-            .map_err(|e| e.to_string())?;
+    // 2. Recompute running balances without mutating any transaction amount.
+    // A preview must describe the exact state produced by the user's edits;
+    // automatic reconciliation would create a different, undisclosed edit set.
+    let recomputed =
+        recalculate_and_validate(working, opening_balance).map_err(|e| e.to_string())?;
 
     // 3. Build per-row preview.
     let mut rows = Vec::with_capacity(recomputed.len());
@@ -583,8 +584,93 @@ pub fn build_preview(
         rows,
         final_imbalance,
         balanced: final_imbalance.abs() < ONE_CENT,
-        auto_correction_message: msg,
+        auto_correction_message: None,
     })
+}
+
+/// Expand a user edit set with every running-balance cell that the preview
+/// deterministically recalculates. The returned edits are the exact cells the
+/// renderer must apply; a missing balance-cell bbox or a conflicting manual
+/// balance value is a hard error rather than a display/render divergence.
+pub fn materialize_preview_edits(
+    original: &[Transaction],
+    edits: &[UserEdit],
+    preview: &BalancePreview,
+) -> Result<Vec<UserEdit>, String> {
+    let mut materialized = edits.to_vec();
+
+    for row in &preview.rows {
+        let Some(new_balance) = row.new_running_balance else {
+            return Err(format!(
+                "recomputed balance missing on page {} line {}",
+                row.page + 1,
+                row.line_on_page + 1
+            ));
+        };
+
+        if let Some(existing) = edits.iter().find(|edit| {
+            edit.page == row.page
+                && edit.line_on_page == row.line_on_page
+                && edit.field == EditField::RunningBalance
+        }) {
+            let typed = parse_money(&existing.new_text).ok_or_else(|| {
+                format!(
+                    "invalid running-balance edit on page {} line {}",
+                    row.page + 1,
+                    row.line_on_page + 1
+                )
+            })?;
+            if typed.round_dp(2) != new_balance.round_dp(2) {
+                return Err(format!(
+                    "running-balance edit on page {} line {} conflicts with the deterministic ledger (typed {}, calculated {})",
+                    row.page + 1,
+                    row.line_on_page + 1,
+                    typed.round_dp(2),
+                    new_balance.round_dp(2)
+                ));
+            }
+            continue;
+        }
+
+        if row.new_running_balance == row.old_running_balance {
+            continue;
+        }
+
+        let transaction = original
+            .iter()
+            .find(|transaction| {
+                transaction.page == row.page && transaction.line_on_page == row.line_on_page
+            })
+            .ok_or_else(|| {
+                format!(
+                    "preview row has no source transaction on page {} line {}",
+                    row.page + 1,
+                    row.line_on_page + 1
+                )
+            })?;
+        let bbox = transaction.field_bboxes.running_balance.ok_or_else(|| {
+            format!(
+                "running-balance cell has no exact bbox on page {} line {}",
+                row.page + 1,
+                row.line_on_page + 1
+            )
+        })?;
+        let old_text = transaction
+            .running_balance
+            .map(|value| format!("{:.2}", value.round_dp(2)))
+            .unwrap_or_default();
+
+        materialized.push(UserEdit {
+            page: row.page,
+            line_on_page: row.line_on_page,
+            bbox,
+            old_text,
+            new_text: format!("{:.2}", new_balance.round_dp(2)),
+            field: EditField::RunningBalance,
+        });
+    }
+
+    Ok(materialized)
 }
 
 fn parse_money(s: &str) -> Option<Decimal> {
@@ -783,6 +869,79 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         assert!(preview.balanced);
         assert_eq!(preview.final_imbalance, dec!(0.00));
+        Ok(())
+    }
+
+    #[test]
+    fn build_preview_reports_imbalance_without_mutating_transaction_amounts() -> anyhow::Result<()>
+    {
+        let original = vec![tx(0, 0, Some(dec!(100)), None, Some(dec!(200)))];
+        let preview = build_preview(&original, &[], dec!(100), Some(dec!(250)))
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        assert!(!preview.balanced);
+        assert_eq!(preview.rows[0].debit, Some(dec!(100)));
+        assert_eq!(preview.rows[0].new_running_balance, Some(dec!(200)));
+        assert_eq!(preview.final_imbalance, dec!(-50.00));
+        assert!(preview.auto_correction_message.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn materialize_preview_edits_adds_every_cascaded_balance_cell() -> anyhow::Result<()> {
+        let mut original = vec![
+            tx(0, 0, Some(dec!(100)), None, Some(dec!(200))),
+            tx(0, 1, None, Some(dec!(50)), Some(dec!(150))),
+        ];
+        original[0].field_bboxes.running_balance = Some([10.0, 20.0, 30.0, 40.0]);
+        original[1].field_bboxes.running_balance = Some([10.0, 50.0, 30.0, 70.0]);
+        let edits = vec![UserEdit {
+            page: 0,
+            line_on_page: 0,
+            bbox: [1.0, 2.0, 3.0, 4.0],
+            old_text: "100.00".into(),
+            new_text: "200.00".into(),
+            field: EditField::Debit,
+        }];
+        let preview = build_preview(&original, &edits, dec!(100), None)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let materialized = materialize_preview_edits(&original, &edits, &preview)
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        assert_eq!(materialized.len(), 3);
+        assert!(materialized.iter().any(|edit| {
+            edit.field == EditField::RunningBalance
+                && edit.line_on_page == 0
+                && edit.new_text == "300.00"
+                && edit.bbox == [10.0, 20.0, 30.0, 40.0]
+        }));
+        assert!(materialized.iter().any(|edit| {
+            edit.field == EditField::RunningBalance
+                && edit.line_on_page == 1
+                && edit.new_text == "250.00"
+                && edit.bbox == [10.0, 50.0, 30.0, 70.0]
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn materialize_preview_edits_rejects_conflicting_manual_balance() -> anyhow::Result<()> {
+        let mut original = vec![tx(0, 0, Some(dec!(100)), None, Some(dec!(200)))];
+        original[0].field_bboxes.running_balance = Some([10.0, 20.0, 30.0, 40.0]);
+        let edits = vec![UserEdit {
+            page: 0,
+            line_on_page: 0,
+            bbox: [10.0, 20.0, 30.0, 40.0],
+            old_text: "200.00".into(),
+            new_text: "999.00".into(),
+            field: EditField::RunningBalance,
+        }];
+        let preview = build_preview(&original, &edits, dec!(100), Some(dec!(200)))
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let error = materialize_preview_edits(&original, &edits, &preview)
+            .expect_err("manual balance must match the deterministic ledger");
+
+        assert!(error.contains("conflicts with the deterministic ledger"));
         Ok(())
     }
 

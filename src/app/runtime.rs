@@ -5817,6 +5817,67 @@ async fn process_job_inner(
             }
 
             tokio::spawn(async move {
+                if original_transactions.is_empty() {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::Other(
+                            "confirm-and-render requires parsed transactions for deterministic math validation"
+                                .into(),
+                        ),
+                    ));
+                    return;
+                }
+                let pre_render_preview = match crate::engine::workflow::build_preview(
+                    &original_transactions,
+                    &edits,
+                    opening_balance,
+                    expected_closing,
+                ) {
+                    Ok(preview) => preview,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(format!(
+                                "pre-render math validation failed: {error}"
+                            )),
+                        ));
+                        return;
+                    }
+                };
+                if expected_closing.is_some() && !pre_render_preview.balanced {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::FinalMathInvalid {
+                            imbalance: pre_render_preview.final_imbalance,
+                        },
+                    ));
+                    return;
+                }
+                let edits = match crate::engine::workflow::materialize_preview_edits(
+                    &original_transactions,
+                    &edits,
+                    &pre_render_preview,
+                ) {
+                    Ok(materialized) => materialized,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(format!(
+                                "preview/render edit-set mismatch: {error}"
+                            )),
+                        ));
+                        return;
+                    }
+                };
+                if edits.is_empty() {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::Other(
+                            "confirm-and-render requires at least one exact edit".into(),
+                        ),
+                    ));
+                    return;
+                }
+
+                let pre_render_imbalance = pre_render_preview.final_imbalance;
+                let pre_render_math_valid = expected_closing
+                    .map(|_| pre_render_preview.balanced)
+                    .unwrap_or(true);
                 let rollback = RollbackGuard::new(&output);
                 let mut attempt: u32 = 1;
                 let mut visual_attempts: u32 = 0;
@@ -5827,7 +5888,7 @@ async fn process_job_inner(
                 let workflow_stamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
                 let mut last_score: f64 = 1.0;
                 let mut last_intended = false;
-                let mut math_verified_ok = false;
+                let mut math_verified_ok = pre_render_math_valid;
                 let _ = (&last_score, &last_intended); // initial values used below the loop on early exit
                 let intended_bboxes: Vec<(usize, [f32; 4])> =
                     edits.iter().map(|e| (e.page, e.bbox)).collect();
@@ -7044,16 +7105,13 @@ async fn process_job_inner(
                                         }
                                         math_valid = is_valid;
                                     }
-                                    Err(e) => {
-                                        // Balance check error on re-parsed output.
-                                        // We already validated math before rendering,
-                                        // so treat errors here as non-fatal.
+                                    Err(error) => {
                                         tracing::warn!(
-                                                        "[workflow] Final balance check errored: {}. Treating as valid (pre-render check passed).",
-                                                        e
-                                                    );
-                                        final_imbalance = rust_decimal::Decimal::ZERO;
-                                        math_valid = true;
+                                            "[workflow] Final balance re-parse could not be evaluated: {}. Retaining the deterministic pre-render result.",
+                                            error
+                                        );
+                                        final_imbalance = pre_render_imbalance;
+                                        math_valid = pre_render_math_valid;
                                     }
                                 }
                             }
@@ -7068,10 +7126,11 @@ async fn process_job_inner(
                         }
                     }
                     Err(_) => {
-                        // No DocAI configured; skip with a permissive default.
-                        final_imbalance = rust_decimal::Decimal::ZERO;
-                        math_valid = true;
-                        re_parsed_count = 0;
+                        // Cloud verification is optional; the deterministic local
+                        // preview is authoritative when Document AI is unavailable.
+                        final_imbalance = pre_render_imbalance;
+                        math_valid = pre_render_math_valid;
+                        re_parsed_count = original_transactions.len();
                     }
                 }
 

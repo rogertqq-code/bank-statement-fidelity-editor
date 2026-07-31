@@ -1,9 +1,11 @@
 mod fixtures;
 
 use dual_core_pdf_pipeline::app::runtime::{Job, JobResult};
-use dual_core_pdf_pipeline::engine::model::ProposedChange;
+use dual_core_pdf_pipeline::engine::model::{ProposedChange, Provenance, Transaction};
+use dual_core_pdf_pipeline::engine::workflow::{EditField, UserEdit, WorkflowFailure};
 use dual_core_pdf_pipeline::pdf::engine::PdfEngine;
 use dual_core_pdf_pipeline::pdf::native_engine::OxidizePdfEngine;
+use rust_decimal_macros::dec;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -88,4 +90,81 @@ fn short_document_batch_commits_every_edit_before_success() {
     assert_eq!(second_after.len(), 1);
     assert_eq!(first_after[0].text, "FIRST EDIT");
     assert_eq!(second_after[0].text, "SECOND EDIT");
+}
+
+#[test]
+fn confirm_and_render_rejects_unbalanced_ledger_before_output_mutation() {
+    let workspace = tempfile::tempdir().unwrap();
+    let input = workspace.path().join("input.pdf");
+    let output = workspace.path().join("existing-output.pdf");
+    fixtures::generate_test_pdf(1, &input);
+    std::fs::copy(&input, &output).unwrap();
+    let output_before = std::fs::read(&output).unwrap();
+
+    let engine = OxidizePdfEngine::new();
+    let blocks = engine.get_text_blocks(&input, 0).unwrap();
+    assert_eq!(blocks.len(), 1);
+    let original_transactions = vec![Transaction {
+        page: 0,
+        line_on_page: 0,
+        date: "01/01/2026".into(),
+        raw_text: blocks[0].text.clone(),
+        debit: Some(dec!(100.00)),
+        credit: None,
+        running_balance: Some(dec!(200.00)),
+        bbox: Some(blocks[0].bbox),
+        field_bboxes: Default::default(),
+        provenance: Provenance::Manual,
+        category: None,
+    }];
+    let edits = vec![UserEdit {
+        page: 0,
+        line_on_page: 0,
+        bbox: blocks[0].bbox,
+        old_text: blocks[0].text.clone(),
+        new_text: "DESCRIPTION EDIT".into(),
+        field: EditField::Description,
+    }];
+
+    let config = Arc::new(dual_core_pdf_pipeline::app::config::AppConfig::default());
+    let audit_log = dual_core_pdf_pipeline::app::audit::AuditLog::open(workspace.path()).unwrap();
+    let (_runtime, job_tx, result_rx) =
+        dual_core_pdf_pipeline::app::runtime::Runtime::start(audit_log, config);
+    job_tx
+        .send(Job::WorkflowConfirmAndRender {
+            input,
+            output: output.clone(),
+            edits,
+            original_transactions,
+            opening_balance: dec!(100.00),
+            expected_closing: Some(dec!(250.00)),
+            deep_font_replication: false,
+            max_visual_attempts: 1,
+            visual_threshold: 0.02,
+            ignore_font_coverage: false,
+            ignore_visual_fidelity: false,
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut rejected = false;
+    while Instant::now() < deadline {
+        match result_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(JobResult::WorkflowFailed(WorkflowFailure::FinalMathInvalid { imbalance })) => {
+                assert_eq!(imbalance, dec!(-50.00));
+                rejected = true;
+                break;
+            }
+            Ok(JobResult::WorkflowComplete(outcome)) => {
+                panic!("unbalanced workflow completed: {outcome:?}")
+            }
+            Ok(JobResult::Error { message, .. }) => panic!("unexpected runtime error: {message}"),
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("result channel failed: {error}"),
+        }
+    }
+
+    assert!(rejected, "missing deterministic imbalance rejection");
+    assert_eq!(std::fs::read(&output).unwrap(), output_before);
 }

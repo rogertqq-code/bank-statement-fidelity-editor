@@ -1112,36 +1112,52 @@ impl MyApp {
             }
         }
         if want_confirm {
-            if let Some(p) = self.workflow_preview.clone() {
-                let (kept, _) =
-                    crate::engine::workflow::prune_redundant_edits(&self.workflow_edits, &p);
-                if let Err(e) = self.job_tx.send(Job::WorkflowConfirmAndRender {
-                    input: PathBuf::from(&self.input_path),
-                    output: PathBuf::from(&self.output_path),
-                    edits: kept,
-                    original_transactions: self.workflow_transactions.clone(),
-                    opening_balance: self
-                        .workflow_validation
-                        .as_ref()
-                        .map(|v| v.opening_balance)
-                        .unwrap_or_default(),
-                    expected_closing: self.workflow_validation.as_ref().and_then(|v| {
-                        if v.closing_balance.abs() > rust_decimal::Decimal::ZERO {
-                            Some(v.closing_balance)
-                        } else {
-                            None
+            if let Some(preview) = self.workflow_preview.clone() {
+                if !preview.balanced {
+                    self.toast(
+                        ToastKind::Error,
+                        format!(
+                            "Render blocked: deterministic ledger is out of balance by ${:.2}",
+                            preview.final_imbalance.abs()
+                        ),
+                    );
+                } else {
+                    let (kept, _) = crate::engine::workflow::prune_redundant_edits(
+                        &self.workflow_edits,
+                        &preview,
+                    );
+                    match self.job_tx.send(Job::WorkflowConfirmAndRender {
+                        input: PathBuf::from(&self.input_path),
+                        output: PathBuf::from(&self.output_path),
+                        edits: kept,
+                        original_transactions: self.workflow_transactions.clone(),
+                        opening_balance: self
+                            .workflow_validation
+                            .as_ref()
+                            .map(|validation| validation.opening_balance)
+                            .unwrap_or_default(),
+                        expected_closing: self.workflow_validation.as_ref().and_then(
+                            |validation| {
+                                if validation.closing_balance.abs() > rust_decimal::Decimal::ZERO {
+                                    Some(validation.closing_balance)
+                                } else {
+                                    None
+                                }
+                            },
+                        ),
+                        deep_font_replication: self.settings.deep_font_replication,
+                        max_visual_attempts: self.settings.max_visual_attempts,
+                        visual_threshold: self.settings.visual_diff_threshold,
+                        ignore_font_coverage: false,
+                        ignore_visual_fidelity: false,
+                    }) {
+                        Ok(()) => {
+                            self.in_flight += 1;
+                            self.toast(ToastKind::Info, "Confirm + Render triggered (Ctrl+3)");
                         }
-                    }),
-                    deep_font_replication: self.settings.deep_font_replication,
-                    max_visual_attempts: self.settings.max_visual_attempts,
-                    visual_threshold: self.settings.visual_diff_threshold,
-                    ignore_font_coverage: false,
-                    ignore_visual_fidelity: false,
-                }) {
-                    tracing::error!("Runtime disconnected: {}", e);
+                        Err(error) => tracing::error!("Runtime disconnected: {}", error),
+                    }
                 }
-                self.in_flight += 1;
-                self.toast(ToastKind::Info, "Confirm + Render triggered (Ctrl+3)");
             }
         }
 
