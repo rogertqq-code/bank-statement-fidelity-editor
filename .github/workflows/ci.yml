@@ -163,6 +163,61 @@ jobs:
       - name: Run production-bridge smoke with Pro package present
         run: python python/smoke_test.py
 
+  p0-integrity:
+    name: P0 integrity regressions (${{ matrix.os }})
+    needs: base-state
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-pro.txt
+      - name: Install pinned Python and PyMuPDF Pro runtime
+        run: python -m pip install --requirement requirements-pro.txt
+      - name: Select Python for PyO3
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "PYO3_PYTHON=python" >> "$GITHUB_ENV"
+          else
+            echo "PYO3_PYTHON=$(command -v python3)" >> "$GITHUB_ENV"
+          fi
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libssl-dev \
+            pkg-config
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install pkg-config openssl@3
+      - uses: Swatinem/rust-cache@v2
+      - name: Python exact-application regressions
+        run: python python/test_apply_many_edits_contract.py
+      - name: Audit snapshot and tamper regressions
+        run: cargo test --locked --lib app::audit::tests --message-format=short
+      - name: Commit-barrier rollback regressions
+        run: cargo test --locked --lib app::commit::tests --message-format=short
+      - name: Real runtime integrity regressions
+        run: cargo test --locked --test integrity_regressions --message-format=short
+
   advisory-inventory:
     name: deferred hardening inventory
     runs-on: ubuntu-latest
