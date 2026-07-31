@@ -1,10 +1,12 @@
 # Phase 01 Gate Manifest
 
-**Disposition:** `IN PROGRESS`
+**Disposition:** `PASS`
 **Phase:** Phase 01 — Executable base state
 **Gate:** Gate 01
 **Base commit:** `5c3678c`
 **Candidate branch:** `remediation/phase-01-base-state`
+**Candidate commit:** `7cb54c2993242b3b3614589d58f3f1dbbde8f646`
+**Remote CI run:** [30653780202](https://github.com/rogertqq-code/bank-statement-fidelity-editor/actions/runs/30653780202) — overall `success`
 **Prepared by:** Manus AI
 **Date:** 2026-07-31
 
@@ -12,8 +14,8 @@
 
 | Ticket | Severity | State | Evidence |
 |---|---:|---|---|
-| BASE-001 | P1 | Implemented; remote matrix pending | Host-neutral Rust toolchain/Cargo config, target-scoped UIAutomation, portable Windows Cargo wrapper. |
-| BASE-002 | P1 | Implemented; remote matrix pending | Blocking format/lint/base-state jobs and concurrency cancellation; deferred hardening inventory remains advisory. |
+| BASE-001 | P1 | Implemented and cross-platform verified | Host-neutral Rust toolchain/Cargo config, target-scoped UIAutomation, portable Windows Cargo wrapper; Windows, macOS, and Linux development jobs passed. |
+| BASE-002 | P1 | Implemented and remote verified | Blocking format/lint/base-state jobs and concurrency cancellation passed; deferred hardening inventory remains explicitly advisory. |
 | BASE-003 | P1 | Partially implemented | Required deterministic library/runtime/startup suites are explicit; broader live/UI suite classification remains in owning phases. |
 | BASE-004 | P2 | Deferred by ticket scope | Node visual-test disposition remains a later base/quality cleanup item and does not block this executable subset. |
 | BASE-005 | P1 | Deferred to health/readiness repair | Current base state proves import, compile, and startup; truthful component/readiness schema remains open. |
@@ -40,8 +42,8 @@
 | Platform | Architecture | Rust | Python | PyMuPDF | Result |
 |---|---|---|---|---|---|
 | Linux development | x86_64 | 1.89.0 | 3.12.3 local | 1.28.0 + optional Pro package present | PASS |
-| Windows | x86_64 MSVC | 1.89.0 planned CI | 3.11 planned CI | 1.28.0 base/Pro package modes | PENDING REMOTE CI |
-| macOS | Apple Silicon | 1.89.0 planned CI | 3.11 planned CI | 1.28.0 base/Pro package modes | PENDING REMOTE CI |
+| Windows | x86_64 MSVC | 1.89.0 | 3.11 | 1.28.0 base and optional-Pro package modes | PASS — job `91233067547`; Pro job `91233067542` |
+| macOS | Apple Silicon | 1.89.0 | 3.11 | 1.28.0 base and optional-Pro package modes | PASS — job `91233067603`; Pro job `91233067553` |
 
 ## Local commands and results
 
@@ -71,7 +73,7 @@
 
 ## Repository and workflow validation
 
-The CI workflow parses as YAML, uses read-only permissions, runs on every branch/PR, cancels superseded runs, and defines mandatory Ubuntu, Windows, and macOS base-state jobs. The publication workflow remains manual, read-only, and frozen. `continue-on-error` appears only in the explicitly deferred hardening inventory.
+The CI workflow parses as YAML, uses read-only permissions, runs on every branch/PR, cancels superseded runs, and defines mandatory Ubuntu, Windows, and macOS base-state jobs. The publication workflow remains manual, read-only, and frozen. Remote run [30653780202](https://github.com/rogertqq-code/bank-statement-fidelity-editor/actions/runs/30653780202) completed with overall `success` on candidate commit `7cb54c2`: rustfmt, production Clippy, all three base-state platforms, and both optional-Pro import jobs passed. The explicitly deferred dependency-advisory job reported the previously audited dependency findings and concluded `failure` under job-level `continue-on-error`; it did not weaken or bypass any functional gate and remains assigned to final hardening.
 
 ## Migration and rollback
 
@@ -91,10 +93,10 @@ There is no customer-data or schema migration. Developer environments must stop 
 | Requirement | Result |
 |---|---|
 | Linux development executable base state | PASS |
-| Windows x64 base-state CI | PENDING |
-| macOS Apple Silicon base-state CI | PENDING |
-| Optional Pro package import smoke on Windows/macOS | PENDING |
+| Windows x64 base-state CI | PASS |
+| macOS Apple Silicon base-state CI | PASS |
+| Optional Pro package import smoke on Windows/macOS | PASS |
 | Local evidence and diff hygiene | PASS |
-| Remote clean-branch reproducibility | PENDING |
+| Remote clean-branch reproducibility | PASS |
 
-**Final disposition:** `IN PROGRESS`
+**Final disposition:** `PASS`

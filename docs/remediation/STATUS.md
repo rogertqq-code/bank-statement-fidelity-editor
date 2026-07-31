@@ -2,8 +2,8 @@
 
 **Repository head audited:** `41993a8daf73266eaae5d6d4abcc2cc13ac85662`
 **Working branch:** `remediation/phase-01-base-state`
-**Current phase:** Phase 01 / executable base state
-**Current gate:** Gate 01 — `IN PROGRESS`
+**Current phase:** Phase 01 / executable base state complete
+**Current gate:** Gate 01 — `PASS`
 **Release publication:** Frozen
 
 ## Accepted owner decisions
@@ -22,7 +22,7 @@
 | Phase | Gate | State | Blocking outcome |
 |---:|---:|---|---|
 | 00 | 00 | Complete | Backlog, ADRs, release freeze, evidence governance, and baseline inventory passed and were pushed at `5c3678c`. |
-| 01 | 01 | In progress | Linux development checks pass; Windows/macOS branch CI pending. |
+| 01 | 01 | Complete | Windows, macOS, Linux development, Clippy, format, and optional-Pro jobs passed in CI run `30653780202`. |
 | 02 | 02 | Planned | Five P0 integrity defects and active blockers closed. |
 | 03 | 03 | Planned | Unified runtime protocol, state, storage, cancellation, and recovery. |
 | 04 | 04 | Planned | Permanent Python/PyMuPDF pipeline bulletproofed. |
@@ -58,9 +58,9 @@ Gate 00 passed locally, was committed at `5c3678c`, and was pushed to `remediati
 | Generated logs, scratch scripts, outputs, and machine Pdfium DLLs removed | Local PASS |
 | CI and release workflow YAML validation | Local PASS |
 | Phase 01 validator | Local PASS |
-| Windows x64 CI | Pending branch push |
-| macOS Apple Silicon CI | Pending branch push |
-| Gate 01 evidence manifest | Pending cross-platform results |
+| Windows x64 CI | PASS — job `91233067547` |
+| macOS Apple Silicon CI | PASS — job `91233067603` |
+| Gate 01 evidence manifest | PASS — run `30653780202`, candidate `7cb54c2` |
 
 ## Open decisions with later blocking phases
 
@@ -76,7 +76,7 @@ Gate 00 passed locally, was committed at `5c3678c`, and was pushed to `remediati
 
 ## Next executable work
 
-1. Commit and push the validated Phase 01 branch to trigger Windows, macOS, and Linux development CI.
-2. Diagnose every cross-platform failure; do not waive or soften a gate.
-3. Capture the final CI run IDs, exact outcomes, and artifact hashes in the Gate 01 manifest.
-4. Close Gate 01 only after all mandatory platform jobs pass from the remote branch.
+1. Commit and push the Gate 01 closure evidence.
+2. Create the Phase 02 core-business-logic branch from the verified Phase 01 checkpoint.
+3. Add failing regressions for the five audited P0 destructive/false-success paths before changing production logic.
+4. Repair and verify each P0 ticket sequentially, preserving all Gate 01 regressions.
