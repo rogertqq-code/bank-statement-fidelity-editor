@@ -51,6 +51,12 @@ pub struct ReplaceOutcome {
     pub obj_id: Option<String>,
 }
 
+/// Extracted text geometry in canonical page coordinates.
+///
+/// `bbox` is always `[x0, y0, x1, y1]` in PDF points with the origin at the
+/// visible top-left, matching PyMuPDF spans, rendered-page clicks, GUI overlays,
+/// and Python edit rectangles. Engines convert internal geometry at their own
+/// implementation boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextBlock {
     pub page: usize,
@@ -75,9 +81,9 @@ pub use crate::engine::layout::DocumentLayout;
 /// `0.0` when the rectangles don't intersect at all, `1.0` when `bbox` is
 /// entirely inside `span_bbox` (and equal in area), or any value in between.
 ///
-/// Both rectangles are PDF-coordinate rects: `[x0, y0, x1, y1]` with
-/// `x1 > x0` and `y1 > y0`. Out-of-order rects yield `0.0` rather than
-/// panicking.
+/// Both rectangles use canonical top-left page coordinates:
+/// `[x0, y0, x1, y1]` with `x1 > x0` and `y1 > y0`. Out-of-order rects yield
+/// `0.0` rather than panicking.
 pub fn bbox_overlap_fraction(bbox: [f32; 4], span_bbox: [f32; 4]) -> f32 {
     let area = |r: [f32; 4]| {
         let w = (r[2] - r[0]).max(0.0);

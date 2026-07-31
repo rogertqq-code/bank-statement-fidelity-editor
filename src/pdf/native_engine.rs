@@ -60,6 +60,8 @@ impl OxidizePdfEngine {
                 ))
             })?;
 
+        let page_box = effective_page_box(&doc, *page_id)?;
+
         let content = doc
             .get_page_content(*page_id)
             .map_err(|e| EngineError::ExtractFailed(format!("Failed to get page content: {e}")))?;
@@ -149,7 +151,12 @@ impl OxidizePdfEngine {
                             blocks.push(TextBlock {
                                 page: page_num,
                                 text: text.clone(),
-                                bbox: [x, y, x + estimated_width, y + font_size],
+                                bbox: page_box.content_span_to_top_left(
+                                    x,
+                                    y,
+                                    estimated_width,
+                                    font_size,
+                                ),
                                 font: current_font.clone(),
                                 size: font_size,
                                 obj_id: Some(format!("ObjId({}, {})", page_id.0, page_id.1)),
@@ -179,7 +186,12 @@ impl OxidizePdfEngine {
                             blocks.push(TextBlock {
                                 page: page_num,
                                 text: combined_text,
-                                bbox: [x, y, x + estimated_width, y + font_size],
+                                bbox: page_box.content_span_to_top_left(
+                                    x,
+                                    y,
+                                    estimated_width,
+                                    font_size,
+                                ),
                                 font: current_font.clone(),
                                 size: font_size,
                                 obj_id: Some(format!("ObjId({}, {})", page_id.0, page_id.1)),
@@ -202,6 +214,99 @@ fn operand_to_f32(obj: &lopdf::Object) -> Option<f32> {
         lopdf::Object::Real(f) => Some(*f),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CanonicalPageBox {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+}
+
+impl CanonicalPageBox {
+    fn content_span_to_top_left(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+        [
+            x - self.x_min,
+            self.y_max - (y + height),
+            x - self.x_min + width,
+            self.y_max - y,
+        ]
+    }
+
+    fn top_left_to_content(self, bbox: [f32; 4]) -> [f32; 4] {
+        [
+            self.x_min + bbox[0],
+            self.y_max - bbox[3],
+            self.x_min + bbox[2],
+            self.y_max - bbox[1],
+        ]
+    }
+
+    fn is_valid(self) -> bool {
+        self.x_max > self.x_min && self.y_max > self.y_min
+    }
+}
+
+fn effective_page_box(
+    doc: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+) -> Result<CanonicalPageBox, EngineError> {
+    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+        if let Some(page_box) = inherited_page_box(doc, page_id, key) {
+            if page_box.is_valid() {
+                return Ok(page_box);
+            }
+        }
+    }
+    Err(EngineError::ExtractFailed(format!(
+        "Page {page_id:?} has no valid inherited CropBox or MediaBox"
+    )))
+}
+
+fn inherited_page_box(
+    doc: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+    key: &[u8],
+) -> Option<CanonicalPageBox> {
+    let mut current = page_id;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return None;
+        }
+        let dictionary = doc.get_dictionary(current).ok()?;
+        if let Ok(value) = dictionary.get(key) {
+            if let Some(page_box) = object_as_page_box(doc, value) {
+                return Some(page_box);
+            }
+        }
+        current = dictionary
+            .get(b"Parent")
+            .and_then(lopdf::Object::as_reference)
+            .ok()?;
+    }
+}
+
+fn object_as_page_box(doc: &lopdf::Document, object: &lopdf::Object) -> Option<CanonicalPageBox> {
+    let resolved = match object {
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok()?,
+        value => value,
+    };
+    let values = resolved.as_array().ok()?;
+    if values.len() != 4 {
+        return None;
+    }
+    let x0 = operand_to_f32(&values[0])?;
+    let y0 = operand_to_f32(&values[1])?;
+    let x1 = operand_to_f32(&values[2])?;
+    let y1 = operand_to_f32(&values[3])?;
+    Some(CanonicalPageBox {
+        x_min: x0.min(x1),
+        y_min: y0.min(y1),
+        x_max: x0.max(x1),
+        y_max: y0.max(y1),
+    })
 }
 
 /// Helper: extract a String from the first string operand.
@@ -557,6 +662,7 @@ impl PdfEngine for OxidizePdfEngine {
                 pages.len()
             ))
         })?;
+        let content_bbox = effective_page_box(&doc, page_id)?.top_left_to_content(bbox);
 
         // Get the page content
         let content_bytes = doc
@@ -634,8 +740,8 @@ impl PdfEngine for OxidizePdfEngine {
                 "Tj" if in_text && !replaced => {
                     let x = tm[4];
                     let y = tm[5];
-                    let x_matches = x >= bbox[0] - 5.0 && x <= bbox[2] + 5.0;
-                    let y_matches = y >= bbox[1] - 1.0 && y <= bbox[3] + 1.0;
+                    let x_matches = x >= content_bbox[0] - 5.0 && x <= content_bbox[2] + 5.0;
+                    let y_matches = y >= content_bbox[1] - 1.0 && y <= content_bbox[3] + 1.0;
                     let coords_ok = x_matches && y_matches;
 
                     // T2: Tightened span selection.
@@ -676,8 +782,8 @@ impl PdfEngine for OxidizePdfEngine {
                 "TJ" if in_text && !replaced => {
                     let x = tm[4];
                     let y = tm[5];
-                    let x_matches = x >= bbox[0] - 5.0 && x <= bbox[2] + 5.0;
-                    let y_matches = y >= bbox[1] - 1.0 && y <= bbox[3] + 1.0;
+                    let x_matches = x >= content_bbox[0] - 5.0 && x <= content_bbox[2] + 5.0;
+                    let y_matches = y >= content_bbox[1] - 1.0 && y <= content_bbox[3] + 1.0;
                     let coords_ok = x_matches && y_matches;
 
                     // T2: Tightened span selection (TJ variant).
@@ -832,6 +938,7 @@ impl PdfEngine for OxidizePdfEngine {
             let page_id = *pages
                 .get(&(page_idx as u32 + 1))
                 .ok_or_else(|| EngineError::ApplyFailed(format!("Page {page_idx} not found")))?;
+            let page_box = effective_page_box(&doc, page_id)?;
 
             let content_bytes = doc.get_page_content(page_id).unwrap_or_default();
             if content_bytes.is_empty() {
@@ -916,16 +1023,17 @@ impl PdfEngine for OxidizePdfEngine {
                             if let Some(rect) = edit["rect"].as_array() {
                                 if rect.len() == 4 {
                                     tracing::debug!("edit bbox match found");
-                                    let bbox = [
+                                    let canonical_bbox = [
                                         rect[0].as_f64().unwrap_or(0.0) as f32,
                                         rect[1].as_f64().unwrap_or(0.0) as f32,
                                         rect[2].as_f64().unwrap_or(0.0) as f32,
                                         rect[3].as_f64().unwrap_or(0.0) as f32,
                                     ];
-                                    if x >= bbox[0] - 1.0
-                                        && y >= bbox[1] - 1.0
-                                        && x <= bbox[2] + 1.0
-                                        && y <= bbox[3] + 1.0
+                                    let content_bbox = page_box.top_left_to_content(canonical_bbox);
+                                    if x >= content_bbox[0] - 1.0
+                                        && y >= content_bbox[1] - 1.0
+                                        && x <= content_bbox[2] + 1.0
+                                        && y <= content_bbox[3] + 1.0
                                     {
                                         if let Some(new_text) = edit["new_text"].as_str() {
                                             op.operator = "Tj".to_string();
@@ -1049,5 +1157,35 @@ mod tests {
         assert_eq!(operand_to_f32(&lopdf::Object::Integer(42)), Some(42.0));
         assert_eq!(operand_to_f32(&lopdf::Object::Real(2.5)), Some(2.5));
         assert_eq!(operand_to_f32(&lopdf::Object::Boolean(true)), None);
+    }
+
+    #[test]
+    fn content_and_top_left_coordinates_round_trip() {
+        let page_box = CanonicalPageBox {
+            x_min: 10.0,
+            y_min: 20.0,
+            x_max: 605.0,
+            y_max: 862.0,
+        };
+        let canonical = page_box.content_span_to_top_left(82.0, 740.0, 120.0, 12.0);
+        assert_eq!(canonical, [72.0, 110.0, 192.0, 122.0]);
+        assert_eq!(
+            page_box.top_left_to_content(canonical),
+            [82.0, 740.0, 202.0, 752.0]
+        );
+    }
+
+    #[test]
+    fn synthetic_fixture_bbox_matches_pymupdf_top_left_space() {
+        let page_box = CanonicalPageBox {
+            x_min: 0.0,
+            y_min: 0.0,
+            x_max: 595.0,
+            y_max: 842.0,
+        };
+        assert_eq!(
+            page_box.content_span_to_top_left(72.0, 720.0, 198.0, 12.0),
+            [72.0, 110.0, 270.0, 122.0]
+        );
     }
 }

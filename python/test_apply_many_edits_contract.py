@@ -46,6 +46,36 @@ def create_text_pdf(path: Path, text: str = "KEEP") -> list[float]:
     return [float(value) for value in spans[0]["bbox"]]
 
 
+def create_many_text_pdf(path: Path, count: int) -> list[tuple[str, list[float]]]:
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    expected = []
+    for index in range(count):
+        text = f"OLD_{index:02d}"
+        expected.append(text)
+        page.insert_text(
+            pymupdf.Point(72, 55 + index * 28),
+            text,
+            fontname="helv",
+            fontsize=11,
+        )
+    document.save(path)
+    document.close()
+
+    document = pymupdf.open(path)
+    by_text = {
+        span.get("text", ""): [float(value) for value in span["bbox"]]
+        for block in document[0].get_text("dict").get("blocks", [])
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+    }
+    document.close()
+    missing = [text for text in expected if text not in by_text]
+    if missing:
+        raise AssertionError(f"missing generated spans: {missing}")
+    return [(text, by_text[text]) for text in expected]
+
+
 class ApplyManyEditsContractTests(unittest.TestCase):
     def test_no_overlap_is_non_destructive_and_not_success(self):
         with tempfile.TemporaryDirectory(prefix="apply-report-no-overlap-") as temp:
@@ -122,6 +152,53 @@ class ApplyManyEditsContractTests(unittest.TestCase):
             document.close()
             self.assertIn("NEW", observed)
             self.assertNotIn("OLD", observed)
+
+    def test_twenty_edit_transaction_is_exact_and_repeatable(self):
+        with tempfile.TemporaryDirectory(prefix="apply-report-twenty-") as temp:
+            root = Path(temp)
+            source = root / "source.pdf"
+            output_one = root / "output-one.pdf"
+            output_two = root / "output-two.pdf"
+            spans = create_many_text_pdf(source, 20)
+            edits = [
+                {
+                    "page": 0,
+                    "rect": bbox,
+                    "new_text": f"NEW_{index:02d}",
+                }
+                for index, (_old_text, bbox) in enumerate(spans)
+            ]
+
+            first = BRIDGE.apply_many_edits(str(source), str(output_one), edits)
+            second = BRIDGE.apply_many_edits(str(source), str(output_two), edits)
+
+            for report, output in ((first, output_one), (second, output_two)):
+                self.assertTrue(report["success"], json.dumps(report, indent=2))
+                self.assertEqual(
+                    (
+                        report["requested"],
+                        report["matched"],
+                        report["placed"],
+                        report["failed"],
+                    ),
+                    (20, 20, 20, 0),
+                )
+                self.assertTrue(report["output_published"])
+                self.assertEqual(report["output_sha256"], sha256(output))
+                self.assertEqual(len(report["edits"]), 20)
+                self.assertEqual(len(report["method_per_edit"]), 20)
+                self.assertTrue(all(edit["matched"] for edit in report["edits"]))
+                self.assertTrue(all(edit["placed"] for edit in report["edits"]))
+
+            observed_outputs = []
+            for output in (output_one, output_two):
+                document = pymupdf.open(output)
+                observed_outputs.append("\n".join(page.get_text() for page in document))
+                document.close()
+            self.assertEqual(observed_outputs[0], observed_outputs[1])
+            for index in range(20):
+                self.assertIn(f"NEW_{index:02d}", observed_outputs[0])
+                self.assertNotIn(f"OLD_{index:02d}", observed_outputs[0])
 
 
 if __name__ == "__main__":
