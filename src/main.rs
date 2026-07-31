@@ -7,6 +7,11 @@ use dual_core_pdf_pipeline::{app, security};
 use std::sync::Arc;
 
 fn main() {
+    // Clap handles `--help` and `--version` by printing and exiting here. Keep
+    // this before environment, telemetry, configuration, audit, and runtime
+    // initialization so informational startup contracts are side-effect free.
+    let cli = app::cli::Cli::parse();
+
     // If running in a Mac app bundle, resolve relative to Resources
     if let Ok(exe_path) = std::env::current_exe() {
         if exe_path.to_string_lossy().contains("Contents/MacOS") {
@@ -45,9 +50,6 @@ fn main() {
     }));
 
     let _telemetry_guard = app::telemetry::init(&config);
-
-    // Parse CLI early so --help works without security gate
-    let cli = app::cli::Cli::parse();
 
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║   Bank Statement Fidelity Editor v1.0.0                   ║");

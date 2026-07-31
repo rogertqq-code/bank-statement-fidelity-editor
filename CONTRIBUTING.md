@@ -4,24 +4,29 @@ We welcome contributions to the Bank Statement Fidelity Editor!
 
 ## Development Setup
 
-1. Follow the [QUICKSTART.md](QUICKSTART.md) guide to set up your environment.
-2. Copy `.env.example` to `.env` and configure at minimum `DUAL_CORE_PASSPHRASE` and `GEMINI_API_KEY`.
-3. Build and run tests:
+Follow [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) from a clean checkout. The executable base state does not require cloud credentials. Install `requirements-ci.txt`, then run the platform verification command:
 
 ```bash
-cargo build
-cargo test
+./scripts/verify-base-state.sh
 ```
+
+On Windows PowerShell, run:
+
+```powershell
+./scripts/verify-base-state.ps1
+```
+
+Copy `.env.example` to `.env` only when testing an optional provider or licensed capability that explicitly requires it.
 
 ## Code Quality
 
 ### Linting & Formatting
 
-All code must pass clippy and rustfmt before merge:
+All code must pass the platform base-state command before merge. For a focused Rust edit, the minimum local checks are:
 
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --locked --lib --bins -- -D warnings
 ```
 
 ### Mutation Testing
@@ -37,14 +42,7 @@ This verifies that the test suite actually catches bugs in the business logic (e
 
 ### Full Validation
 
-Run the complete validation suite before submitting:
-
-```bash
-cargo fmt
-cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-```
+Run the complete platform command in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) before submitting. During the remediation program, also complete the ticket evidence fields, run all prior P0 regressions, and update the owning phase manifest under `docs/remediation/evidence/`.
 
 ## Architecture Guidelines
 
@@ -72,3 +70,6 @@ Before merging, verify documentation matches code:
 - **`AGENTS.md`** — Agent development rules and autonomy boundaries
 - **`QUICKSTART.md`** — Setup guide for new developers
 - **`CHANGELOG.md`** — Release history
+- **`docs/DEVELOPMENT.md`** — Reproducible Windows/macOS/Linux-development bootstrap and verification
+- **`docs/remediation/MASTER_PLAN.md`** — Sequenced implementation tickets and mandatory gates
+- **`docs/remediation/EVIDENCE_POLICY.md`** — Ticket and phase proof requirements

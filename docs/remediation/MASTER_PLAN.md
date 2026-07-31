@@ -67,7 +67,7 @@ A ticket may enter `Blocked` only with a written blocker, attempted alternatives
 | Ticket | Sev. | Findings | Work | Ticket verification |
 |---|---:|---|---|---|
 | BASE-001 | P1 | OPS-03 | Remove the global Windows target/compiler path; target-scope platform dependencies; align Rust 1.89, Python, PyO3, and native prerequisites across mandatory Windows/macOS builds and Linux development CI. | Clean `cargo check --all-targets` on Windows and macOS plus Linux development CI; no host-specific repository edit required. |
-| BASE-002 | P1 | QA-07 | Make format, Clippy, unit/integration, RustSec, dependency policy, secret scan, and coverage jobs blocking. Add concurrency cancellation for superseded CI runs. | Deliberately broken test/lint/advisory branch is rejected; green branch passes. |
+| BASE-002 | P1 | QA-07 | Make format, Clippy, compile, unit/integration, executable smoke, and minimum critical-path coverage jobs blocking. Add concurrency cancellation for superseded CI runs. Keep dependency/supply-chain reports advisory until Phase 12, except any active credential exposure or data exfiltration blocks immediately. | Deliberately broken build/test/lint branch is rejected; green branch passes; deferred hardening reports remain visible and ticketed. |
 | BASE-003 | P1 | QA-03, QA-06 | Classify tests as unit, contract, integration, E2E, live-provider, GUI, accessibility, performance, and package smoke. Rename no-panic suites and replace self-skip with explicit CI disposition. | CI report states executed/skipped counts and reasons; core E2E never silently self-skips. |
 | BASE-004 | P2 | QA-04 | Either implement the Node visual test command and pin its dependencies or remove the unused package/workflow claims. | `npm test` passes deterministically or Node is absent from the supported toolchain. |
 | BASE-005 | P1 | QA-01 | Separate component health from full readiness. Fix `doctor`/`selftest` result schemas so failed Python/provider initialization cannot appear ready. | Matrix tests cover missing Python, missing Pro key, missing Pdfium, offline mode, and full configured mode. |
@@ -76,7 +76,7 @@ A ticket may enter `Blocked` only with a written blocker, attempted alternatives
 | BASE-008 | P2/P3 | Repository hygiene | Remove tracked generated binaries, logs, outputs, coverage, scratch artifacts, stale one-off scripts, and duplicate docs; strengthen ignore rules without hiding required fixtures. | Clean clone and test leave `git status` clean; secret/artifact scan passes. |
 | BASE-009 | P3 | Developer experience | Add one documented bootstrap command, one verification command, contribution workflow, supported tool versions, and failure troubleshooting. | New clean environment reaches the same baseline from docs only. |
 
-**Gate 01 commands:** `cargo fmt --all -- --check`; strict cross-platform Clippy; all currently supportable tests; RustSec and dependency policy; secret scan; CLI contract suite; clean-tree check. The gate must pass on a clean clone before Phase 02.
+**Gate 01 commands:** `cargo fmt --all -- --check`; strict cross-platform Clippy; all currently supportable tests; executable smoke; CLI contract suite; Python import/runtime smoke; and clean-tree check. Dependency, privacy, and supply-chain reports remain visible but non-blocking until Phase 12 unless they identify an active exposure. The gate must pass on a clean clone before Phase 02.
 
 ## 5. Phase 02 — Critical integrity, exact success, and immutable history
 

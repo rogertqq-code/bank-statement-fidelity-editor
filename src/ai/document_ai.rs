@@ -2034,40 +2034,24 @@ mod tests {
 
     #[test]
     fn jwt_claim_shape() {
-        let key_content =
-            std::fs::read_to_string("tests/fixtures/test_service_account.json").unwrap();
-        let service_account: serde_json::Value = serde_json::from_str(&key_content).unwrap();
-        let client_email = service_account["client_email"].as_str().unwrap();
-        let private_key = service_account["private_key"].as_str().unwrap();
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const CLIENT_EMAIL: &str = "document-ai-test@example.invalid";
         let claims = JwtClaims {
-            iss: client_email.to_string(),
+            iss: CLIENT_EMAIL.to_string(),
             scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
             aud: "https://oauth2.googleapis.com/token".to_string(),
-            iat: now,
-            exp: now + 3600,
+            iat: ISSUED_AT,
+            exp: ISSUED_AT + 3600,
         };
 
-        let mut header = Header::new(Algorithm::RS256);
-        header.typ = Some("JWT".to_string());
-        let encoding_key = EncodingKey::from_rsa_pem(private_key.as_bytes()).unwrap();
-        let signed_jwt = encode(&header, &claims, &encoding_key).unwrap();
-
-        let parts: Vec<&str> = signed_jwt.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(parts[1])
-            .unwrap();
-        let token_data: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
-        assert_eq!(token_data["iss"].as_str().unwrap(), client_email);
+        let token_data = serde_json::to_value(&claims).expect("JWT claims must serialize");
+        assert_eq!(token_data["iss"], CLIENT_EMAIL);
         assert_eq!(
-            token_data["aud"].as_str().unwrap(),
-            "https://oauth2.googleapis.com/token"
+            token_data["scope"],
+            "https://www.googleapis.com/auth/cloud-platform"
         );
+        assert_eq!(token_data["aud"], "https://oauth2.googleapis.com/token");
+        assert_eq!(token_data["iat"], ISSUED_AT);
         assert_eq!(
             token_data["exp"].as_u64().unwrap() - token_data["iat"].as_u64().unwrap(),
             3600

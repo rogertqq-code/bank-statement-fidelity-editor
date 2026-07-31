@@ -1,9 +1,9 @@
 # Remediation Program Status
 
 **Repository head audited:** `41993a8daf73266eaae5d6d4abcc2cc13ac85662`
-**Working branch:** `remediation/phase-00-governance-baseline`
-**Current phase:** Phase 00 / backlog and governance
-**Current gate:** Gate 00 — `IN PROGRESS`
+**Working branch:** `remediation/phase-01-base-state`
+**Current phase:** Phase 01 / executable base state
+**Current gate:** Gate 01 — `IN PROGRESS`
 **Release publication:** Frozen
 
 ## Accepted owner decisions
@@ -21,8 +21,8 @@
 
 | Phase | Gate | State | Blocking outcome |
 |---:|---:|---|---|
-| 00 | 00 | In progress | Backlog, ADRs, release freeze, evidence governance, and baseline inventory. |
-| 01 | 01 | Planned | Reproducible Windows/macOS and Linux-development CI baseline. |
+| 00 | 00 | Complete | Backlog, ADRs, release freeze, evidence governance, and baseline inventory passed and were pushed at `5c3678c`. |
+| 01 | 01 | In progress | Linux development checks pass; Windows/macOS branch CI pending. |
 | 02 | 02 | Planned | Five P0 integrity defects and active blockers closed. |
 | 03 | 03 | Planned | Unified runtime protocol, state, storage, cancellation, and recovery. |
 | 04 | 04 | Planned | Permanent Python/PyMuPDF pipeline bulletproofed. |
@@ -36,21 +36,31 @@
 | 12 | 12 | Planned | Final non-blocking privacy, secrets, dependency, and supply-chain hardening. |
 | 13 | 13 | Planned | Complete post-hardening rerun and signed release. |
 
-## Gate 00 checklist
+## Completed checkpoint
+
+Gate 00 passed locally, was committed at `5c3678c`, and was pushed to `remediation/phase-00-governance-baseline`. The default branch remains untouched.
+
+## Gate 01 checklist
 
 | Requirement | State |
 |---|---|
-| Deploy-key read access verified | Complete |
-| Deploy-key write dry-run verified | Complete |
-| Fresh isolated remediation clone and branch | Complete |
-| Accepted architecture decisions recorded | Complete |
-| 57 findings mapped to unique tickets | Complete — validator reports 57/57 mapped and 129 unique tickets |
-| Release publication frozen | Complete in branch; remote merge pending |
-| Ticket template and evidence policy | Complete |
-| Baseline source/fixture/toolchain hash manifest | Pending |
-| Gate 00 manifest | Pending |
-| Branch validation and clean diff review | Pending |
-| Commit/push for owner review | Pending explicit repository-instruction confirmation at the branch checkpoint |
+| Host-neutral Rust 1.89.0 toolchain and Cargo configuration | Local PASS |
+| Windows-only development dependencies target-scoped | Local PASS |
+| Pinned Python/PyMuPDF base and optional-Pro package manifests | Local PASS |
+| Production Python bridge smoke | Local PASS |
+| `cargo fmt --all -- --check` | Local PASS |
+| Strict production Clippy | Local PASS |
+| `cargo check --locked --all-targets` | Linux development PASS |
+| Library tests | 228 passed, 0 failed, 0 ignored |
+| Runtime actor smoke | 2 passed, 0 failed |
+| Configuration-free CLI startup regressions | 2 passed, 0 failed |
+| Production binary build and direct help/version startup | Linux development PASS; stderr empty without configuration |
+| Generated logs, scratch scripts, outputs, and machine Pdfium DLLs removed | Local PASS |
+| CI and release workflow YAML validation | Local PASS |
+| Phase 01 validator | Local PASS |
+| Windows x64 CI | Pending branch push |
+| macOS Apple Silicon CI | Pending branch push |
+| Gate 01 evidence manifest | Pending cross-platform results |
 
 ## Open decisions with later blocking phases
 
@@ -66,7 +76,7 @@
 
 ## Next executable work
 
-1. Create the immutable baseline and fixture hash inventory.
-2. Create and validate the Gate 00 evidence manifest.
-3. Run documentation/YAML/plan validators and secret/diff hygiene checks.
-4. Present the branch checkpoint for commit and push authorization required by `AGENTS.md`.
+1. Commit and push the validated Phase 01 branch to trigger Windows, macOS, and Linux development CI.
+2. Diagnose every cross-platform failure; do not waive or soften a gate.
+3. Capture the final CI run IDs, exact outcomes, and artifact hashes in the Gate 01 manifest.
+4. Close Gate 01 only after all mandatory platform jobs pass from the remote branch.

@@ -63,8 +63,12 @@ Thumbs.db
 # Project artefacts
 # =============================================================================
 output/
+out/
+scratch/
 audit/
 logs/
+logs_test/
+lcov.info
 output_test.pdf
 *.tmp
 *.bak
@@ -83,8 +87,11 @@ node_modules/
 
 package-lock.json
 
-# Pdfium Binaries
+# Pdfium binaries are produced or installed by the verified packaging/runtime
+# process; machine-specific copies must not be committed to source control.
 libpdfium.dylib
+pdfium.dll
+pdfium_lib/
 pdfium-*.tgz
 PDFiumConfig.cmake
 args.gn

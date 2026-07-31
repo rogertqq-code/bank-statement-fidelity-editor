@@ -1,6 +1,11 @@
 @echo off
-REM Prepend MinGW64 bin dir to PATH so pyo3-ffi build script can find dlltool.exe.
-REM The cargo [env] PATH override is avoided because it completely replaces
-REM the inherited PATH and breaks the GNU linker on Windows.
-set "PATH=C:\msys64\mingw64\bin;%PATH%"
-"C:\Users\zbook\.rustup\toolchains\1.89.0-x86_64-pc-windows-gnu\bin\cargo.exe" %*
+setlocal
+
+where cargo >nul 2>nul
+if errorlevel 1 (
+  echo Cargo was not found on PATH. Install Rust 1.89.0 with rustup and retry. 1>&2
+  exit /b 1
+)
+
+cargo %*
+exit /b %errorlevel%
