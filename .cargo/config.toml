@@ -1,0 +1,14 @@
+[env]
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+PDFIUM_AUTO_DOWNLOAD = "true"
+# PATH is NOT set here: [env] PATH OVERWRITES the inherited PATH and broke
+# the MinGW linker (ld returned 53). Use scripts/cargo.bat instead.
+
+# ─── Default build target ────────────────────────────────────────────────────
+[build]
+target = "x86_64-pc-windows-gnu"
+
+# ─── GNU linker (MinGW-w64 via MSYS2) ───────────────────────────────────────
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\msys64\\mingw64\\bin\\gcc.exe"
+ar     = "C:\\msys64\\mingw64\\bin\\ar.exe"
