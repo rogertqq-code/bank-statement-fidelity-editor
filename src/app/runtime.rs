@@ -3609,21 +3609,34 @@ async fn process_job_inner(
                             None,
                         );
                         final_record.obj_id = o.obj_id;
-                        let snap_path = a.snapshot_path_for(final_record.id);
 
-                        // Audit snapshots always use independent storage so later
-                        // in-place output edits cannot rewrite historical evidence.
-                        if let Err(e) =
-                            crate::app::audit::snapshot_link_or_copy(&output, &snap_path)
-                        {
+                        // Historical evidence is stored as a content-addressed,
+                        // independently allocated object with a hash/size/parent
+                        // manifest that must verify before the audit record is written.
+                        let (snapshot_path, snapshot_evidence) = match a
+                            .create_content_addressed_snapshot(
+                                final_record.id,
+                                &output,
+                                Some(&input),
+                            ) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                let _ = res_tx.send(JobResult::Error {
+                                    job_label: "apply_change".into(),
+                                    message: format!("Snapshot failed: {error}"),
+                                });
+                                return;
+                            }
+                        };
+                        final_record.snapshot_path = Some(snapshot_path);
+                        final_record.snapshot_evidence = Some(snapshot_evidence);
+                        if let Err(error) = a.verify_snapshot_record(&final_record) {
                             let _ = res_tx.send(JobResult::Error {
                                 job_label: "apply_change".into(),
-                                message: format!("Snapshot failed: {e}"),
+                                message: format!("Snapshot verification failed: {error}"),
                             });
                             return;
                         }
-
-                        final_record.snapshot_path = Some(snap_path);
                         if let Err(e) = a.write(
                             &final_record,
                             &input,

@@ -4,11 +4,20 @@
 use crate::engine::history::ChangeRecord;
 use crate::error::{AuditError, AuditResult};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SnapshotManifest {
+    schema_version: u32,
+    change_id: u64,
+    object_path: PathBuf,
+    evidence: crate::engine::history::SnapshotEvidence,
+}
 
 pub struct AuditLog {
     db: Option<Connection>,
@@ -67,23 +76,27 @@ impl AuditLog {
             record,
         };
 
-        let json_line = serde_json::to_string(&event).unwrap_or_default();
+        let json_line = serde_json::to_string(&event)
+            .map_err(|error| AuditError::Write(std::io::Error::other(error.to_string())))?;
+        let ts = record.timestamp.replace(':', "");
+        let event_path = self
+            .snapshots_dir
+            .join(format!("{ts}-{}.audit.json", record.id));
+        write_json_atomic(&event_path, &event)?;
 
         let timestamp = Utc::now().to_rfc3339();
-        self.db
-            .as_ref()
-            .unwrap()
-            .execute(
-                "INSERT INTO audit_log (timestamp, action, details) VALUES (?1, ?2, ?3)",
-                params![timestamp, "write", json_line],
-            )
-            .map_err(|e| AuditError::Write(std::io::Error::other(e.to_string())))?;
-
-        // Also dump an individual snapshot matching the old verification_report format
-        let ts = record.timestamp.replace(':', ""); // safe for filenames
-        let snap_json_path = self.snapshots_dir.join(format!("{ts}.json"));
-        if let Ok(json_bytes) = serde_json::to_vec_pretty(&event) {
-            let _ = fs::write(snap_json_path, json_bytes);
+        if let Err(error) = self.db.as_ref().unwrap().execute(
+            "INSERT INTO audit_log (timestamp, action, details) VALUES (?1, ?2, ?3)",
+            params![timestamp, "write", json_line],
+        ) {
+            if let Err(cleanup_error) = fs::remove_file(&event_path) {
+                tracing::error!(
+                    "[audit] failed to remove staged event {} after database failure: {}",
+                    event_path.display(),
+                    cleanup_error
+                );
+            }
+            return Err(AuditError::Write(std::io::Error::other(error.to_string())));
         }
 
         Ok(())
@@ -162,15 +175,165 @@ impl AuditLog {
         Ok(())
     }
 
+    pub fn create_content_addressed_snapshot(
+        &self,
+        change_id: u64,
+        source: &Path,
+        parent_source: Option<&Path>,
+    ) -> AuditResult<(PathBuf, crate::engine::history::SnapshotEvidence)> {
+        let (sha256, size_bytes) = sha256_file(source)?;
+        let objects_dir = self.snapshots_dir.join("objects");
+        fs::create_dir_all(&objects_dir)
+            .map_err(|error| AuditError::snapshot(objects_dir.display().to_string(), error))?;
+        let object_path = objects_dir.join(format!("{sha256}.pdf"));
+
+        if object_path.exists() {
+            verify_snapshot_file(&object_path, &sha256, size_bytes)?;
+        } else {
+            snapshot_link_or_copy(source, &object_path)?;
+            verify_snapshot_file(&object_path, &sha256, size_bytes)?;
+        }
+
+        let parent_sha256 = match parent_source {
+            Some(parent) => Some(sha256_file(parent)?.0),
+            None => None,
+        };
+        let manifest_path = self
+            .snapshots_dir
+            .join(format!("{change_id}.snapshot.json"));
+        let evidence = crate::engine::history::SnapshotEvidence {
+            sha256,
+            size_bytes,
+            parent_sha256,
+            created_at: Utc::now().to_rfc3339(),
+            manifest_path: manifest_path.clone(),
+        };
+        let manifest = SnapshotManifest {
+            schema_version: 1,
+            change_id,
+            object_path: object_path.clone(),
+            evidence: evidence.clone(),
+        };
+        write_json_atomic(&manifest_path, &manifest)?;
+
+        Ok((object_path, evidence))
+    }
+
+    pub fn verify_snapshot_record(&self, record: &ChangeRecord) -> AuditResult<()> {
+        let path = record.snapshot_path.as_ref().ok_or_else(|| {
+            AuditError::snapshot(
+                format!("change {} snapshot path", record.id),
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "change record has no snapshot path",
+                ),
+            )
+        })?;
+        let evidence = record.snapshot_evidence.as_ref().ok_or_else(|| {
+            AuditError::snapshot(
+                format!("change {} snapshot evidence", record.id),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "change record has no snapshot evidence",
+                ),
+            )
+        })?;
+        verify_snapshot_file(path, &evidence.sha256, evidence.size_bytes)?;
+
+        let manifest_bytes = fs::read(&evidence.manifest_path).map_err(|error| {
+            AuditError::snapshot(evidence.manifest_path.display().to_string(), error)
+        })?;
+        let manifest: SnapshotManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| {
+                AuditError::snapshot(
+                    evidence.manifest_path.display().to_string(),
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                )
+            })?;
+        if manifest.change_id != record.id
+            || manifest.object_path != *path
+            || manifest.evidence != *evidence
+        {
+            return Err(AuditError::snapshot(
+                evidence.manifest_path.display().to_string(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "snapshot manifest does not match change record",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn snapshots_dir(&self) -> &Path {
         &self.snapshots_dir
     }
 
-    /// Returns the path where a snapshot for a specific change ID should be stored.
+    /// Returns the legacy path where a snapshot for a specific change ID was stored.
     pub fn snapshot_path_for(&self, change_id: u64) -> PathBuf {
-        // We use .pdf for snapshots per Approach §4.4
         self.snapshots_dir.join(format!("{change_id}.pdf"))
     }
+}
+
+fn sha256_file(path: &Path) -> AuditResult<(String, u64)> {
+    let mut file = File::open(path)
+        .map_err(|error| AuditError::snapshot(path.display().to_string(), error))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| AuditError::snapshot(path.display().to_string(), error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), total))
+}
+
+fn verify_snapshot_file(path: &Path, expected_sha256: &str, expected_size: u64) -> AuditResult<()> {
+    let (actual_sha256, actual_size) = sha256_file(path)?;
+    if actual_sha256 != expected_sha256 || actual_size != expected_size {
+        return Err(AuditError::snapshot(
+            path.display().to_string(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot evidence mismatch: expected sha256={expected_sha256} size={expected_size}, actual sha256={actual_sha256} size={actual_size}"
+                ),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> AuditResult<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| AuditError::snapshot(parent.display().to_string(), error))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| AuditError::snapshot(parent.display().to_string(), error))?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), value).map_err(|error| {
+        AuditError::snapshot(
+            path.display().to_string(),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| AuditError::snapshot(path.display().to_string(), error))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| AuditError::snapshot(path.display().to_string(), error))?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| AuditError::snapshot(path.display().to_string(), error.error))?;
+    Ok(())
 }
 
 /// Save an immutable snapshot of `source` at `dest`.
@@ -375,6 +538,7 @@ impl AuditLogParser {
             bbox: bbox?,
             description,
             snapshot_path,
+            snapshot_evidence: None,
             provenance,
             obj_id: None,
         })
@@ -400,6 +564,7 @@ mod tests {
             bbox: [0.0, 1.0, 2.0, 3.0],
             description: "Adjustment".into(),
             snapshot_path: Some(PathBuf::from("audit/snapshots/123.pdf")),
+            snapshot_evidence: None,
             provenance: "DocumentAI".into(),
             obj_id: None,
         };
@@ -461,6 +626,75 @@ mod tests {
                 "source and snapshot must use independent inodes"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn content_addressed_snapshot_records_and_verifies_evidence() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let audit = AuditLog::open(dir.path().join("audit"))?;
+        let parent = dir.path().join("parent.pdf");
+        let source = dir.path().join("edited.pdf");
+        std::fs::write(&parent, b"parent bytes")?;
+        std::fs::write(&source, b"edited immutable bytes")?;
+
+        let (object_path, evidence) =
+            audit.create_content_addressed_snapshot(42, &source, Some(&parent))?;
+        let expected_object_name = format!("{}.pdf", evidence.sha256);
+        assert_eq!(
+            object_path.file_name().and_then(|name| name.to_str()),
+            Some(expected_object_name.as_str())
+        );
+        assert_eq!(evidence.size_bytes, b"edited immutable bytes".len() as u64);
+        assert!(evidence.parent_sha256.is_some());
+        assert!(evidence.manifest_path.is_file());
+
+        let record = ChangeRecord {
+            id: 42,
+            timestamp: Utc::now().to_rfc3339(),
+            page: 0,
+            old_text: "old".into(),
+            new_text: "new".into(),
+            bbox: [0.0; 4],
+            description: "snapshot test".into(),
+            snapshot_path: Some(object_path.clone()),
+            snapshot_evidence: Some(evidence),
+            provenance: "test".into(),
+            obj_id: None,
+        };
+        audit.verify_snapshot_record(&record)?;
+
+        std::fs::write(&source, b"later live-output rewrite")?;
+        audit.verify_snapshot_record(&record)?;
+        assert_eq!(std::fs::read(&object_path)?, b"edited immutable bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_verification_rejects_tamper_and_missing_objects() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let audit = AuditLog::open(dir.path().join("audit"))?;
+        let source = dir.path().join("edited.pdf");
+        std::fs::write(&source, b"verified bytes")?;
+        let (object_path, evidence) = audit.create_content_addressed_snapshot(7, &source, None)?;
+        let record = ChangeRecord {
+            id: 7,
+            timestamp: Utc::now().to_rfc3339(),
+            page: 0,
+            old_text: "old".into(),
+            new_text: "new".into(),
+            bbox: [0.0; 4],
+            description: "snapshot test".into(),
+            snapshot_path: Some(object_path.clone()),
+            snapshot_evidence: Some(evidence),
+            provenance: "test".into(),
+            obj_id: None,
+        };
+
+        std::fs::write(&object_path, b"tampered")?;
+        assert!(audit.verify_snapshot_record(&record).is_err());
+        std::fs::remove_file(&object_path)?;
+        assert!(audit.verify_snapshot_record(&record).is_err());
         Ok(())
     }
 

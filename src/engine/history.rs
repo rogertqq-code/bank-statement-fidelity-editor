@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotEvidence {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub parent_sha256: Option<String>,
+    pub created_at: String,
+    pub manifest_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeRecord {
     pub id: u64,
@@ -15,6 +24,8 @@ pub struct ChangeRecord {
     pub bbox: [f32; 4],
     pub description: String,
     pub snapshot_path: Option<PathBuf>,
+    #[serde(default)]
+    pub snapshot_evidence: Option<SnapshotEvidence>,
     pub provenance: String,
     pub obj_id: Option<String>,
 }
@@ -77,6 +88,7 @@ impl ChangeHistory {
             bbox,
             description,
             snapshot_path: None,
+            snapshot_evidence: None,
             provenance: "Manual".into(),
             obj_id: None,
         };
@@ -107,6 +119,7 @@ impl ChangeHistory {
             bbox,
             description,
             snapshot_path,
+            snapshot_evidence: None,
             provenance: "Manual".into(),
             obj_id: None,
         }

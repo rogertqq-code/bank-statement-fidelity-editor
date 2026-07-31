@@ -112,6 +112,7 @@ fn test_handle_job_result_change_applied() {
         new_text: "new".to_string(),
         description: "Edit".to_string(),
         snapshot_path: None,
+        snapshot_evidence: None,
         obj_id: None,
         provenance: "UserEdit".to_string(),
     };
