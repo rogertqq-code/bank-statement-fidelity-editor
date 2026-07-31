@@ -1,14 +1,13 @@
-name: Build & Release Executables
+name: Build Release Candidates (Publication Frozen)
 
+# Publication remains intentionally frozen until every remediation gate passes.
+# This workflow may be run manually to diagnose Windows/macOS candidate builds,
+# but it cannot create or update a GitHub Release.
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master, fix-ci-and-railway]
-    tags:
-      - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # ------------------------------------------------------------------
@@ -52,11 +51,12 @@ jobs:
           path: target/release/dual-core-pdf-pipeline.exe
           retention-days: 14
 
-      - name: Upload to GitHub Release (If triggered by tag)
+      - name: Enforce release publication freeze
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: target/release/dual-core-pdf-pipeline.exe
+        shell: bash
+        run: |
+          echo "Release publication is frozen until the final remediation gate passes."
+          exit 1
 
   # ------------------------------------------------------------------
   # Mac (Apple Silicon) Build
@@ -229,9 +229,8 @@ jobs:
           path: DualCorePdfPipeline-Mac-Silicon.dmg
           if-no-files-found: error
 
-      - name: Upload to GitHub Release (If triggered by tag)
+      - name: Enforce release publication freeze
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            DualCorePdfPipeline-Mac-Silicon.dmg
+        run: |
+          echo "Release publication is frozen until the final remediation gate passes."
+          exit 1

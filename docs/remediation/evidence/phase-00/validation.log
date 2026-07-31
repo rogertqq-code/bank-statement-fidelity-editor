@@ -1,0 +1,11 @@
+GATE 00 VALIDATION
+REMEDIATION PLAN VALIDATION
+findings=57 mapped=57
+tickets=129 unique=129
+PASS
+git status:
+M .github/workflows/release.yml
+?? .github/ISSUE_TEMPLATE/
+?? docs/remediation/
+?? scripts/validate_remediation_plan.py
+PASS
