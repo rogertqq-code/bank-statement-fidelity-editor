@@ -173,35 +173,59 @@ impl AuditLog {
     }
 }
 
-/// Save a snapshot of `output` at the audit log's expected path for
-/// `change_id`. Tries hard-linking first (~zero disk cost when the source
-/// and snapshot live on the same volume), falls back to a full copy on
-/// hard-link failure (cross-FS, FAT32, etc.).
+/// Save an immutable snapshot of `source` at `dest`.
 ///
-/// Returns `Ok(true)` when the hard link succeeded, `Ok(false)` after a
-/// fallback copy.
+/// The compatibility name is retained for existing callers, but hard links
+/// are intentionally forbidden: a snapshot must have independent storage so
+/// later in-place edits to the source cannot rewrite historical evidence.
+/// Bytes are copied to a temporary file in the destination directory, synced,
+/// and then persisted to the final path.
+///
+/// Returns `Ok(false)` to preserve the historical return contract while
+/// explicitly reporting that no hard link was created.
 ///
 /// # Errors
-/// Returns [`AuditError::Snapshot`] if the destination directory cannot be
-/// created or the fallback copy fails.
+/// Returns [`AuditError::Snapshot`] when the source cannot be opened, the
+/// independent copy cannot be written and synced, or the destination cannot be
+/// replaced.
 pub fn snapshot_link_or_copy(source: &Path, dest: &Path) -> AuditResult<bool> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| AuditError::snapshot(parent.display().to_string(), e))?;
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| AuditError::snapshot(parent.display().to_string(), error))?;
+
+    let mut source_file = File::open(source)
+        .map_err(|error| AuditError::snapshot(source.display().to_string(), error))?;
+    let source_len = source_file
+        .metadata()
+        .map_err(|error| AuditError::snapshot(source.display().to_string(), error))?
+        .len();
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| AuditError::snapshot(parent.display().to_string(), error))?;
+    let copied = std::io::copy(&mut source_file, temporary.as_file_mut())
+        .map_err(|error| AuditError::snapshot(dest.display().to_string(), error))?;
+    if copied != source_len {
+        return Err(AuditError::snapshot(
+            dest.display().to_string(),
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("snapshot copied {copied}/{source_len} bytes"),
+            ),
+        ));
     }
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| AuditError::snapshot(dest.display().to_string(), error))?;
+
     if dest.exists() {
-        // Hard linking onto an existing path errors; remove first.
-        let _ = fs::remove_file(dest);
+        fs::remove_file(dest)
+            .map_err(|error| AuditError::snapshot(dest.display().to_string(), error))?;
     }
-    match fs::hard_link(source, dest) {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            tracing::debug!("[audit] hard_link failed ({}); falling back to copy", e);
-            fs::copy(source, dest)
-                .map_err(|e| AuditError::snapshot(dest.display().to_string(), e))?;
-            Ok(false)
-        }
-    }
+    temporary
+        .persist(dest)
+        .map_err(|error| AuditError::snapshot(dest.display().to_string(), error.error))?;
+
+    Ok(false)
 }
 
 pub struct AuditLogParser;
@@ -410,8 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_link_creates_either_a_hard_link_or_a_copy_and_content_matches() -> anyhow::Result<()>
-    {
+    fn snapshot_is_an_independent_immutable_copy() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let source = dir.path().join("source.pdf");
         let payload = b"%PDF-1.7\nfake snapshot content";
@@ -419,16 +442,24 @@ mod tests {
 
         let dest = dir.path().join("snapshots").join("123.pdf");
         let was_hard_link = snapshot_link_or_copy(&source, &dest)?;
+        assert!(!was_hard_link, "audit snapshots must never be hard linked");
+        assert_eq!(std::fs::read(&dest)?, payload);
 
-        // Either path: content must match the source byte-for-byte.
-        let read_back = std::fs::read(&dest)?;
-        assert_eq!(read_back, payload);
+        std::fs::write(&source, b"modified source bytes")?;
+        assert_eq!(
+            std::fs::read(&dest)?,
+            payload,
+            "later source rewrites must not mutate historical evidence"
+        );
 
-        // If the FS supported hard links, modifying the source must surface
-        // through the dest. (NTFS / ext4 do; FAT32 / cross-volume don't.)
-        if was_hard_link {
-            std::fs::write(&source, b"modified")?;
-            assert_eq!(std::fs::read(&dest)?, b"modified");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                std::fs::metadata(&source)?.ino(),
+                std::fs::metadata(&dest)?.ino(),
+                "source and snapshot must use independent inodes"
+            );
         }
         Ok(())
     }

@@ -3595,9 +3595,8 @@ async fn process_job_inner(
                         final_record.obj_id = o.obj_id;
                         let snap_path = a.snapshot_path_for(final_record.id);
 
-                        // Snapshots use a hard link when possible (same volume)
-                        // so applying many edits doesn't multiply disk usage by
-                        // the PDF size. Falls back to a full copy on cross-FS.
+                        // Audit snapshots always use independent storage so later
+                        // in-place output edits cannot rewrite historical evidence.
                         if let Err(e) =
                             crate::app::audit::snapshot_link_or_copy(&output, &snap_path)
                         {
