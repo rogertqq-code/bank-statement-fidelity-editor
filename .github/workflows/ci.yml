@@ -237,6 +237,7 @@ jobs:
         run: brew install pkg-config openssl@3
       - uses: Swatinem/rust-cache@v2
       - name: Pro-installed worker protocol and exact-count contract
+        shell: bash
         env:
           PYTHONPATH: python
         run: |
