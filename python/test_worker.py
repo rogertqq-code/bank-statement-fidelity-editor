@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
+
+import pymupdf
 
 from bridge_protocol import OPERATIONS, PROTOCOL_VERSION, ProtocolError, parse_response
 from worker import classify_error
@@ -28,10 +32,11 @@ def request(operation: str, payload: dict[str, object]) -> dict[str, object]:
 
 
 class WorkerProcess:
-    def __init__(self) -> None:
+    def __init__(self, extra_env: dict[str, str] | None = None) -> None:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(ROOT / "python")
         env["PYTHONUNBUFFERED"] = "1"
+        env.update(extra_env or {})
         self.process = subprocess.Popen(
             [sys.executable, str(WORKER)],
             cwd=ROOT,
@@ -117,6 +122,42 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(response["failure"]["code"], "INPUT_NOT_FOUND")
         self.assertEqual(response["failure"]["class"], "FileNotFoundError")
         self.assertNotIn("traceback", response["failure"]["context"])
+
+    def test_pro_page_limit_cannot_be_bypassed_and_preserves_source(self) -> None:
+        self.worker.terminate()
+        self.worker = WorkerProcess({"IGNORE_PRO_LIMIT": "100"})
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "four-pages.pdf"
+            output_path = Path(directory) / "should-not-exist.pdf"
+            document = pymupdf.open()
+            try:
+                for page_index in range(4):
+                    page = document.new_page()
+                    page.insert_text((72, 72), f"PAGE {page_index + 1}")
+                document.save(source_path)
+            finally:
+                document.close()
+            before_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            operation = request(
+                "apply_many_edits",
+                {
+                    "pdf_path": str(source_path),
+                    "output_path": str(output_path),
+                    "edits": [
+                        {
+                            "page": 0,
+                            "rect": [60.0, 50.0, 160.0, 85.0],
+                            "new_text": "REPLACED",
+                        }
+                    ],
+                    "font_path": None,
+                },
+            )
+            response = parse_response(self.worker.send(operation))
+            self.assertEqual(response["disposition"], "failed")
+            self.assertEqual(response["failure"]["code"], "PRO_PAGE_LIMIT_EXCEEDED")
+            self.assertEqual(hashlib.sha256(source_path.read_bytes()).hexdigest(), before_hash)
+            self.assertFalse(output_path.exists())
 
     def test_exception_taxonomy_is_stable_and_retry_aware(self) -> None:
         cases = [

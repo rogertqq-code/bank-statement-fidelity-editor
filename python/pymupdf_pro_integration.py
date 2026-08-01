@@ -85,7 +85,9 @@ PYMUPDF_PRO_KEY = os.environ.get("PYMUPDF_PRO_KEY", "")
 # above it) matches on this exact token to surface a structured error, so it
 # must not be changed without updating `src/ai/pyo3_bridge.rs`.
 # ---------------------------------------------------------------------------
-PRO_PAGE_LIMIT = int(os.environ.get("IGNORE_PRO_LIMIT", 3))
+# This is a licensing and correctness boundary, not a developer tuning knob.
+# Long statements must be split into verified <=3-page segments by Rust.
+PRO_PAGE_LIMIT = 3
 PRO_PAGE_LIMIT_TOKEN = "PRO_PAGE_LIMIT_EXCEEDED"
 
 

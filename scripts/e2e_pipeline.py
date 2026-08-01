@@ -69,7 +69,6 @@ def build_exe(release):
 def run(exe, args, timeout=180):
     env = dict(os.environ)
     env.setdefault("DUAL_CORE_PASSPHRASE", "ci-only-passphrase-do-not-use")
-    env["IGNORE_PRO_LIMIT"] = "100"
     try:
         p = subprocess.run(
             [exe] + args,
@@ -83,6 +82,33 @@ def run(exe, args, timeout=180):
     except subprocess.TimeoutExpired:
         return 124, f"TIMEOUT after {timeout}s running: {' '.join(args)}"
     return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def prepare_edit_input(pdf_path, page, out_root, slug):
+    """Return an input whose Pro edit scope is never larger than three pages."""
+    source = pymupdf.open(pdf_path)
+    try:
+        if source.page_count <= 3:
+            return pdf_path, page, None
+        start = (page // 3) * 3
+        end = min(start + 2, source.page_count - 1)
+        segment_dir = os.path.join(out_root, "segments")
+        os.makedirs(segment_dir, exist_ok=True)
+        segment_path = os.path.join(segment_dir, f"{slug}_pages_{start + 1}_{end + 1}.pdf")
+        segment = pymupdf.open()
+        try:
+            segment.insert_pdf(source, from_page=start, to_page=end)
+            segment.save(segment_path, garbage=4, deflate=True)
+        finally:
+            segment.close()
+        return segment_path, page - start, {
+            "source_page": page,
+            "segment_page": page - start,
+            "page_range": [start, end],
+            "path": segment_path,
+        }
+    finally:
+        source.close()
 
 
 def first_amount_span(pdf_path):
@@ -187,13 +213,21 @@ def process_pdf(exe, pdf, out_root):
     new_text = text.replace(digits, f"{new_val:,.2f}")
     rec["steps"]["locate_amount"] = {"bbox": bbox, "text": text, "new_text": new_text, "page": page}
     log(f"[PASS] step 1 locate amount: {text!r} @ p{page} {bbox} -> {new_text!r}", 2)
+    edit_input, edit_page, segment = prepare_edit_input(pdf, page, out_root, slug)
+    if segment is not None:
+        rec["steps"]["segment"] = segment
+        log(
+            f"[PASS] production segmentation: source p{page} -> segment p{edit_page} "
+            f"({segment['page_range'][0] + 1}-{segment['page_range'][1] + 1})",
+            2,
+        )
 
     # Step 3: apply edit.
     edited = os.path.join(out_root, f"{slug}_edited.pdf")
     code, edit_log = run(
         exe,
-        ["text", "--input", pdf, "--output", edited, "--old", text, "--new", new_text,
-         "--page", str(page), "--bbox", ",".join(str(v) for v in bbox)],
+        ["text", "--input", edit_input, "--output", edited, "--old", text, "--new", new_text,
+         "--page", str(edit_page), "--bbox", ",".join(str(v) for v in bbox)],
     )
     applied = code == 0 and os.path.exists(edited)
     rec["steps"]["apply_edit"] = {"exit": code, "ok": applied}
@@ -207,8 +241,8 @@ def process_pdf(exe, pdf, out_root):
     log(f"[PASS] step 3 apply edit: exit {code}", 2)
 
     # Step 4: render both + pixel diff.
-    ok_o, ro, log_o = render(exe, pdf, page, os.path.join(out_root, f"{slug}_orig"), out_root)
-    ok_e, re_path, log_e = render(exe, edited, page, os.path.join(out_root, f"{slug}_edit"), out_root)
+    ok_o, ro, log_o = render(exe, edit_input, edit_page, os.path.join(out_root, f"{slug}_orig"), out_root)
+    ok_e, re_path, log_e = render(exe, edited, edit_page, os.path.join(out_root, f"{slug}_edit"), out_root)
     if ok_o and ok_e:
         pdiff = pixel_diff(ro, re_path)
         rec["steps"]["pixel_diff"] = pdiff
