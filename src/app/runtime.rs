@@ -413,6 +413,275 @@ pub enum PythonJobResult {
     Error(String),
 }
 
+impl PythonJob {
+    fn to_worker_request(
+        &self,
+    ) -> Result<crate::ai::python_protocol::PythonRequestEnvelope, String> {
+        use crate::ai::python_protocol::{PythonOperation, PythonRequestEnvelope};
+        use serde_json::json;
+
+        let (operation, input_path, payload) = match self {
+            Self::Ping => (PythonOperation::Ping, None, json!({})),
+            Self::GetTextBlocks { pdf_path, page_num } => (
+                PythonOperation::GetTextBlocks,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path, "page_num": page_num}),
+            ),
+            Self::ReplaceTextInRect {
+                pdf_path,
+                output_path,
+                page_num,
+                rect,
+                new_text,
+                font_path,
+            } => (
+                PythonOperation::ReplaceTextInRect,
+                Some(pdf_path.as_str()),
+                json!({
+                    "pdf_path": pdf_path,
+                    "output_path": output_path,
+                    "page_num": page_num,
+                    "rect": rect,
+                    "new_text": new_text,
+                    "font_path": font_path,
+                }),
+            ),
+            Self::FindTextBlockAtClick {
+                pdf_path,
+                page_num,
+                x,
+                y,
+            } => (
+                PythonOperation::FindTextBlockAtClick,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path, "page_num": page_num, "x": x, "y": y}),
+            ),
+            Self::GetAllTransactions { pdf_path } => (
+                PythonOperation::GetAllTransactions,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path}),
+            ),
+            Self::AnalyzeDocumentLayout { pdf_path } => (
+                PythonOperation::AnalyzeDocumentLayout,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path}),
+            ),
+            Self::CompleteFontWithAdaption {
+                pdf_path,
+                font_name,
+            } => (
+                PythonOperation::CompleteFontWithAdaption,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path, "font_name": font_name}),
+            ),
+            Self::DeepFontReplication {
+                pdf_path,
+                font_name,
+                output_dir,
+            } => (
+                PythonOperation::DeepFontReplication,
+                Some(pdf_path.as_str()),
+                json!({
+                    "pdf_path": pdf_path,
+                    "font_name": font_name,
+                    "output_dir": output_dir,
+                }),
+            ),
+            Self::ApplyManyEdits {
+                pdf_path,
+                output_path,
+                edits_json,
+                font_path,
+            } => {
+                let edits: serde_json::Value = serde_json::from_str(edits_json)
+                    .map_err(|error| format!("invalid edit payload: {error}"))?;
+                (
+                    PythonOperation::ApplyManyEdits,
+                    Some(pdf_path.as_str()),
+                    json!({
+                        "pdf_path": pdf_path,
+                        "output_path": output_path,
+                        "edits": edits,
+                        "font_path": font_path,
+                    }),
+                )
+            }
+            Self::ChunkPdfForDocai {
+                pdf_path,
+                output_dir,
+                max_pages_per_chunk,
+            } => (
+                PythonOperation::ChunkPdfForDocai,
+                Some(pdf_path.as_str()),
+                json!({
+                    "pdf_path": pdf_path,
+                    "output_dir": output_dir,
+                    "max_pages_per_chunk": max_pages_per_chunk,
+                }),
+            ),
+            Self::AnalyzeFonts { pdf_path } => (
+                PythonOperation::AnalyzeFonts,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path}),
+            ),
+            Self::ReplicateFontForMissingChars {
+                pdf_path,
+                font_name,
+                missing_chars_csv,
+                output_dir,
+            } => (
+                PythonOperation::ReplicateFontForMissingChars,
+                Some(pdf_path.as_str()),
+                json!({
+                    "pdf_path": pdf_path,
+                    "font_name": font_name,
+                    "missing_chars": missing_chars_csv
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>(),
+                    "output_dir": output_dir,
+                }),
+            ),
+            Self::ClonePages {
+                pdf_path,
+                output_path,
+                page_indices,
+            } => (
+                PythonOperation::ClonePages,
+                Some(pdf_path.as_str()),
+                json!({
+                    "pdf_path": pdf_path,
+                    "output_path": output_path,
+                    "page_indices": page_indices,
+                }),
+            ),
+            Self::RemovePages {
+                pdf_path,
+                output_path,
+                page_indices,
+            } => (
+                PythonOperation::RemovePages,
+                Some(pdf_path.as_str()),
+                json!({
+                    "pdf_path": pdf_path,
+                    "output_path": output_path,
+                    "page_indices": page_indices,
+                }),
+            ),
+            Self::RenderPageToPng {
+                pdf_path,
+                page_num,
+                dpi,
+            } => (
+                PythonOperation::RenderPageToPng,
+                Some(pdf_path.as_str()),
+                json!({"pdf_path": pdf_path, "page_num": page_num, "dpi": dpi}),
+            ),
+        };
+
+        let submitted_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis() as u64;
+        let input_sha256 = input_path.map(python_input_sha256).transpose()?;
+        PythonRequestEnvelope::new(
+            operation,
+            Uuid::new_v4(),
+            submitted_at_unix_ms,
+            submitted_at_unix_ms + 120_000,
+            input_sha256,
+            payload,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn worker_response_to_legacy(
+        &self,
+        response: crate::ai::python_protocol::PythonResponseEnvelope,
+    ) -> PythonJobResult {
+        use crate::ai::python_protocol::PythonDisposition;
+
+        if response.disposition != PythonDisposition::Succeeded {
+            let detail = response
+                .failure
+                .as_ref()
+                .map(|failure| format!("{}: {}", failure.code, failure.message))
+                .or_else(|| {
+                    response
+                        .warnings
+                        .first()
+                        .map(|warning| format!("{}: {}", warning.code, warning.message))
+                })
+                .unwrap_or_else(|| format!("{:?}", response.disposition));
+            return PythonJobResult::Error(detail);
+        }
+
+        if matches!(self, Self::Ping) {
+            return PythonJobResult::Pong;
+        }
+        let result = response
+            .payload
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        match self {
+            Self::ApplyManyEdits { edits_json, .. } => {
+                let expected = serde_json::from_str::<Vec<serde_json::Value>>(edits_json)
+                    .map(|edits| edits.len())
+                    .unwrap_or_default();
+                match crate::ai::apply_report::ApplyReport::from_json_exact(
+                    &result.to_string(),
+                    expected,
+                ) {
+                    Ok(report) => PythonJobResult::ApplyReport(report),
+                    Err(error) => PythonJobResult::Error(error.to_string()),
+                }
+            }
+            Self::ReplaceTextInRect { .. } if !response.warnings.is_empty() => {
+                PythonJobResult::ReplacedWithReviewWarning {
+                    reason: response
+                        .warnings
+                        .iter()
+                        .map(|warning| warning.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }
+            }
+            Self::ReplaceTextInRect { .. } => PythonJobResult::Success,
+            _ => match serde_json::to_string(&result) {
+                Ok(json) => PythonJobResult::Json(json),
+                Err(error) => PythonJobResult::Error(error.to_string()),
+            },
+        }
+    }
+}
+
+fn python_input_sha256(path: &str) -> Result<String, String> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "cannot hash Python input {}: {error}",
+            Path::new(path).display()
+        )
+    })?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 #[derive(Debug)]
 pub enum Job {
     Ping,
@@ -1191,171 +1460,49 @@ impl Runtime {
         ));
 
         let _python_actor_thread = thread::spawn(move || {
-            // T2 test support: simulate a downed actor for cascade fallback testing
-            let engine_result = if std::env::var("TEST_CRASH_PYTHON_ACTOR").is_ok() {
+            // T2 test support: preserve the explicit unavailable-worker path used
+            // by existing cascade tests without starting an embedded interpreter.
+            if std::env::var("TEST_CRASH_PYTHON_ACTOR").is_ok() {
                 tracing::warn!(
-                    "[PYTHON_ACTOR] TEST_CRASH_PYTHON_ACTOR set — simulating crashed actor"
+                    "[PYTHON_WORKER] TEST_CRASH_PYTHON_ACTOR set — simulating unavailable worker"
                 );
-                Err("Simulated Python actor crash for testing".to_string())
-            } else {
-                crate::ai::pyo3_bridge::PyEngine::init()
-            };
-
-            if let Err(e) = &engine_result {
-                tracing::error!("❌ [PYTHON_ACTOR] Failed to initialize PyEngine: {}", e);
+                while let Ok((_job, reply_tx)) = python_rx.recv() {
+                    let _ = reply_tx.send(PythonJobResult::Error(
+                        "Simulated Python worker crash for testing".to_string(),
+                    ));
+                }
+                return;
             }
 
-            while let Ok((job, reply_tx)) = python_rx.recv() {
-                if let PythonJob::Ping = job {
-                    let _ = reply_tx.send(PythonJobResult::Pong);
-                    continue;
-                }
-
-                match &engine_result {
-                    Ok(engine) => {
-                        let res =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
-                                PythonJob::Ping => unreachable!(),
-                                PythonJob::GetTextBlocks { pdf_path, page_num } => engine
-                                    .get_text_blocks(&pdf_path, page_num)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::ReplaceTextInRect {
-                                    pdf_path,
-                                    output_path,
-                                    page_num,
-                                    rect,
-                                    new_text,
-                                    font_path,
-                                } => engine
-                                    .replace_text_in_rect(
-                                        &pdf_path,
-                                        &output_path,
-                                        page_num,
-                                        rect,
-                                        &new_text,
-                                        font_path.as_deref(),
-                                    )
-                                    .map(|opt| {
-                                        opt.map(|reason| {
-                                            PythonJobResult::ReplacedWithReviewWarning { reason }
-                                        })
-                                        .unwrap_or(PythonJobResult::Success)
-                                    }),
-                                PythonJob::FindTextBlockAtClick {
-                                    pdf_path,
-                                    page_num,
-                                    x,
-                                    y,
-                                } => engine
-                                    .find_text_block_at_click(&pdf_path, page_num, x, y)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::GetAllTransactions { pdf_path } => engine
-                                    .get_all_transactions(&pdf_path)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::AnalyzeDocumentLayout { pdf_path } => engine
-                                    .analyze_document_layout(&pdf_path)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::CompleteFontWithAdaption {
-                                    pdf_path,
-                                    font_name,
-                                } => engine
-                                    .complete_font_with_adaption(&pdf_path, &font_name)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::DeepFontReplication {
-                                    pdf_path,
-                                    font_name,
-                                    output_dir,
-                                } => engine
-                                    .deep_font_replication(&pdf_path, &font_name, &output_dir)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::ApplyManyEdits {
-                                    pdf_path,
-                                    output_path,
-                                    edits_json,
-                                    font_path,
-                                } => engine
-                                    .apply_many_edits(
-                                        &pdf_path,
-                                        &output_path,
-                                        &edits_json,
-                                        font_path.as_deref(),
-                                    )
-                                    .map(PythonJobResult::ApplyReport),
-                                PythonJob::ChunkPdfForDocai {
-                                    pdf_path,
-                                    output_dir,
-                                    max_pages_per_chunk,
-                                } => engine
-                                    .chunk_pdf_for_docai(
-                                        &pdf_path,
-                                        &output_dir,
-                                        max_pages_per_chunk,
-                                    )
-                                    .map(PythonJobResult::Json),
-                                PythonJob::AnalyzeFonts { pdf_path } => {
-                                    engine.analyze_fonts(&pdf_path).map(PythonJobResult::Json)
-                                }
-                                PythonJob::ReplicateFontForMissingChars {
-                                    pdf_path,
-                                    font_name,
-                                    missing_chars_csv,
-                                    output_dir,
-                                } => engine
-                                    .replicate_font_for_missing_chars(
-                                        &pdf_path,
-                                        &font_name,
-                                        &missing_chars_csv,
-                                        &output_dir,
-                                    )
-                                    .map(PythonJobResult::Json),
-                                PythonJob::ClonePages {
-                                    pdf_path,
-                                    output_path,
-                                    page_indices,
-                                } => engine
-                                    .clone_pages(&pdf_path, &output_path, &page_indices)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::RemovePages {
-                                    pdf_path,
-                                    output_path,
-                                    page_indices,
-                                } => engine
-                                    .remove_pages(&pdf_path, &output_path, &page_indices)
-                                    .map(PythonJobResult::Json),
-                                PythonJob::RenderPageToPng {
-                                    pdf_path,
-                                    page_num,
-                                    dpi,
-                                } => engine
-                                    .render_page_to_png(&pdf_path, page_num, dpi)
-                                    .map(PythonJobResult::Json),
-                            }));
-
-                        let final_res = match res {
-                            Ok(Ok(pjr)) => pjr,
-                            Ok(Err(e)) => PythonJobResult::Error(e),
-                            Err(panic) => {
-                                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                                    s.to_string()
-                                } else if let Some(s) = panic.downcast_ref::<String>() {
-                                    s.clone()
-                                } else {
-                                    "Unknown panic in Python actor".to_string()
-                                };
-                                PythonJobResult::Error(format!("PyO3 panic: {msg}"))
-                            }
-                        };
-                        let _ = reply_tx.send(final_res);
-                        // Stage 2 Memory Management: explicit collection
-                        crate::ai::pyo3_bridge::PyEngine::garbage_collect();
-                    }
-                    Err(e) => {
+            let worker = crate::ai::python_worker::PythonWorkerClient::start(
+                crate::ai::python_worker::PythonWorkerConfig::default(),
+            );
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(error) => {
+                    tracing::error!("[PYTHON_WORKER] startup failed: {error}");
+                    while let Ok((_job, reply_tx)) = python_rx.recv() {
                         let _ = reply_tx.send(PythonJobResult::Error(format!(
-                            "Python Engine not initialized: {e}"
+                            "Python worker unavailable: {error}"
                         )));
                     }
+                    return;
                 }
+            };
+
+            while let Ok((job, reply_tx)) = python_rx.recv() {
+                let result = match job.to_worker_request() {
+                    Ok(request) => match worker.execute(request) {
+                        Ok(response) => job.worker_response_to_legacy(response),
+                        Err(error) => PythonJobResult::Error(format!(
+                            "Python worker operation failed: {error}"
+                        )),
+                    },
+                    Err(error) => PythonJobResult::Error(error),
+                };
+                let _ = reply_tx.send(result);
             }
+            let _ = worker.shutdown(std::time::Duration::from_secs(5));
         });
 
         let cancellations = CancellationRegistry::new();
