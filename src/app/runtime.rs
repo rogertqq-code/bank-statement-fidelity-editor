@@ -6706,15 +6706,27 @@ async fn process_job_inner(
 
                 use crate::app::config::AiProviderMode;
 
-                let (score, notes, missing, _math_ok) = match ai_provider {
+                let deterministic_issues = crate::engine::workflow::deterministic_parse_issues(
+                    stmt.total_pages,
+                    &stmt.transactions,
+                    stmt.opening_balance,
+                    stmt.closing_balance,
+                );
+                let deterministic_score = if deterministic_issues.is_empty() {
+                    1.0
+                } else {
+                    0.0
+                };
+
+                let (score, notes, mut missing, _math_ok) = match ai_provider {
                     AiProviderMode::ManualOnly => {
                         let _ = res_tx.send(JobResult::Progress {
                             label: "AI validation skipped (Manual Only mode)".into(),
                             fraction: 0.7,
                         });
                         (
-                            0.8,
-                            "AI validation skipped (Manual Only mode).".into(),
+                            deterministic_score,
+                            "Optional AI validation skipped (Manual Only mode).".into(),
                             vec![],
                             false,
                         )
@@ -6744,7 +6756,7 @@ async fn process_job_inner(
                         .await
                         {
                             Ok(Ok(r)) => (
-                                r.completeness_score,
+                                r.completeness_score.min(deterministic_score),
                                 r.notes,
                                 r.missing_rows,
                                 r.math_consistent,
@@ -6758,8 +6770,8 @@ async fn process_job_inner(
                                     fraction: 0.7,
                                 });
                                 (
-                                    0.7,
-                                    format!("Gemini validation skipped: {e}"),
+                                    deterministic_score,
+                                    format!("Optional AI validation skipped: {e}"),
                                     vec![],
                                     false,
                                 )
@@ -6771,8 +6783,9 @@ async fn process_job_inner(
                                     fraction: 0.7,
                                 });
                                 (
-                                    0.7,
-                                    "Gemini validation timed out; skipped.".into(),
+                                    deterministic_score,
+                                    "Optional AI validation timed out; deterministic validation used."
+                                        .into(),
                                     vec![],
                                     false,
                                 )
@@ -6781,6 +6794,7 @@ async fn process_job_inner(
                     }
                 };
 
+                missing.extend(deterministic_issues);
                 let validation = crate::engine::workflow::ParseValidation {
                     total_pages: stmt.total_pages,
                     transactions_found: stmt.transactions.len(),
@@ -6821,6 +6835,23 @@ async fn process_job_inner(
                     validation: validation.clone(),
                     transactions: txs,
                 });
+                if !validation.is_acceptable() {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::Incomplete {
+                            score: validation.completeness_score,
+                            notes: if validation.missing_rows.is_empty() {
+                                validation.completeness_notes.clone()
+                            } else {
+                                format!(
+                                    "{} {}",
+                                    validation.completeness_notes,
+                                    validation.missing_rows.join("; ")
+                                )
+                            },
+                        },
+                    ));
+                    return;
+                }
                 let _ = res_tx.send(JobResult::WorkflowStageChanged {
                     stage: crate::engine::workflow::WorkflowStage::Editing(validation),
                 });

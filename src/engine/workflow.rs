@@ -363,8 +363,110 @@ pub struct ParseValidation {
 impl ParseValidation {
     /// Whether the parse is good enough to proceed without re-parsing.
     pub fn is_acceptable(&self) -> bool {
-        self.completeness_score >= 0.85 && self.transactions_found > 0
+        self.completeness_score >= 0.85
+            && self.transactions_found > 0
+            && self.missing_rows.is_empty()
     }
+}
+
+/// Deterministically validate whether an extracted ledger is safe to enter the
+/// editing workflow. Optional AI may explain or flag rows for review, but only
+/// exact row identity, required fields, page coverage, geometry, and decimal
+/// balance continuity decide the core financial result.
+pub fn deterministic_parse_issues(
+    total_pages: usize,
+    transactions: &[crate::engine::model::Transaction],
+    opening_balance: Decimal,
+    closing_balance: Decimal,
+) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut issues = Vec::new();
+    if total_pages == 0 {
+        issues.push("statement has zero pages".into());
+    }
+    if transactions.is_empty() {
+        issues.push("no transaction rows were extracted".into());
+        return issues;
+    }
+
+    let mut identities = HashSet::new();
+    let mut covered_pages = HashSet::new();
+    let mut previous_identity: Option<(usize, usize)> = None;
+    let mut expected_balance = opening_balance;
+
+    for (index, transaction) in transactions.iter().enumerate() {
+        let identity = (transaction.page, transaction.line_on_page);
+        if !identities.insert(identity) {
+            issues.push(format!(
+                "duplicate row identity at page {} line {}",
+                transaction.page, transaction.line_on_page
+            ));
+        }
+        if transaction.page >= total_pages {
+            issues.push(format!(
+                "row {index} references page {} outside {total_pages} pages",
+                transaction.page
+            ));
+        } else {
+            covered_pages.insert(transaction.page);
+        }
+        if previous_identity.is_some_and(|previous| identity <= previous) {
+            issues.push(format!(
+                "row {index} is out of document order at page {} line {}",
+                transaction.page, transaction.line_on_page
+            ));
+        }
+        previous_identity = Some(identity);
+
+        if transaction.date.trim().is_empty() {
+            issues.push(format!("row {index} has no date"));
+        }
+        if transaction.debit.is_none() && transaction.credit.is_none() {
+            issues.push(format!("row {index} has no monetary amount"));
+        }
+        if transaction.bbox.is_none() && transaction.field_bboxes.is_empty() {
+            issues.push(format!("row {index} has no editable geometry"));
+        }
+
+        expected_balance =
+            (expected_balance + transaction.delta_in() - transaction.delta_out()).round_dp(2);
+        match transaction.running_balance {
+            Some(actual) if actual.round_dp(2) == expected_balance => {}
+            Some(actual) => issues.push(format!(
+                "row {index} running balance is {}, expected {}",
+                actual.round_dp(2),
+                expected_balance
+            )),
+            None => issues.push(format!("row {index} has no running balance")),
+        }
+    }
+
+    if let (Some(first_page), Some(last_page)) = (
+        transactions
+            .iter()
+            .map(|transaction| transaction.page)
+            .min(),
+        transactions
+            .iter()
+            .map(|transaction| transaction.page)
+            .max(),
+    ) {
+        for page in first_page..=last_page {
+            if !covered_pages.contains(&page) {
+                issues.push(format!("transaction page coverage is missing page {page}"));
+            }
+        }
+    }
+    if expected_balance != closing_balance.round_dp(2) {
+        issues.push(format!(
+            "closing balance is {}, expected {} from the extracted ledger",
+            closing_balance.round_dp(2),
+            expected_balance
+        ));
+    }
+
+    issues
 }
 
 /// Cross-check signal from a deterministic geometry extractor (e.g.
@@ -1207,9 +1309,60 @@ mod tests {
 
         let bad = ParseValidation {
             completeness_score: 0.5,
-            ..v
+            ..v.clone()
         };
         assert!(!bad.is_acceptable());
+
+        let review_required = ParseValidation {
+            missing_rows: vec!["page 1 row 3 requires review".into()],
+            ..v
+        };
+        assert!(!review_required.is_acceptable());
+    }
+
+    #[test]
+    fn deterministic_parse_accepts_exact_ordered_ledger() {
+        let mut transactions = vec![
+            tx(0, 0, Some(dec!(100)), None, Some(dec!(1100))),
+            tx(0, 1, None, Some(dec!(25)), Some(dec!(1075))),
+            tx(1, 0, Some(dec!(50)), None, Some(dec!(1125))),
+        ];
+        for transaction in &mut transactions {
+            transaction.bbox = Some([10.0, 20.0, 100.0, 30.0]);
+        }
+
+        let issues = deterministic_parse_issues(2, &transactions, dec!(1000), dec!(1125));
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn deterministic_parse_rejects_financial_and_structural_mutations() {
+        let mut transactions = vec![
+            tx(0, 0, Some(dec!(100)), None, Some(dec!(1100))),
+            tx(2, 0, None, Some(dec!(25)), Some(dec!(999))),
+            tx(2, 0, Some(dec!(50)), None, None),
+        ];
+        transactions[0].bbox = Some([10.0, 20.0, 100.0, 30.0]);
+        transactions[1].bbox = Some([10.0, 40.0, 100.0, 50.0]);
+        transactions[2].date.clear();
+
+        let issues = deterministic_parse_issues(3, &transactions, dec!(1000), dec!(9999));
+        assert!(issues.iter().any(|issue| issue.contains("running balance")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("duplicate row identity")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("out of document order")));
+        assert!(issues.iter().any(|issue| issue.contains("missing page 1")));
+        assert!(issues.iter().any(|issue| issue.contains("has no date")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("has no editable geometry")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("has no running balance")));
+        assert!(issues.iter().any(|issue| issue.contains("closing balance")));
     }
 
     fn validation(score: f32, found: usize) -> ParseValidation {
