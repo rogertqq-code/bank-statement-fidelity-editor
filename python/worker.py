@@ -311,6 +311,7 @@ class WorkerRuntime:
                 output_path=payload["output_path"],
                 page_num=payload["page_num"],
                 rect=payload["rect"],
+                old_text=payload["old_text"],
                 new_text=payload["new_text"],
                 font_path=payload.get("font_path"),
             ),

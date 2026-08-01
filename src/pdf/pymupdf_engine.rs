@@ -156,7 +156,7 @@ impl PdfEngine for PyMuPdfEngine {
         page: usize,
         bbox: [f32; 4],
         new_text: &str,
-        _old_text: &str,
+        old_text: &str,
         font_path: Option<&Path>,
     ) -> Result<ReplaceOutcome, EngineError> {
         let (tx, rx) = oneshot::channel();
@@ -167,6 +167,7 @@ impl PdfEngine for PyMuPdfEngine {
                     output_path: output.to_string_lossy().to_string(),
                     page_num: page,
                     rect: bbox,
+                    old_text: old_text.to_string(),
                     new_text: new_text.to_string(),
                     font_path: font_path.map(|p| p.to_string_lossy().to_string()),
                 },

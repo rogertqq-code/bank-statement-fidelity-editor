@@ -82,6 +82,7 @@
         "payload": {
           "font_path": null,
           "new_text": "replacement",
+          "old_text": "original",
           "output_path": "scratch/output.pdf",
           "page_num": 0,
           "pdf_path": "fixtures/input.pdf",

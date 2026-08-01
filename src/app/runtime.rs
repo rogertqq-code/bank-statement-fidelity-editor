@@ -326,6 +326,7 @@ pub enum PythonJob {
         output_path: String,
         page_num: usize,
         rect: [f32; 4],
+        old_text: String,
         new_text: String,
         font_path: Option<String>,
     },
@@ -351,7 +352,7 @@ pub enum PythonJob {
         output_dir: String,
     },
     /// Stage 3 / Item #14: apply N edits in one open/save pass.
-    /// `edits_json` is a JSON array of `{page, rect, new_text, fill_color?}`.
+    /// `edits_json` is a JSON array of `{page, rect, old_text, new_text, fill_color?}`.
     ApplyManyEdits {
         pdf_path: String,
         output_path: String,
@@ -432,6 +433,7 @@ impl PythonJob {
                 output_path,
                 page_num,
                 rect,
+                old_text,
                 new_text,
                 font_path,
             } => (
@@ -442,6 +444,7 @@ impl PythonJob {
                     "output_path": output_path,
                     "page_num": page_num,
                     "rect": rect,
+                    "old_text": old_text,
                     "new_text": new_text,
                     "font_path": font_path,
                 }),
@@ -3714,6 +3717,9 @@ async fn process_job_inner(
                             output_path: staged_output.to_string_lossy().to_string(),
                             page_num: record.page,
                             rect: date_bbox,
+                            old_text: transaction
+                                .map(|transaction| transaction.date.clone())
+                                .unwrap_or_default(),
                             new_text: record.new_date.clone(),
                             font_path: None,
                         },
@@ -7170,97 +7176,111 @@ async fn process_job_inner(
                         }
                     }
 
-                    // Row-drift guard (pre-flight)
+                    // Stable-target guard (pre-flight).
                     //
-                    // Three-tier resilience:
-                    //   Tier 1: >=50% overlap -> accept as-is (ideal)
-                    //   Tier 2: <50% overlap but spans exist -> snap bbox
-                    //           to the closest span by Y-midpoint and warn
-                    //   Tier 3: no spans at all -> warn and proceed (PDF may
-                    //           be image-only; the edit will still apply via
-                    //           redaction)
-                    //
-                    // Previously this guard hard-failed on <50% overlap,
-                    // which killed every AU bank statement because DocAI
-                    // reports dimensions in inches/pixels that didn't match
-                    // PyMuPDF's 72-dpi point space.
+                    // Every edit must resolve to exactly one source span by BOTH
+                    // normalized old-text identity and >=50% canonical-rectangle
+                    // overlap. Image-only pages, coordinate drift, zero matches,
+                    // and duplicate matches are unsupported automatic-edit cases;
+                    // they must stop before any scratch output is created.
                     {
                         let eng_for_guard = eng.clone();
                         let input_for_guard = input.clone();
                         let edits_for_guard = edits.clone();
                         let map_for_guard = map_opt.clone();
 
-                        let drift_result = tokio::task::spawn_blocking(move || -> Vec<(usize, f32, Option<[f32; 4]>)> {
-                                        let mut warnings = Vec::new();
-                                        for (idx, e) in edits_for_guard.iter().enumerate() {
-                                            let (check_path, check_page) = if let Some(ref map) = map_for_guard {
-                                                map.resolve(e.page).map(|(seg_idx, p)| (map.segments[seg_idx].path.clone(), p)).unwrap_or((input_for_guard.clone(), e.page))
-                                            } else {
-                                                (input_for_guard.clone(), e.page)
-                                            };
+                        let target_issues = tokio::task::spawn_blocking(move || {
+                            let mut issues = Vec::new();
+                            for (index, edit) in edits_for_guard.iter().enumerate() {
+                                let (check_path, check_page) = if let Some(ref map) = map_for_guard {
+                                    map.resolve(edit.page)
+                                        .map(|(segment_index, local_page)| {
+                                            (map.segments[segment_index].path.clone(), local_page)
+                                        })
+                                        .unwrap_or((input_for_guard.clone(), edit.page))
+                                } else {
+                                    (input_for_guard.clone(), edit.page)
+                                };
+                                let blocks = match eng_for_guard
+                                    .get_text_blocks(&check_path, check_page)
+                                {
+                                    Ok(blocks) => blocks,
+                                    Err(error) => {
+                                        issues.push(format!(
+                                            "edit {index} page {}: text extraction failed: {error}",
+                                            edit.page
+                                        ));
+                                        continue;
+                                    }
+                                };
+                                let expected_identity = edit
+                                    .old_text
+                                    .split_whitespace()
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                let mut identity_overlaps = blocks
+                                    .iter()
+                                    .filter(|block| block.page == check_page)
+                                    .filter_map(|block| {
+                                        let observed_identity = block
+                                            .text
+                                            .split_whitespace()
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        (observed_identity == expected_identity).then(|| {
+                                            (
+                                                block,
+                                                crate::pdf::bbox_overlap_fraction(
+                                                    edit.bbox,
+                                                    block.bbox,
+                                                ),
+                                            )
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                identity_overlaps.sort_by(|left, right| {
+                                    right
+                                        .1
+                                        .partial_cmp(&left.1)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                let exact_matches = identity_overlaps
+                                    .iter()
+                                    .filter(|(_, overlap)| *overlap >= 0.5)
+                                    .count();
+                                if exact_matches != 1 {
+                                    let best_overlap = identity_overlaps
+                                        .first()
+                                        .map(|(_, overlap)| *overlap)
+                                        .unwrap_or(0.0);
+                                    issues.push(format!(
+                                        "edit {index} page {}: expected exactly one stable target for {:?}, found {exact_matches} (best overlap {:.1}%)",
+                                        edit.page,
+                                        edit.old_text,
+                                        best_overlap * 100.0
+                                    ));
+                                }
+                            }
+                            issues
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            vec![format!("stable-target preflight panicked: {error}")]
+                        });
 
-                                            let blocks = eng_for_guard
-                                                .get_text_blocks(&check_path, check_page)
-                                                .unwrap_or_default();
-
-                                            if blocks.is_empty() {
-                                                // Tier 3: no spans at all - image-only page
-                                                tracing::warn!(
-                                                    "[ROW_DRIFT] Edit {} on page {}: no text spans found (image-only page?). Proceeding without guard.",
-                                                    idx, e.page,
-                                                );
-                                                warnings.push((idx, 0.0, None));
-                                                continue;
-                                            }
-
-                                            let best = crate::pdf::dominant_span_overlap(&blocks, check_page, e.bbox)
-                                                .map(|(_, f)| f)
-                                                .unwrap_or(0.0);
-
-                                            if best >= 0.5 {
-                                                // Tier 1: good overlap, proceed
-                                                continue;
-                                            }
-
-                                            // Tier 2: poor overlap - find nearest span by Y-midpoint
-                                            let edit_y_mid = (e.bbox[1] + e.bbox[3]) / 2.0;
-                                            let nearest = blocks.iter()
-                                                .filter(|b| b.page == check_page)
-                                                .min_by(|a, b| {
-                                                    let ay = (a.bbox[1] + a.bbox[3]) / 2.0;
-                                                    let by = (b.bbox[1] + b.bbox[3]) / 2.0;
-                                                    (ay - edit_y_mid).abs().partial_cmp(&(by - edit_y_mid).abs())
-                                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                                });
-
-                                            if let Some(snap_span) = nearest {
-                                                let snap_y_mid = (snap_span.bbox[1] + snap_span.bbox[3]) / 2.0;
-                                                let y_dist = (snap_y_mid - edit_y_mid).abs();
-                                                tracing::warn!(
-                                                    "[ROW_DRIFT] Edit {} on page {}: bbox [{:.1},{:.1},{:.1},{:.1}] overlap={:.0}% < 50%. \
-                                                     Nearest span '{}' at y_mid={:.1} (dist={:.1}pts). Proceeding with warning.",
-                                                    idx, e.page, e.bbox[0], e.bbox[1], e.bbox[2], e.bbox[3],
-                                                    best * 100.0,
-                                                    &snap_span.text[..snap_span.text.len().min(30)],
-                                                    snap_y_mid, y_dist,
-                                                );
-                                                warnings.push((idx, best, Some(snap_span.bbox)));
-                                            } else {
-                                                tracing::warn!(
-                                                    "[ROW_DRIFT] Edit {} on page {}: no matching span found. Proceeding with warning.",
-                                                    idx, e.page,
-                                                );
-                                                warnings.push((idx, best, None));
-                                            }
-                                        }
-                                        warnings
-                                    }).await.unwrap_or_default();
-
-                        if !drift_result.is_empty() {
-                            tracing::warn!(
-                                            "[ROW_DRIFT] {} of {} edits had sub-50% overlap. Proceeding with best-effort placement.",
-                                            drift_result.len(), edits.len(),
-                                        );
+                        if !target_issues.is_empty() {
+                            let detail = target_issues
+                                .iter()
+                                .take(10)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            let _ = res_tx.send(JobResult::WorkflowFailed(
+                                crate::engine::workflow::WorkflowFailure::Other(format!(
+                                    "Stable target validation failed before PDF mutation: {detail}"
+                                )),
+                            ));
+                            return;
                         }
                     }
 
