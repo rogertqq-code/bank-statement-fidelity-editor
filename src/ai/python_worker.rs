@@ -18,6 +18,7 @@ pub struct PythonWorkerConfig {
     pub worker_script: PathBuf,
     pub working_directory: PathBuf,
     pub python_path: PathBuf,
+    pub environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     pub handshake_timeout: Duration,
     pub operation_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -46,6 +47,7 @@ impl Default for PythonWorkerConfig {
             worker_script: root.join("python").join("worker.py"),
             working_directory: root.clone(),
             python_path: root.join("python"),
+            environment: Vec::new(),
             handshake_timeout: Duration::from_secs(15),
             operation_timeout: Duration::from_secs(120),
             shutdown_timeout: Duration::from_secs(5),
@@ -180,7 +182,8 @@ impl PythonWorkerProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("PYTHONUNBUFFERED", "1");
+            .env("PYTHONUNBUFFERED", "1")
+            .envs(config.environment.iter().cloned());
         let python_path = joined_python_path(&config.python_path)?;
         command.env("PYTHONPATH", python_path);
 
@@ -644,6 +647,118 @@ mod tests {
         let operation_id = request.operation_id;
         let response = client.execute(request).unwrap();
         assert_eq!(response.operation_id, operation_id);
+        client.shutdown(Duration::from_secs(5)).unwrap();
+    }
+
+    struct FaultHarness {
+        _directory: tempfile::TempDir,
+        config: PythonWorkerConfig,
+        log_path: PathBuf,
+    }
+
+    impl FaultHarness {
+        fn new(mode: &str, timeout: Duration) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let state_path = directory.path().join("fault.state");
+            let log_path = directory.path().join("operations.log");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let config = PythonWorkerConfig {
+                worker_script: root.join("python").join("worker_fault_fixture.py"),
+                environment: vec![
+                    ("PYTHON_WORKER_FAULT_MODE".into(), mode.into()),
+                    (
+                        "PYTHON_WORKER_FAULT_STATE".into(),
+                        state_path.as_os_str().to_owned(),
+                    ),
+                    (
+                        "PYTHON_WORKER_FAULT_LOG".into(),
+                        log_path.as_os_str().to_owned(),
+                    ),
+                ],
+                operation_timeout: timeout,
+                handshake_timeout: Duration::from_secs(5),
+                max_operations_per_worker: 1_000,
+                ..PythonWorkerConfig::default()
+            };
+            Self {
+                _directory: directory,
+                config,
+                log_path,
+            }
+        }
+
+        fn logged_ids(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect()
+        }
+    }
+
+    fn assert_fault_restarts_without_replay(
+        mode: &str,
+        timeout: Duration,
+        expected: fn(&PythonWorkerError) -> bool,
+    ) {
+        let harness = FaultHarness::new(mode, timeout);
+        let mut supervisor = PythonWorkerSupervisor::start(harness.config.clone()).unwrap();
+        let first = ping_request();
+        let first_id = first.operation_id.to_string();
+        let error = supervisor.execute(&first).unwrap_err();
+        assert!(expected(&error), "unexpected fault result: {error}");
+
+        let second = ping_request();
+        let second_id = second.operation_id.to_string();
+        let response = supervisor.execute(&second).unwrap();
+        assert_eq!(response.operation_id, second.operation_id);
+        let ids = harness.logged_ids();
+        assert_eq!(ids.iter().filter(|id| *id == &first_id).count(), 1);
+        assert_eq!(ids.iter().filter(|id| *id == &second_id).count(), 1);
+        supervisor.shutdown();
+    }
+
+    #[test]
+    fn crash_mid_operation_restarts_without_replay() {
+        assert_fault_restarts_without_replay("crash_once", Duration::from_secs(2), |error| {
+            matches!(error, PythonWorkerError::WorkerExited { .. })
+        });
+    }
+
+    #[test]
+    fn timeout_mid_operation_restarts_without_replay() {
+        assert_fault_restarts_without_replay("hang_once", Duration::from_millis(150), |error| {
+            matches!(error, PythonWorkerError::ResponseTimeout)
+        });
+    }
+
+    #[test]
+    fn malformed_stdout_restarts_without_replay() {
+        assert_fault_restarts_without_replay("malformed_once", Duration::from_secs(2), |error| {
+            matches!(error, PythonWorkerError::InvalidResponse(_))
+        });
+    }
+
+    #[test]
+    fn bounded_queue_rejects_overload() {
+        let mut harness = FaultHarness::new("hang_once", Duration::from_millis(300));
+        harness.config.queue_capacity = 1;
+        let client = PythonWorkerClient::start(harness.config.clone()).unwrap();
+        let first = client.submit(ping_request()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let second = client.submit(ping_request()).unwrap();
+        assert!(matches!(
+            client.submit(ping_request()),
+            Err(PythonWorkerError::QueueFull)
+        ));
+        assert!(matches!(
+            first.wait(),
+            Err(PythonWorkerError::ResponseTimeout)
+        ));
+        assert_eq!(
+            second.wait().unwrap().disposition,
+            crate::ai::python_protocol::PythonDisposition::Succeeded
+        );
         client.shutdown(Duration::from_secs(5)).unwrap();
     }
 
