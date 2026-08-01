@@ -945,6 +945,30 @@ impl AppModals for MyApp {
                 ui.separator();
 
                 let has_input = !self.input_path.is_empty();
+                let validated_mode = if self.date_adjust_mode_shift {
+                    self.date_adjust_shift_days
+                        .trim()
+                        .parse::<i64>()
+                        .map(crate::engine::date_adjust::DateAdjustMode::ShiftDays)
+                        .map_err(|_| "Days to shift must be a whole number.".to_string())
+                } else {
+                    let from =
+                        chrono::NaiveDate::parse_from_str(self.date_adjust_from.trim(), "%d/%m/%Y")
+                            .map_err(|_| "From date must be a valid DD/MM/YYYY date.".to_string());
+                    let to =
+                        chrono::NaiveDate::parse_from_str(self.date_adjust_to.trim(), "%d/%m/%Y")
+                            .map_err(|_| "To date must be a valid DD/MM/YYYY date.".to_string());
+                    from.and_then(|from_start| {
+                        to.map(
+                            |to_start| crate::engine::date_adjust::DateAdjustMode::RemapPeriod {
+                                from_start,
+                                to_start,
+                            },
+                        )
+                    })
+                };
+                let can_apply = has_input && validated_mode.is_ok();
+                let validation_error = validated_mode.as_ref().err().cloned();
 
                 ui.horizontal(|ui| {
                     if self.in_flight > 0 {
@@ -958,8 +982,8 @@ impl AppModals for MyApp {
                         }
                     } else {
                         let btn = ui.add_enabled(
-                            has_input,
-                            egui::Button::new("▶ Apply Date Adjustment").fill(if has_input {
+                            can_apply,
+                            egui::Button::new("▶ Apply Date Adjustment").fill(if can_apply {
                                 self.settings.theme.palette().accent
                             } else {
                                 self.settings.theme.palette().panel
@@ -970,25 +994,9 @@ impl AppModals for MyApp {
                             let input = std::path::PathBuf::from(&self.input_path);
                             let output = Self::safe_output_path(&input, "dates");
 
-                            let mode = if self.date_adjust_mode_shift {
-                                let days: i64 = self.date_adjust_shift_days.parse().unwrap_or(0);
-                                crate::engine::date_adjust::DateAdjustMode::ShiftDays(days)
-                            } else {
-                                let from = chrono::NaiveDate::parse_from_str(
-                                    self.date_adjust_from.trim(),
-                                    "%d/%m/%Y",
-                                )
-                                .unwrap_or(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-                                let to = chrono::NaiveDate::parse_from_str(
-                                    self.date_adjust_to.trim(),
-                                    "%d/%m/%Y",
-                                )
-                                .unwrap_or(chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
-                                crate::engine::date_adjust::DateAdjustMode::RemapPeriod {
-                                    from_start: from,
-                                    to_start: to,
-                                }
-                            };
+                            let mode = validated_mode
+                                .clone()
+                                .expect("enabled date-adjust action has validated input");
 
                             let _ = self.job_tx.send(Job::AdjustDatePeriods {
                                 input,
@@ -1008,6 +1016,8 @@ impl AppModals for MyApp {
 
                 if !has_input {
                     ui.colored_label(self.settings.theme.palette().warn, "⚠ Load a PDF first");
+                } else if let Some(error) = validation_error {
+                    ui.colored_label(self.settings.theme.palette().warn, error);
                 }
             });
         if open {
