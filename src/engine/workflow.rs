@@ -890,30 +890,46 @@ pub fn build_preview(
     // 1. Clone, apply edits in place.
     let mut working: Vec<Transaction> = original.to_vec();
     for e in edits {
-        // Find the matching row by (page, line_on_page); skip silently if
-        // there's no match (the edit was on a row that no longer exists).
+        // A stale row identity means the preview no longer represents the
+        // user's intent. Reject it rather than silently dropping the edit.
         let Some(row) = working
             .iter_mut()
             .find(|t| t.page == e.page && t.line_on_page == e.line_on_page)
         else {
-            continue;
+            return Err(format!(
+                "edit targets missing row p{}:r{}",
+                e.page, e.line_on_page
+            ));
         };
         match e.field {
             EditField::Date => row.date = e.new_text.clone(),
             EditField::Description => row.raw_text = e.new_text.clone(),
             EditField::Debit => {
-                row.debit = parse_money(&e.new_text);
-                if row.debit.is_some() {
-                    row.credit = None;
-                }
+                row.debit = Some(parse_money(&e.new_text).ok_or_else(|| {
+                    format!(
+                        "invalid debit value {:?} on p{}:r{}",
+                        e.new_text, e.page, e.line_on_page
+                    )
+                })?);
+                row.credit = None;
             }
             EditField::Credit => {
-                row.credit = parse_money(&e.new_text);
-                if row.credit.is_some() {
-                    row.debit = None;
-                }
+                row.credit = Some(parse_money(&e.new_text).ok_or_else(|| {
+                    format!(
+                        "invalid credit value {:?} on p{}:r{}",
+                        e.new_text, e.page, e.line_on_page
+                    )
+                })?);
+                row.debit = None;
             }
-            EditField::RunningBalance => row.running_balance = parse_money(&e.new_text),
+            EditField::RunningBalance => {
+                row.running_balance = Some(parse_money(&e.new_text).ok_or_else(|| {
+                    format!(
+                        "invalid running-balance value {:?} on p{}:r{}",
+                        e.new_text, e.page, e.line_on_page
+                    )
+                })?);
+            }
         }
     }
 
@@ -1243,6 +1259,69 @@ mod tests {
         assert!(preview.balanced);
         assert_eq!(preview.final_imbalance, dec!(0.00));
         Ok(())
+    }
+
+    #[test]
+    fn build_preview_cascades_exact_balances_across_pages() -> anyhow::Result<()> {
+        let original = vec![
+            tx(0, 0, Some(dec!(10)), None, Some(dec!(110))),
+            tx(0, 1, None, Some(dec!(20)), Some(dec!(90))),
+            tx(1, 0, Some(dec!(5)), None, Some(dec!(95))),
+        ];
+        let edits = vec![UserEdit {
+            page: 0,
+            line_on_page: 0,
+            bbox: [1.0, 2.0, 3.0, 4.0],
+            old_text: "10.00".into(),
+            new_text: "15.00".into(),
+            field: EditField::Debit,
+        }];
+        let preview = build_preview(&original, &edits, dec!(100), Some(dec!(100)))
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            preview
+                .rows
+                .iter()
+                .map(|row| row.new_running_balance)
+                .collect::<Vec<_>>(),
+            vec![Some(dec!(115)), Some(dec!(95)), Some(dec!(100))]
+        );
+        assert!(preview.balanced);
+        assert_eq!(preview.changed_row_count(), 3);
+        assert_eq!(preview.changed_pages(), vec![0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn build_preview_rejects_stale_row_identity_and_invalid_money() {
+        let original = vec![tx(0, 0, Some(dec!(10)), None, Some(dec!(110)))];
+        let stale = UserEdit {
+            page: 9,
+            line_on_page: 9,
+            bbox: [0.0; 4],
+            old_text: "10.00".into(),
+            new_text: "20.00".into(),
+            field: EditField::Debit,
+        };
+        assert!(
+            build_preview(&original, &[stale], dec!(100), Some(dec!(110)))
+                .unwrap_err()
+                .contains("missing row")
+        );
+
+        let malformed = UserEdit {
+            page: 0,
+            line_on_page: 0,
+            bbox: [0.0; 4],
+            old_text: "10.00".into(),
+            new_text: "not-money".into(),
+            field: EditField::Debit,
+        };
+        assert!(
+            build_preview(&original, &[malformed], dec!(100), Some(dec!(110)))
+                .unwrap_err()
+                .contains("invalid debit")
+        );
     }
 
     #[test]
