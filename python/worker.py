@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Supervised JSON-lines worker for the permanent PyMuPDF production pipeline."""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import importlib
+import json
+import os
+import platform
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Mapping
+
+from bridge_protocol import (
+    OPERATIONS,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    build_response,
+    canonical_json,
+    parse_request,
+)
+
+
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _rss_bytes() -> int | None:
+    try:
+        import resource
+
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return rss if sys.platform == "darwin" else rss * 1024
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _open_handles() -> int | None:
+    try:
+        fd_dir = Path("/proc/self/fd")
+        return len(tuple(fd_dir.iterdir())) if fd_dir.is_dir() else None
+    except OSError:
+        return None
+
+
+def _gc_collections() -> int:
+    try:
+        return sum(int(item.get("collections", 0)) for item in gc.get_stats())
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+class WorkerRuntime:
+    def __init__(self) -> None:
+        self.bridge: Any | None = None
+        self.bridge_error_class: str | None = None
+        try:
+            self.bridge = importlib.import_module("pymupdf_pro_integration")
+        except BaseException as error:  # startup must report even loader-level failures
+            self.bridge_error_class = type(error).__name__
+
+    def handshake(self) -> dict[str, Any]:
+        pymupdf_version = None
+        pro_available = False
+        pro_error_class = None
+        if self.bridge is not None:
+            version = getattr(self.bridge.pymupdf, "version", None)
+            if isinstance(version, tuple):
+                pymupdf_version = str(version[0]) if version else None
+            elif version is not None:
+                pymupdf_version = str(version)
+            pro_available = bool(
+                getattr(self.bridge, "_PYMUPDF_PRO_AVAILABLE", False)
+            )
+            pro_error = getattr(self.bridge, "_PYMUPDF_PRO_IMPORT_ERROR", None)
+            if pro_error is not None:
+                pro_error_class = type(pro_error).__name__
+        return {
+            "event": "handshake",
+            "protocol_version": PROTOCOL_VERSION,
+            "worker_pid": os.getpid(),
+            "python_version": platform.python_version(),
+            "platform": sys.platform,
+            "ready": self.bridge is not None,
+            "bridge_error_class": self.bridge_error_class,
+            "pymupdf_version": pymupdf_version,
+            "pro_package_available": pro_available,
+            "pro_import_error_class": pro_error_class,
+            "operations": list(OPERATIONS),
+        }
+
+    def execute(self, request_raw: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
+        request = parse_request(request_raw)
+        start_ns = time.monotonic_ns()
+        rss_before = _rss_bytes()
+        handles_before = _open_handles()
+        gc_before = _gc_collections()
+        try:
+            outcome = self._dispatch(request)
+            response = build_response(
+                request,
+                disposition=outcome["disposition"],
+                capability_tier=outcome["capability_tier"],
+                output_sha256=outcome.get("output_sha256"),
+                requested_count=outcome.get("requested_count"),
+                applied_count=outcome.get("applied_count"),
+                warnings=outcome.get("warnings"),
+                metrics=self._metrics(start_ns, rss_before, handles_before, gc_before),
+                payload=outcome.get("payload"),
+                failure=outcome.get("failure"),
+            )
+        except BaseException as error:
+            response = build_response(
+                request,
+                disposition="failed",
+                capability_tier=self._capability_tier(request["operation"]),
+                metrics=self._metrics(start_ns, rss_before, handles_before, gc_before),
+                failure={
+                    "code": self._error_code(error),
+                    "class": type(error).__name__,
+                    "message": str(error) or type(error).__name__,
+                    "retryable": self._is_retryable(error),
+                    "context": {},
+                },
+            )
+        return response
+
+    def _metrics(
+        self,
+        start_ns: int,
+        rss_before: int | None,
+        handles_before: int | None,
+        gc_before: int,
+    ) -> dict[str, Any]:
+        return {
+            "duration_ms": max(0, (time.monotonic_ns() - start_ns) // 1_000_000),
+            "rss_before_bytes": rss_before,
+            "rss_after_bytes": _rss_bytes(),
+            "open_handles_before": handles_before,
+            "open_handles_after": _open_handles(),
+            "gc_collections": max(0, _gc_collections() - gc_before),
+        }
+
+    def _dispatch(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        operation = request["operation"]
+        payload = request["payload"]
+        if operation == "ping":
+            return {
+                "disposition": "succeeded",
+                "capability_tier": "core",
+                "payload": {"handshake": self.handshake()},
+            }
+        if self.bridge is None:
+            raise RuntimeError(
+                f"Python bridge unavailable ({self.bridge_error_class or 'unknown'})"
+            )
+        pdf_path = payload.get("pdf_path")
+        if isinstance(pdf_path, str) and not Path(pdf_path).is_file():
+            raise FileNotFoundError(f"input PDF not found: {Path(pdf_path).name}")
+
+        method = {
+            "get_text_blocks": lambda: self.bridge.get_text_blocks(
+                payload["pdf_path"], payload["page_num"]
+            ),
+            "replace_text_in_rect": lambda: self.bridge.replace_text_in_rect(
+                pdf_path=payload["pdf_path"],
+                output_path=payload["output_path"],
+                page_num=payload["page_num"],
+                rect=payload["rect"],
+                new_text=payload["new_text"],
+                font_path=payload.get("font_path"),
+            ),
+            "find_text_block_at_click": lambda: self.bridge.find_text_block_at_click(
+                payload["pdf_path"],
+                payload["page_num"],
+                payload["x"],
+                payload["y"],
+                72.0,
+            ),
+            "get_all_transactions": lambda: self.bridge.get_all_transactions(
+                payload["pdf_path"]
+            ),
+            "analyze_document_layout": lambda: self.bridge.analyze_document_layout(
+                payload["pdf_path"]
+            ),
+            "complete_font_with_adaption": lambda: self.bridge.complete_font_with_adaption_fallback(
+                payload["pdf_path"], payload["font_name"]
+            ),
+            "deep_font_replication": lambda: self.bridge.deep_font_replication_api(
+                payload["pdf_path"], payload["font_name"], payload["output_dir"]
+            ),
+            "apply_many_edits": lambda: self.bridge.apply_many_edits(
+                payload["pdf_path"],
+                payload["output_path"],
+                payload["edits"],
+                payload.get("font_path"),
+            ),
+            "chunk_pdf_for_docai": lambda: self.bridge.chunk_pdf_for_docai(
+                payload["pdf_path"],
+                payload["output_dir"],
+                payload["max_pages_per_chunk"],
+            ),
+            "analyze_fonts": lambda: self.bridge.analyze_fonts(payload["pdf_path"]),
+            "replicate_font_for_missing_chars": lambda: self.bridge.replicate_font_for_missing_chars(
+                payload["pdf_path"],
+                payload["font_name"],
+                ",".join(payload["missing_chars"]),
+                payload["output_dir"],
+            ),
+            "clone_pages": lambda: self.bridge.clone_pages(
+                payload["pdf_path"], payload["output_path"], payload["page_indices"]
+            ),
+            "remove_pages": lambda: self.bridge.remove_pages(
+                payload["pdf_path"], payload["output_path"], payload["page_indices"]
+            ),
+            "render_page_to_png": lambda: self.bridge.render_page_to_png(
+                payload["pdf_path"], payload["page_num"], payload["dpi"]
+            ),
+        }.get(operation)
+        if method is None:
+            raise ProtocolError("UNSUPPORTED_OPERATION", f"unsupported operation: {operation}")
+        result = method()
+        return self._outcome(operation, payload, result)
+
+    def _outcome(
+        self, operation: str, payload: Mapping[str, Any], result: Any
+    ) -> dict[str, Any]:
+        outcome: dict[str, Any] = {
+            "disposition": "succeeded",
+            "capability_tier": self._capability_tier(operation),
+            "payload": {"result": result},
+        }
+        if operation not in {
+            "replace_text_in_rect",
+            "apply_many_edits",
+            "clone_pages",
+            "remove_pages",
+        }:
+            return outcome
+
+        output_path = payload["output_path"]
+        requested = self._requested_count(operation, payload)
+        applied = self._applied_count(operation, result)
+        output_hash = _sha256_file(output_path) if Path(output_path).is_file() else None
+        outcome.update(
+            requested_count=requested,
+            applied_count=applied,
+            output_sha256=output_hash,
+        )
+        success_flag = not isinstance(result, dict) or bool(result.get("success", True))
+        if success_flag and output_hash is not None and requested == applied:
+            return outcome
+        outcome["disposition"] = "partial" if applied > 0 else "failed"
+        outcome["failure"] = {
+            "code": "PYTHON_MUTATION_INCOMPLETE",
+            "class": "MutationIncomplete",
+            "message": f"applied {applied} of {requested} requested changes",
+            "retryable": False,
+            "context": {"requested_count": requested, "applied_count": applied},
+        }
+        if outcome["disposition"] == "partial":
+            # Partial is not a failure disposition in protocol v1, so carry the
+            # explanatory evidence as a warning rather than a failure object.
+            failure = outcome.pop("failure")
+            outcome["warnings"] = [
+                {"code": failure["code"], "message": failure["message"]}
+            ]
+        return outcome
+
+    @staticmethod
+    def _requested_count(operation: str, payload: Mapping[str, Any]) -> int:
+        if operation == "replace_text_in_rect":
+            return 1
+        if operation == "apply_many_edits":
+            return len(payload["edits"])
+        return len(payload["page_indices"])
+
+    @staticmethod
+    def _applied_count(operation: str, result: Any) -> int:
+        if not isinstance(result, dict):
+            return 1 if operation == "replace_text_in_rect" else 0
+        if operation == "apply_many_edits":
+            return int(result.get("applied_count", 0))
+        if operation == "clone_pages":
+            return int(result.get("cloned", 0))
+        if operation == "remove_pages":
+            return int(result.get("removed", 0))
+        return 1 if result.get("success", True) else 0
+
+    @staticmethod
+    def _capability_tier(operation: str) -> str:
+        return (
+            "pro"
+            if operation
+            in {
+                "replace_text_in_rect",
+                "complete_font_with_adaption",
+                "deep_font_replication",
+                "apply_many_edits",
+                "replicate_font_for_missing_chars",
+            }
+            else "core"
+        )
+
+    @staticmethod
+    def _error_code(error: BaseException) -> str:
+        message = str(error)
+        for code in (
+            "PRO_PAGE_LIMIT_EXCEEDED",
+            "FONT_COVERAGE_INSUFFICIENT",
+            "PDF_NOT_EDITABLE",
+        ):
+            if code in message:
+                return code
+        if isinstance(error, ProtocolError):
+            return error.code
+        return "PYTHON_OPERATION_FAILED"
+
+    @staticmethod
+    def _is_retryable(error: BaseException) -> bool:
+        return isinstance(error, (TimeoutError, InterruptedError))
+
+
+def _emit(value: Mapping[str, Any]) -> None:
+    sys.stdout.write(canonical_json(value) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> int:
+    runtime = WorkerRuntime()
+    _emit(runtime.handshake())
+    for line in sys.stdin.buffer:
+        if not line.strip():
+            continue
+        try:
+            _emit(runtime.execute(line))
+        except ProtocolError as error:
+            _emit(
+                {
+                    "event": "protocol_error",
+                    "code": error.code,
+                    "class": type(error).__name__,
+                    "message": str(error),
+                }
+            )
+        except BaseException as error:
+            _emit(
+                {
+                    "event": "worker_error",
+                    "code": "WORKER_INTERNAL_ERROR",
+                    "class": type(error).__name__,
+                    "message": str(error) or type(error).__name__,
+                }
+            )
+            traceback.print_exc(file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
