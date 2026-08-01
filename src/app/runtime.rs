@@ -25,6 +25,12 @@ pub fn alloc_job_id() -> JobId {
     NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Interactive,
+    Headless,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobMetadata {
     pub job_id: JobId,
@@ -33,10 +39,15 @@ pub struct JobMetadata {
     pub label: &'static str,
     pub submitted_at: std::time::SystemTime,
     pub deadline: std::time::Instant,
+    pub execution_mode: ExecutionMode,
 }
 
 impl JobMetadata {
     fn for_job(job: &Job) -> Self {
+        Self::for_job_with_mode(job, ExecutionMode::Interactive)
+    }
+
+    fn for_job_with_mode(job: &Job, execution_mode: ExecutionMode) -> Self {
         Self {
             job_id: alloc_job_id(),
             document_id: job.document_path().map(document_id_for_path),
@@ -44,6 +55,7 @@ impl JobMetadata {
             label: job.label(),
             submitted_at: std::time::SystemTime::now(),
             deadline: std::time::Instant::now() + job.default_timeout(),
+            execution_mode,
         }
     }
 }
@@ -77,8 +89,24 @@ impl JobEnvelope {
     }
 
     fn routed(job: Job, route: mpsc::Sender<JobResult>) -> Self {
+        Self::routed_with_mode(job, route, ExecutionMode::Interactive)
+    }
+
+    fn broadcast_with_mode(job: Job, execution_mode: ExecutionMode) -> Self {
         Self {
-            metadata: JobMetadata::for_job(&job),
+            metadata: JobMetadata::for_job_with_mode(&job, execution_mode),
+            job,
+            route: None,
+        }
+    }
+
+    fn routed_with_mode(
+        job: Job,
+        route: mpsc::Sender<JobResult>,
+        execution_mode: ExecutionMode,
+    ) -> Self {
+        Self {
+            metadata: JobMetadata::for_job_with_mode(&job, execution_mode),
             job,
             route: Some(route),
         }
@@ -130,7 +158,19 @@ impl RuntimeClient {
     }
 
     pub fn send(&self, job: Job) -> Result<JobId, RuntimeSubmitError> {
-        let envelope = JobEnvelope::broadcast(job);
+        self.send_with_mode(job, ExecutionMode::Interactive)
+    }
+
+    pub fn send_headless(&self, job: Job) -> Result<JobId, RuntimeSubmitError> {
+        self.send_with_mode(job, ExecutionMode::Headless)
+    }
+
+    pub fn send_with_mode(
+        &self,
+        job: Job,
+        execution_mode: ExecutionMode,
+    ) -> Result<JobId, RuntimeSubmitError> {
+        let envelope = JobEnvelope::broadcast_with_mode(job, execution_mode);
         let id = envelope.metadata.job_id;
         self.sender()?
             .send(envelope)
@@ -139,8 +179,20 @@ impl RuntimeClient {
     }
 
     pub fn submit(&self, job: Job) -> Result<JobTicket, RuntimeSubmitError> {
+        self.submit_with_mode(job, ExecutionMode::Interactive)
+    }
+
+    pub fn submit_headless(&self, job: Job) -> Result<JobTicket, RuntimeSubmitError> {
+        self.submit_with_mode(job, ExecutionMode::Headless)
+    }
+
+    pub fn submit_with_mode(
+        &self,
+        job: Job,
+        execution_mode: ExecutionMode,
+    ) -> Result<JobTicket, RuntimeSubmitError> {
         let (result_tx, result_rx) = mpsc::channel();
-        let envelope = JobEnvelope::routed(job, result_tx);
+        let envelope = JobEnvelope::routed_with_mode(job, result_tx, execution_mode);
         let metadata = envelope.metadata.clone();
         self.sender()?
             .send(envelope)
@@ -869,6 +921,10 @@ impl ResultSink {
         outcome
     }
 
+    fn is_interactive(&self) -> bool {
+        self.metadata.execution_mode == ExecutionMode::Interactive
+    }
+
     async fn completed(&self) {
         if self
             .terminal_sent
@@ -974,6 +1030,10 @@ impl TerminalTracker {
             return Ok(());
         }
         self.0.tx.send(res)
+    }
+
+    fn is_interactive(&self) -> bool {
+        self.0.tx.is_interactive()
     }
 }
 
@@ -2128,7 +2188,7 @@ async fn process_job_inner(
                         Ok(p) => p,
                         Err(e) => {
                             tracing::warn!("[TRANSFER] Gemini format mapping failed: {e}");
-                            if !cfg.interactive_fallbacks {
+                            if !cfg.interactive_fallbacks || !res_tx.is_interactive() {
                                 let _ = res_tx.send(JobResult::TransferFailed {
                                     stage: "AiFormatMapping".into(),
                                     message: format!("Gemini format mapping failed: {e}"),
@@ -2140,12 +2200,16 @@ async fn process_job_inner(
                                             "Transfer Transactions Mapping",
                                             format!("Gemini mapping failed: {e}"),
                                         );
-                            req = req.add_alternative(
-                                "openrouter",
-                                "Try OpenRouter (Multi-Model)",
-                                None,
-                            );
-                            req = req.add_alternative("groq", "Try Groq", None);
+                            if cfg.openrouter_api_key.is_some() {
+                                req = req.add_alternative(
+                                    "openrouter",
+                                    "Try OpenRouter (Multi-Model)",
+                                    None,
+                                );
+                            }
+                            if cfg.groq_api_key.is_some() {
+                                req = req.add_alternative("groq", "Try Groq", None);
+                            }
                             req = req.add_alternative("cancel", "Cancel Transfer", None);
 
                             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3037,7 +3101,7 @@ async fn process_job_inner(
                     // Interactive Fallback Logic for No Improvement / Reduction
                     if attempt >= 1 && current_quality_score <= best_quality_score {
                         tracing::warn!("[TRANSFER] Loop {} yielded no improvement or regression. Quality score: {:.4}, Best: {:.4}", attempt, current_quality_score, best_quality_score);
-                        if cfg.interactive_fallbacks {
+                        if cfg.interactive_fallbacks && res_tx.is_interactive() {
                             let mut req = crate::engine::interactive_fallback::InteractiveFallbackRequest::new(
                                             "Transfer Validation Loop",
                                             if current_quality_score < best_quality_score {
@@ -3046,8 +3110,16 @@ async fn process_job_inner(
                                                 "The AI mapping failed to improve the fidelity issues."
                                             }
                                         );
-                            req = req.add_alternative("openrouter", "Try OpenRouter Backup", None);
-                            req = req.add_alternative("groq", "Try Groq Backup", None);
+                            if cfg.openrouter_api_key.is_some() {
+                                req = req.add_alternative(
+                                    "openrouter",
+                                    "Try OpenRouter Backup",
+                                    None,
+                                );
+                            }
+                            if cfg.groq_api_key.is_some() {
+                                req = req.add_alternative("groq", "Try Groq Backup", None);
+                            }
                             req = req.add_alternative("finish", "Use Best Result & Finish", None);
 
                             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -5966,15 +6038,31 @@ async fn process_job_inner(
 
                 macro_rules! interactive_fallback_or_continue {
                                 ($cfg:expr, $router:expr, $res_tx:expr, $err:expr, $next_parser:expr) => {{
-                                    if $cfg.interactive_fallbacks {
+                                    if $cfg.interactive_fallbacks && $res_tx.is_interactive() {
                                         let mut req = crate::engine::interactive_fallback::InteractiveFallbackRequest::new(
                                             "Document Parsing",
                                             $err.to_string(),
                                         );
 
-                                        req = req.add_alternative("document_ai", "Try Document AI Again", None);
-                                        req = req.add_alternative("llamaparse", "Try LlamaParse", None);
-                                        req = req.add_alternative("offline_parser", "Fall back to Offline Parser (Local)", None);
+                                        if $cfg.document_ai.is_some() {
+                                            req = req.add_alternative(
+                                                "document_ai",
+                                                "Try Document AI Again",
+                                                None,
+                                            );
+                                        }
+                                        if $cfg.llamaparse_api_key.is_some() {
+                                            req = req.add_alternative(
+                                                "llamaparse",
+                                                "Try LlamaParse",
+                                                None,
+                                            );
+                                        }
+                                        req = req.add_alternative(
+                                            "offline_parser",
+                                            "Fall back to Offline Parser (Local)",
+                                            None,
+                                        );
                                         req = req.add_alternative("cancel", "Cancel Workflow", None);
 
                                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -6002,8 +6090,10 @@ async fn process_job_inner(
                                             "offline_parser" => Some(DocumentParserMode::OfflineHeuristic),
                                             _ => None,
                                         }
+                                    } else if $next_parser.is_some() {
+                                        Some(DocumentParserMode::OfflineHeuristic)
                                     } else {
-                                        $next_parser
+                                        None
                                     }
                                 }};
                             }
@@ -8015,6 +8105,31 @@ mod tests {
             Ok(JobResult::Pong)
         ));
         assert!(second.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_client_preserves_explicit_execution_mode() {
+        let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
+        let client = RuntimeClient::new(intake_tx);
+
+        let interactive = client.submit(Job::Ping).unwrap();
+        let interactive_envelope = intake_rx.recv().unwrap();
+        assert_eq!(
+            interactive.metadata().execution_mode,
+            ExecutionMode::Interactive
+        );
+        assert_eq!(
+            interactive_envelope.metadata.execution_mode,
+            ExecutionMode::Interactive
+        );
+
+        let headless = client.submit_headless(Job::Ping).unwrap();
+        let headless_envelope = intake_rx.recv().unwrap();
+        assert_eq!(headless.metadata().execution_mode, ExecutionMode::Headless);
+        assert_eq!(
+            headless_envelope.metadata.execution_mode,
+            ExecutionMode::Headless
+        );
     }
 
     #[test]

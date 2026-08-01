@@ -185,7 +185,7 @@ fn route(
 /// Exercise the worker actor with a private result route. Each readiness
 /// probe receives only the result stream for its own `Ping` job.
 fn ping_worker(channel: &RuntimeChannel) -> bool {
-    let ticket = match channel.submit(Job::Ping) {
+    let ticket = match channel.submit_headless(Job::Ping) {
         Ok(ticket) => ticket,
         Err(_) => return false,
     };

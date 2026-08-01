@@ -378,7 +378,7 @@ fn run_selftest(
     println!("▶ Self-test on {}", input.display());
 
     // 1) Runtime liveness.
-    let _ = job_tx.send(Job::Ping);
+    let _ = job_tx.send_headless(Job::Ping);
     match wait_for_terminal_result(job_rx) {
         Ok(JobResult::Pong) => println!("  ✅ runtime ping"),
         _ => {
@@ -388,7 +388,7 @@ fn run_selftest(
     }
 
     // 2) Baseline render of page 0.
-    let _ = job_tx.send(Job::RenderPage {
+    let _ = job_tx.send_headless(Job::RenderPage {
         path: input.clone(),
         page: 0,
         dpi: 150.0,
@@ -407,7 +407,7 @@ fn run_selftest(
 
     // 3) Find a real text span on page 0 (so the edit has a target).
     let (tx, rx) = std::sync::mpsc::channel();
-    let _ = job_tx.send(Job::Python(
+    let _ = job_tx.send_headless(Job::Python(
         PythonJob::GetTextBlocks {
             pdf_path: input.to_string_lossy().to_string(),
             page_num: 0,
@@ -461,7 +461,7 @@ fn run_selftest(
     // 4) Apply an edit over that span.
     let out = std::path::PathBuf::from("output/selftest_edited.pdf");
     let _ = std::fs::create_dir_all("output");
-    let _ = job_tx.send(Job::ApplyChange {
+    let _ = job_tx.send_headless(Job::ApplyChange {
         input: input.clone(),
         output: out.clone(),
         page: 0,
@@ -480,7 +480,7 @@ fn run_selftest(
     }
 
     // 5) Re-render the edited PDF and assert it differs from the baseline.
-    let _ = job_tx.send(Job::RenderPage {
+    let _ = job_tx.send_headless(Job::RenderPage {
         path: out.clone(),
         page: 0,
         dpi: 150.0,
@@ -620,7 +620,7 @@ fn run_doctor(
 
     // ---- Runtime check ---------------------------------------------------
     println!("\n Runtime");
-    let _ = job_tx.send(Job::Ping);
+    let _ = job_tx.send_headless(Job::Ping);
     let runtime_ok = matches!(wait_for_terminal_result(job_rx), Ok(JobResult::Pong));
     print_status(
         if runtime_ok {
@@ -791,7 +791,7 @@ pub fn run_inner(
     match cli.command {
         Commands::TypstReconstruct { input, output } => {
             tracing::info!("Triggering Typst Reconstruction...");
-            let _ = job_tx.send(Job::TypstReconstruct {
+            let _ = job_tx.send_headless(Job::TypstReconstruct {
                 input: input.clone(),
                 output: output.clone(),
             });
@@ -886,7 +886,7 @@ pub fn run_inner(
                 }
             };
 
-            let _ = job_tx.send(Job::ApplyChange {
+            let _ = job_tx.send_headless(Job::ApplyChange {
                 input,
                 output,
                 page: page.unwrap_or(0),
@@ -916,7 +916,7 @@ pub fn run_inner(
             output,
             auto_approve,
         } => {
-            let _ = job_tx.send(Job::BalanceStatement {
+            let _ = job_tx.send_headless(Job::BalanceStatement {
                 path: input.clone(),
             });
             match wait_for_terminal_result(&job_rx) {
@@ -948,7 +948,7 @@ pub fn run_inner(
                             "\n--auto-approve flag is set. Applying all {} changes...",
                             expected_changes
                         );
-                        let _ = job_tx.send(Job::ApplyProposedChanges {
+                        let _ = job_tx.send_headless(Job::ApplyProposedChanges {
                             input,
                             output: output.clone(),
                             changes,
@@ -1013,13 +1013,13 @@ pub fn run_inner(
             }
         }
         Commands::Extract { input, output } => {
-            let _ = job_tx.send(Job::LoadDocument {
+            let _ = job_tx.send_headless(Job::LoadDocument {
                 path: input.clone(),
                 three_page_mode: false,
             });
             match wait_for_terminal_result(&job_rx) {
                 Ok(JobResult::DocumentLoaded { .. }) => {
-                    let _ = job_tx.send(Job::ExtractTransactions { path: input });
+                    let _ = job_tx.send_headless(Job::ExtractTransactions { path: input });
                     match wait_for_terminal_result(&job_rx) {
                         Ok(JobResult::TransactionsExtracted(transactions)) => {
                             let json = match serde_json::to_string_pretty(&transactions) {
@@ -1078,7 +1078,7 @@ pub fn run_inner(
                     intended_bboxes.len()
                 );
             }
-            let _ = job_tx.send(Job::Verify {
+            let _ = job_tx.send_headless(Job::Verify {
                 original,
                 edited,
                 output_dir: output_dir.clone(),
@@ -1125,7 +1125,7 @@ pub fn run_inner(
                 .and_then(|s| s.to_str())
                 .unwrap_or("page")
                 .to_string();
-            let _ = job_tx.send(Job::RenderPage {
+            let _ = job_tx.send_headless(Job::RenderPage {
                 path: input,
                 page,
                 dpi,
@@ -1158,7 +1158,7 @@ pub fn run_inner(
             }
         }
         Commands::FontComplete { input, font } => {
-            let _ = job_tx.send(Job::CompleteFont {
+            let _ = job_tx.send_headless(Job::CompleteFont {
                 path: input,
                 font_name: font,
             });
@@ -1199,7 +1199,7 @@ pub fn run_inner(
             }
         }
         Commands::Ping => {
-            let _ = job_tx.send(Job::Ping);
+            let _ = job_tx.send_headless(Job::Ping);
             match wait_for_terminal_result(&job_rx) {
                 Ok(JobResult::Pong) => {
                     println!("pong");
@@ -1348,7 +1348,7 @@ pub fn run_inner(
             }
         }
         Commands::AnalyzeFonts { input } => {
-            let _ = job_tx.send(Job::AnalyzeFonts { path: input });
+            let _ = job_tx.send_headless(Job::AnalyzeFonts { path: input });
             loop {
                 match job_rx.recv() {
                     Ok(JobResult::FontAnalysisReady(report)) => {
@@ -1365,7 +1365,7 @@ pub fn run_inner(
             }
         }
         Commands::AutoBalance { input, output } => {
-            let _ = job_tx.send(Job::BalanceAndApplyAll {
+            let _ = job_tx.send_headless(Job::BalanceAndApplyAll {
                 input,
                 output: output.clone(),
                 auto_apply: true,
@@ -1390,7 +1390,7 @@ pub fn run_inner(
             }
         }
         Commands::AiFixVisual { input, page } => {
-            let _ = job_tx.send(Job::AiFixVisualFidelity { input, page });
+            let _ = job_tx.send_headless(Job::AiFixVisualFidelity { input, page });
             println!("AiFixVisualFidelity is a stub.");
             Ok(0)
         }
@@ -1399,7 +1399,7 @@ pub fn run_inner(
             target_pdf,
             output,
         } => {
-            let _ = job_tx.send(Job::TransferTransactions {
+            let _ = job_tx.send_headless(Job::TransferTransactions {
                 source_pdf,
                 target_pdf,
                 output_pdf: output,
@@ -1438,7 +1438,7 @@ pub fn run_inner(
             } else {
                 crate::engine::date_adjust::DateAdjustMode::ShiftDays(30)
             };
-            let _ = job_tx.send(Job::AdjustDatePeriods {
+            let _ = job_tx.send_headless(Job::AdjustDatePeriods {
                 input,
                 output,
                 mode: parsed_mode,
@@ -1459,7 +1459,7 @@ pub fn run_inner(
             statements,
             max_iterations,
         } => {
-            let _ = job_tx.send(Job::RunTransferTests {
+            let _ = job_tx.send_headless(Job::RunTransferTests {
                 statements,
                 max_iterations,
             });
