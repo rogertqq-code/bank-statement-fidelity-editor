@@ -98,7 +98,9 @@ class MutationTransaction:
                 "OUTPUT_ARTIFACT_MISSING",
                 f"{operation} did not create the staged output artifact",
             )
-        with self.stage_path.open("rb") as stream:
+        # Windows requires a write-capable handle for FlushFileBuffers/fsync.
+        with self.stage_path.open("r+b") as stream:
+            stream.flush()
             os.fsync(stream.fileno())
         size_bytes = self.stage_path.stat().st_size
         if size_bytes <= 0:
