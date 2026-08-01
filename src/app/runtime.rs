@@ -8271,7 +8271,7 @@ mod tests {
     fn runtime_client_routes_results_by_job_and_document_identity() {
         let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
         let client = RuntimeClient::new(intake_tx);
-        let path = PathBuf::from("fixtures/account.pdf");
+        let path = PathBuf::from("fixtures/private-account.pdf");
         let first = client
             .submit(Job::LoadDocument {
                 path: path.clone(),
@@ -8290,11 +8290,38 @@ mod tests {
         assert_eq!(first.metadata().document_id, second.metadata().document_id);
         assert_eq!(first.metadata().job_id, first_envelope.metadata.job_id);
         assert_eq!(second.metadata().job_id, second_envelope.metadata.job_id);
-        first_envelope.route.unwrap().send(JobResult::Pong).unwrap();
+        assert_eq!(
+            first.metadata().correlation_id,
+            first_envelope.metadata.correlation_id
+        );
+        let metadata_debug = format!("{:?}", first_envelope.metadata);
+        assert!(!metadata_debug.contains("fixtures"));
+        assert!(!metadata_debug.contains("private-account.pdf"));
+
+        let (broadcast_tx, broadcast_rx) = mpsc::channel();
+        let sink = ResultSink::new(
+            broadcast_tx,
+            first_envelope.metadata,
+            first_envelope.route,
+            CancellationRegistry::new(),
+        );
+        sink.send(JobResult::completed(
+            "load_document",
+            OperationDisposition::Succeeded,
+            None,
+            "document metadata loaded",
+        ))
+        .unwrap();
         assert!(matches!(
             first.recv_timeout(Duration::from_secs(1)),
-            Ok(JobResult::Pong)
+            Ok(JobResult::JobCompleted {
+                disposition: OperationDisposition::Succeeded,
+                ..
+            })
         ));
+        assert!(broadcast_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
         assert!(second.try_recv().is_err());
     }
 
