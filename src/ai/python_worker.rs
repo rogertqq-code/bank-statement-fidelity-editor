@@ -23,6 +23,9 @@ pub struct PythonWorkerConfig {
     pub shutdown_timeout: Duration,
     pub queue_capacity: usize,
     pub max_consecutive_restarts: usize,
+    pub max_operations_per_worker: usize,
+    pub max_rss_growth_bytes: u64,
+    pub max_handle_growth: u64,
 }
 
 impl Default for PythonWorkerConfig {
@@ -48,6 +51,9 @@ impl Default for PythonWorkerConfig {
             shutdown_timeout: Duration::from_secs(5),
             queue_capacity: 32,
             max_consecutive_restarts: 3,
+            max_operations_per_worker: 250,
+            max_rss_growth_bytes: 256 * 1024 * 1024,
+            max_handle_growth: 32,
         }
     }
 }
@@ -158,6 +164,11 @@ struct PythonWorkerProcess {
     lines: mpsc::Receiver<Result<String, String>>,
     stderr_tail: Arc<Mutex<String>>,
     handshake: PythonWorkerHandshake,
+    operations_completed: usize,
+    baseline_rss_bytes: Option<u64>,
+    latest_rss_bytes: Option<u64>,
+    baseline_open_handles: Option<u64>,
+    latest_open_handles: Option<u64>,
 }
 
 impl PythonWorkerProcess {
@@ -243,6 +254,11 @@ impl PythonWorkerProcess {
             lines: line_rx,
             stderr_tail,
             handshake,
+            operations_completed: 0,
+            baseline_rss_bytes: None,
+            latest_rss_bytes: None,
+            baseline_open_handles: None,
+            latest_open_handles: None,
         })
     }
 
@@ -299,7 +315,36 @@ impl PythonWorkerProcess {
         response
             .validate_for(request)
             .map_err(|error| PythonWorkerError::InvalidResponse(error.to_string()))?;
+        self.operations_completed = self.operations_completed.saturating_add(1);
+        if let Some(rss) = response.metrics.rss_after_bytes {
+            self.baseline_rss_bytes.get_or_insert(rss);
+            self.latest_rss_bytes = Some(rss);
+        }
+        if let Some(handles) = response.metrics.open_handles_after {
+            self.baseline_open_handles.get_or_insert(handles);
+            self.latest_open_handles = Some(handles);
+        }
         Ok(response)
+    }
+
+    fn should_recycle(&self, config: &PythonWorkerConfig) -> bool {
+        if self.operations_completed >= config.max_operations_per_worker.max(1) {
+            return true;
+        }
+        let rss_growth = self
+            .baseline_rss_bytes
+            .zip(self.latest_rss_bytes)
+            .map(|(baseline, latest)| latest.saturating_sub(baseline))
+            .unwrap_or(0);
+        if rss_growth > config.max_rss_growth_bytes {
+            return true;
+        }
+        let handle_growth = self
+            .baseline_open_handles
+            .zip(self.latest_open_handles)
+            .map(|(baseline, latest)| latest.saturating_sub(baseline))
+            .unwrap_or(0);
+        handle_growth > config.max_handle_growth
     }
 
     fn stop(&mut self) {
@@ -350,6 +395,21 @@ impl PythonWorkerSupervisor {
         match result {
             Ok(response) => {
                 self.consecutive_restarts = 0;
+                let should_recycle = self
+                    .worker
+                    .as_ref()
+                    .map(|worker| worker.should_recycle(&self.config))
+                    .unwrap_or(false);
+                if should_recycle {
+                    if let Some(mut worker) = self.worker.take() {
+                        worker.stop();
+                    }
+                    if let Err(error) = self.restart() {
+                        tracing::warn!(
+                            "Python worker completed an operation but could not recycle: {error}"
+                        );
+                    }
+                }
                 Ok(response)
             }
             Err(error) => {
@@ -585,5 +645,62 @@ mod tests {
         let response = client.execute(request).unwrap();
         assert_eq!(response.operation_id, operation_id);
         client.shutdown(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn operation_budget_recycles_worker_after_success() {
+        let config = PythonWorkerConfig {
+            max_operations_per_worker: 1,
+            ..PythonWorkerConfig::default()
+        };
+        let mut supervisor = PythonWorkerSupervisor::start(config).unwrap();
+        let first_pid = supervisor.handshake().unwrap().worker_pid;
+        let response = supervisor.execute(&ping_request()).unwrap();
+        assert_eq!(
+            response.disposition,
+            crate::ai::python_protocol::PythonDisposition::Succeeded
+        );
+        let replacement_pid = supervisor.handshake().unwrap().worker_pid;
+        assert_ne!(first_pid, replacement_pid);
+        supervisor.shutdown();
+    }
+
+    #[test]
+    fn hundred_operation_stress_stays_correlated_and_bounded() {
+        let config = PythonWorkerConfig {
+            max_operations_per_worker: 25,
+            max_rss_growth_bytes: 128 * 1024 * 1024,
+            max_handle_growth: 16,
+            ..PythonWorkerConfig::default()
+        };
+        let mut supervisor = PythonWorkerSupervisor::start(config).unwrap();
+        let first_pid = supervisor.handshake().unwrap().worker_pid;
+        let mut rss_samples = Vec::new();
+        let mut handle_samples = Vec::new();
+
+        for _ in 0..100 {
+            let request = ping_request();
+            let operation_id = request.operation_id;
+            let response = supervisor.execute(&request).unwrap();
+            assert_eq!(response.operation_id, operation_id);
+            if let Some(rss) = response.metrics.rss_after_bytes {
+                rss_samples.push(rss);
+            }
+            if let Some(handles) = response.metrics.open_handles_after {
+                handle_samples.push(handles);
+            }
+        }
+
+        assert_ne!(first_pid, supervisor.handshake().unwrap().worker_pid);
+        if let (Some(minimum), Some(maximum)) = (rss_samples.iter().min(), rss_samples.iter().max())
+        {
+            assert!(maximum.saturating_sub(*minimum) < 128 * 1024 * 1024);
+        }
+        if let (Some(minimum), Some(maximum)) =
+            (handle_samples.iter().min(), handle_samples.iter().max())
+        {
+            assert!(maximum.saturating_sub(*minimum) <= 16);
+        }
+        supervisor.shutdown();
     }
 }
