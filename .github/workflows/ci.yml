@@ -125,10 +125,7 @@ jobs:
           python scripts/generate_python_runtime_manifest.py --check
           python python/verify_runtime_manifest.py --tier base
           python scripts/generate_python_protocol_fixtures.py --check
-          python -m unittest -v \
-            python.test_runtime_manifest \
-            python.test_bridge_protocol \
-            python.test_worker
+          python -m unittest -v python.test_runtime_manifest python.test_bridge_protocol python.test_worker
 
       - name: Compile every host target
         run: cargo check --locked --all-targets --message-format=short
