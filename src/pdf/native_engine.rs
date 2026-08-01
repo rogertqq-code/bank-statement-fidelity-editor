@@ -580,14 +580,87 @@ fn save_lopdf_atomically(
 ///  3. Auto-download from official GitHub releases (opt-in via
 ///     `PDFIUM_AUTO_DOWNLOAD=true` env var)
 pub mod pdfium_resolver {
-    use std::path::PathBuf;
+    use serde::Deserialize;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::path::{Component, Path, PathBuf};
     use std::sync::OnceLock;
+
+    const PINNED_MANIFEST: &str = include_str!("../../assets/pdfium-artifacts.json");
+    const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_EXTRACTED_BYTES: usize = 128 * 1024 * 1024;
+
+    #[derive(Debug, Deserialize)]
+    struct ArtifactManifest {
+        schema_version: u32,
+        source_repository: String,
+        release_tag: String,
+        artifacts: BTreeMap<String, PinnedArtifact>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    struct PinnedArtifact {
+        asset: String,
+        size_bytes: usize,
+        archive_sha256: String,
+        library_member: String,
+        library_sha256: String,
+    }
+
+    #[derive(Debug)]
+    struct VerifiedArchive {
+        library: Vec<u8>,
+        licenses: BTreeMap<PathBuf, Vec<u8>>,
+    }
 
     /// Cached result: `Ok(path)` where path is the directory containing the
     /// library, or `Err(reason)` if Pdfium could not be located.
     static RESOLVED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-    /// Platform-specific library filename.
+    fn platform_key() -> Result<&'static str, String> {
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            Ok("windows-x86_64")
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Ok("macos-aarch64")
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Ok("macos-x86_64")
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Ok("linux-x86_64")
+        } else {
+            Err(format!(
+                "no pinned Pdfium artifact for {}-{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))
+        }
+    }
+
+    fn pinned_artifact() -> Result<(ArtifactManifest, PinnedArtifact), String> {
+        let manifest: ArtifactManifest = serde_json::from_str(PINNED_MANIFEST)
+            .map_err(|error| format!("invalid embedded Pdfium manifest: {error}"))?;
+        if manifest.schema_version != 1
+            || manifest.release_tag.trim().is_empty()
+            || manifest.source_repository != "https://github.com/bblanchon/pdfium-binaries"
+        {
+            return Err("unsupported or untrusted embedded Pdfium manifest".into());
+        }
+        let artifact = manifest
+            .artifacts
+            .get(platform_key()?)
+            .cloned()
+            .ok_or_else(|| "pinned Pdfium platform entry is missing".to_string())?;
+        for (label, digest) in [
+            ("archive", artifact.archive_sha256.as_str()),
+            ("library", artifact.library_sha256.as_str()),
+        ] {
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("invalid pinned Pdfium {label} SHA-256"));
+            }
+        }
+        Ok((manifest, artifact))
+    }
+
     fn lib_filename() -> &'static str {
         if cfg!(target_os = "windows") {
             "pdfium.dll"
@@ -598,144 +671,222 @@ pub mod pdfium_resolver {
         }
     }
 
-    /// Directory next to the running executable (works for both debug and
-    /// release layouts).
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn sha256_file(path: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        Ok(sha256_bytes(&bytes))
+    }
+
+    fn verify_library(path: &Path, artifact: &PinnedArtifact) -> Result<(), String> {
+        let actual = sha256_file(path)?;
+        if actual != artifact.library_sha256 {
+            return Err(format!(
+                "Pdfium library checksum mismatch at {}: expected {}, got {}",
+                path.display(),
+                artifact.library_sha256,
+                actual
+            ));
+        }
+        Ok(())
+    }
+
     fn exe_adjacent_dir() -> Option<PathBuf> {
         std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .and_then(|path| path.parent().map(Path::to_path_buf))
     }
 
-    /// Try to find the Pdfium library in well-known local directories.
-    fn find_local() -> Option<PathBuf> {
-        let name = lib_filename();
-
-        // 1. pdfium_lib/ relative to CWD (project root at dev time)
-        let cwd_lib = PathBuf::from("pdfium_lib").join(name);
-        if cwd_lib.exists() {
-            return Some(PathBuf::from("pdfium_lib"));
-        }
-
-        // 2. pdfium_lib/ next to the executable
+    fn find_local() -> Result<Option<PathBuf>, String> {
+        let (_, artifact) = pinned_artifact()?;
+        let mut candidates = vec![PathBuf::from("pdfium_lib")];
         if let Some(exe_dir) = exe_adjacent_dir() {
-            let candidate = exe_dir.join("pdfium_lib").join(name);
-            if candidate.exists() {
-                return Some(exe_dir.join("pdfium_lib"));
-            }
-            // 3. Directly next to the executable
-            let candidate = exe_dir.join(name);
-            if candidate.exists() {
-                return Some(exe_dir);
+            candidates.push(exe_dir.join("pdfium_lib"));
+            candidates.push(exe_dir);
+        }
+        for directory in candidates {
+            let library = directory.join(lib_filename());
+            if library.is_file() {
+                verify_library(&library, &artifact)?;
+                return Ok(Some(directory));
             }
         }
-
-        None
+        Ok(None)
     }
 
-    /// Download the Pdfium binary from the official bblanchon/pdfium-binaries
-    /// GitHub releases. This is gated behind `PDFIUM_AUTO_DOWNLOAD=true`.
-    ///
-    /// Downloads to `pdfium_lib/` in the current working directory.
-    #[cfg(not(test))]
-    fn auto_download() -> Result<PathBuf, String> {
-        let enabled = std::env::var("PDFIUM_AUTO_DOWNLOAD")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
-        if !enabled {
-            return Err(
-                "Pdfium not found locally. Set PDFIUM_AUTO_DOWNLOAD=true to auto-download.".into(),
-            );
-        }
+    fn is_safe_archive_path(path: &Path) -> bool {
+        !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    }
 
-        let (os_tag, ext) = if cfg!(target_os = "windows") {
-            ("win-x64", "dll")
-        } else if cfg!(target_os = "macos") {
-            if cfg!(target_arch = "aarch64") {
-                ("mac-arm64", "dylib")
-            } else {
-                ("mac-x64", "dylib")
-            }
-        } else {
-            ("linux-x64", "so")
-        };
-
-        // Use a known stable Pdfium release (chromium/6721)
-        let url = format!(
-            "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-{os_tag}.tgz"
-        );
-
-        tracing::info!("[pdfium] Auto-downloading Pdfium from {}", url);
-
-        // Download using blocking reqwest (we're already on a blocking thread)
-        let response = reqwest::blocking::get(&url)
-            .map_err(|e| format!("Failed to download Pdfium from {url}: {e}"))?;
-
-        if !response.status().is_success() {
+    fn verify_archive(bytes: &[u8], artifact: &PinnedArtifact) -> Result<VerifiedArchive, String> {
+        if bytes.len() != artifact.size_bytes {
             return Err(format!(
-                "Pdfium download failed: HTTP {}",
-                response.status()
+                "Pdfium archive size mismatch: expected {}, got {}",
+                artifact.size_bytes,
+                bytes.len()
+            ));
+        }
+        if bytes.len() > MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "Pdfium archive exceeds {} byte safety limit",
+                MAX_ARCHIVE_BYTES
+            ));
+        }
+        let archive_digest = sha256_bytes(bytes);
+        if archive_digest != artifact.archive_sha256 {
+            return Err(format!(
+                "Pdfium archive checksum mismatch: expected {}, got {}",
+                artifact.archive_sha256, archive_digest
             ));
         }
 
-        let bytes = response
-            .bytes()
-            .map_err(|e| format!("Failed to read Pdfium download: {e}"))?;
-
-        // Extract the library from the tgz archive
-        let dest = PathBuf::from("pdfium_lib");
-        std::fs::create_dir_all(&dest).map_err(|e| format!("Failed to create pdfium_lib/: {e}"))?;
-
-        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(&bytes));
+        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
         let mut archive = tar::Archive::new(decoder);
-
-        let lib_name = if ext == "dll" {
-            "pdfium.dll"
-        } else if ext == "dylib" {
-            "libpdfium.dylib"
-        } else {
-            "libpdfium.so"
-        };
-
-        // Extract just the library file from the archive
-        let mut found = false;
-        for entry in archive.entries().map_err(|e| format!("tar error: {e}"))? {
-            let mut entry = entry.map_err(|e| format!("tar entry error: {e}"))?;
-            let path = entry
+        let mut library = None;
+        let mut licenses = BTreeMap::new();
+        let mut extracted_bytes = 0usize;
+        for entry in archive
+            .entries()
+            .map_err(|error| format!("invalid Pdfium tar archive: {error}"))?
+        {
+            let entry = entry.map_err(|error| format!("invalid Pdfium tar entry: {error}"))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let member = entry
                 .path()
-                .map_err(|e| format!("tar path error: {e}"))?
-                .to_path_buf();
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if file_name == lib_name {
-                let out_path = dest.join(lib_name);
-                entry
-                    .unpack(&out_path)
-                    .map_err(|e| format!("Failed to extract {lib_name}: {e}"))?;
-                found = true;
-                tracing::info!("[pdfium] Extracted {} to {:?}", lib_name, out_path);
-                break;
+                .map_err(|error| format!("invalid Pdfium member path: {error}"))?
+                .into_owned();
+            if !is_safe_archive_path(&member) {
+                return Err(format!(
+                    "unsafe Pdfium archive member path: {}",
+                    member.display()
+                ));
+            }
+            let is_library = member == Path::new(&artifact.library_member);
+            let is_license =
+                member == Path::new("LICENSE") || member.starts_with(Path::new("licenses"));
+            if !is_library && !is_license {
+                continue;
+            }
+            let remaining = MAX_EXTRACTED_BYTES.saturating_sub(extracted_bytes);
+            let mut payload = Vec::new();
+            entry
+                .take(remaining as u64 + 1)
+                .read_to_end(&mut payload)
+                .map_err(|error| format!("failed to read {}: {error}", member.display()))?;
+            if payload.len() > remaining {
+                return Err(format!(
+                    "Pdfium extracted content exceeds {} byte safety limit",
+                    MAX_EXTRACTED_BYTES
+                ));
+            }
+            extracted_bytes += payload.len();
+            if is_library {
+                if library.replace(payload).is_some() {
+                    return Err("Pdfium archive contains duplicate library members".into());
+                }
+            } else {
+                licenses.insert(member, payload);
             }
         }
 
-        if !found {
-            return Err(format!("Pdfium archive did not contain {lib_name}"));
+        let library = library.ok_or_else(|| {
+            format!(
+                "Pdfium archive does not contain pinned member {}",
+                artifact.library_member
+            )
+        })?;
+        let library_digest = sha256_bytes(&library);
+        if library_digest != artifact.library_sha256 {
+            return Err(format!(
+                "Pdfium library checksum mismatch after extraction: expected {}, got {}",
+                artifact.library_sha256, library_digest
+            ));
+        }
+        if !licenses.contains_key(Path::new("LICENSE")) {
+            return Err("Pdfium archive is missing its root LICENSE".into());
+        }
+        Ok(VerifiedArchive { library, licenses })
+    }
+
+    fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| format!("failed to stage {}: {error}", path.display()))?;
+        temporary
+            .write_all(bytes)
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| format!("failed to sync {}: {error}", path.display()))?;
+        temporary
+            .persist(path)
+            .map_err(|error| format!("failed to publish {}: {}", path.display(), error.error))?;
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn auto_download() -> Result<PathBuf, String> {
+        let enabled = std::env::var("PDFIUM_AUTO_DOWNLOAD")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false);
+        if !enabled {
+            return Err(
+                "Pdfium not found locally. Install the pinned runtime or explicitly set PDFIUM_AUTO_DOWNLOAD=true."
+                    .into(),
+            );
         }
 
-        Ok(dest)
+        let (manifest, artifact) = pinned_artifact()?;
+        let url = format!(
+            "{}/releases/download/{}/{}",
+            manifest.source_repository, manifest.release_tag, artifact.asset
+        );
+        tracing::info!(
+            release = %manifest.release_tag,
+            asset = %artifact.asset,
+            "[pdfium] downloading pinned artifact"
+        );
+        let response = reqwest::blocking::get(&url)
+            .map_err(|error| format!("failed to download pinned Pdfium from {url}: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "pinned Pdfium download failed with HTTP {}",
+                response.status()
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|error| format!("failed to read pinned Pdfium download: {error}"))?;
+        let verified = verify_archive(&bytes, &artifact)?;
+
+        let destination = PathBuf::from("pdfium_lib");
+        for (member, payload) in verified.licenses {
+            write_atomically(&destination.join(member), &payload)?;
+        }
+        let library_path = destination.join(lib_filename());
+        write_atomically(&library_path, &verified.library)?;
+        verify_library(&library_path, &artifact)?;
+        Ok(destination)
     }
 
     #[cfg(test)]
     fn auto_download() -> Result<PathBuf, String> {
-        Err("Auto-download disabled in tests".into())
+        Err("Pdfium network download is disabled in tests".into())
     }
 
-    /// Probe only installed or system Pdfium libraries. This function never
-    /// downloads files and is safe for readiness, doctor, and capability UI.
+    /// Probe only installed or system Pdfium libraries. Bundled libraries must
+    /// match the pinned binary checksum. This function never downloads files.
     pub fn probe_local() -> Result<PathBuf, String> {
-        if let Some(dir) = find_local() {
-            return Ok(dir);
+        if let Some(directory) = find_local()? {
+            return Ok(directory);
         }
         if pdfium_render::prelude::Pdfium::bind_to_system_library().is_ok() {
             return Ok(PathBuf::new());
@@ -743,12 +894,91 @@ pub mod pdfium_resolver {
         Err("Pdfium is not installed locally or available as a system library".into())
     }
 
-    /// Resolve the Pdfium library path, caching the result. Optional download
-    /// remains an explicit resolver policy and is never used by `probe_local`.
+    /// Resolve Pdfium once per process. Network installation is opt-in, pinned,
+    /// checksummed, bounded, license-preserving, and disabled in test builds.
     pub fn resolve() -> Result<PathBuf, String> {
         RESOLVED
             .get_or_init(|| probe_local().or_else(|_| auto_download()))
             .clone()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn make_archive(library_member: &str, library: &[u8]) -> Vec<u8> {
+            let mut compressed = Vec::new();
+            {
+                let encoder =
+                    flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+                let mut archive = tar::Builder::new(encoder);
+                for (member, payload) in [
+                    (library_member, library),
+                    ("LICENSE", b"license".as_slice()),
+                    ("licenses/pdfium.txt", b"notice".as_slice()),
+                ] {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(payload.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, member, payload)
+                        .expect("append fixture member");
+                }
+                archive.finish().expect("finish fixture archive");
+            }
+            compressed
+        }
+
+        fn fixture_artifact(member: &str, archive: &[u8], library: &[u8]) -> PinnedArtifact {
+            PinnedArtifact {
+                asset: "fixture.tgz".into(),
+                size_bytes: archive.len(),
+                archive_sha256: sha256_bytes(archive),
+                library_member: member.into(),
+                library_sha256: sha256_bytes(library),
+            }
+        }
+
+        #[test]
+        fn embedded_manifest_has_mandatory_platforms_and_pinned_digests() {
+            let manifest: ArtifactManifest = serde_json::from_str(PINNED_MANIFEST).unwrap();
+            assert_eq!(manifest.schema_version, 1);
+            assert_eq!(manifest.release_tag, "chromium/7961");
+            for platform in ["windows-x86_64", "macos-aarch64"] {
+                let artifact = manifest.artifacts.get(platform).unwrap();
+                assert!(artifact.asset.ends_with(".tgz"));
+                assert_eq!(artifact.archive_sha256.len(), 64);
+                assert_eq!(artifact.library_sha256.len(), 64);
+                assert!(artifact.size_bytes > 1_000_000);
+            }
+        }
+
+        #[test]
+        fn verified_archive_requires_exact_digest_member_and_license() {
+            let library = b"not-an-executable-test-library";
+            let archive = make_archive("lib/libpdfium.so", library);
+            let artifact = fixture_artifact("lib/libpdfium.so", &archive, library);
+            let verified = verify_archive(&archive, &artifact).unwrap();
+            assert_eq!(verified.library, library);
+            assert!(verified.licenses.contains_key(Path::new("LICENSE")));
+
+            let mut corrupt = archive.clone();
+            corrupt[0] ^= 0x01;
+            assert!(verify_archive(&corrupt, &artifact)
+                .unwrap_err()
+                .contains("checksum mismatch"));
+
+            let wrong_platform = fixture_artifact("bin/pdfium.dll", &archive, library);
+            assert!(verify_archive(&archive, &wrong_platform)
+                .unwrap_err()
+                .contains("does not contain pinned member"));
+
+            let directory = tempfile::tempdir().unwrap();
+            let installed = directory.path().join("pdfium-license.txt");
+            write_atomically(&installed, b"verified-license").unwrap();
+            assert_eq!(std::fs::read(installed).unwrap(), b"verified-license");
+        }
     }
 }
 
