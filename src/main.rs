@@ -69,15 +69,14 @@ fn main() {
     };
 
     // Open Audit Log
-    let audit_log = match app::audit::AuditLog::open(
-        app_paths.audit_dir().to_string_lossy().as_ref(),
-    ) {
-        Ok(log) => log,
-        Err(e) => {
-            tracing::error!("[AUDIT] Failed to open audit log: {}", e);
-            std::process::exit(exit_code::IO);
-        }
-    };
+    let audit_log =
+        match app::audit::AuditLog::open(app_paths.audit_dir().to_string_lossy().as_ref()) {
+            Ok(log) => log,
+            Err(e) => {
+                tracing::error!("[AUDIT] Failed to open audit log: {}", e);
+                std::process::exit(exit_code::IO);
+            }
+        };
 
     // Start Runtime (Unified Worker)
     let (mut runtime, job_tx, job_rx) = app::runtime::Runtime::start(audit_log, config.clone());

@@ -879,9 +879,7 @@ impl ResultSink {
 }
 
 type InteractiveFallbackRouter = std::sync::Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<String>>,
-    >,
+    tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<String>>>,
 >;
 
 async fn wait_for_interactive_choice(
@@ -8060,13 +8058,9 @@ mod tests {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         router.lock().await.insert(request_id, sender);
 
-        let result = wait_for_interactive_choice(
-            &router,
-            request_id,
-            receiver,
-            Duration::from_millis(10),
-        )
-        .await;
+        let result =
+            wait_for_interactive_choice(&router, request_id, receiver, Duration::from_millis(10))
+                .await;
         assert_eq!(result, Err("interactive response timed out"));
         assert!(!router.lock().await.contains_key(&request_id));
     }
@@ -8081,13 +8075,9 @@ mod tests {
         let response_sender = router.lock().await.remove(&request_id).unwrap();
         response_sender.send("offline_parser".to_string()).unwrap();
 
-        let result = wait_for_interactive_choice(
-            &router,
-            request_id,
-            receiver,
-            Duration::from_secs(1),
-        )
-        .await;
+        let result =
+            wait_for_interactive_choice(&router, request_id, receiver, Duration::from_secs(1))
+                .await;
         assert_eq!(result.as_deref(), Ok("offline_parser"));
         assert!(!router.lock().await.contains_key(&request_id));
     }
