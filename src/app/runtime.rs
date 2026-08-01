@@ -2628,8 +2628,25 @@ async fn process_job_inner(
                     let mut actual_pages_added = 0usize;
                     let mut actual_pages_removed = 0usize;
 
+                    let publish_surgery_output =
+                        |staged: &std::path::Path, destination: &std::path::Path| {
+                            let mut barrier = crate::app::commit::FileCommitBarrier::new();
+                            barrier.publish(staged, destination).map_err(|error| {
+                                format!(
+                                    "could not publish {} to {}: {error}",
+                                    staged.display(),
+                                    destination.display()
+                                )
+                            })?;
+                            barrier.commit();
+                            let _ = std::fs::remove_file(staged);
+                            Ok::<(), String>(())
+                        };
+
                     if !transfer_plan.pages_to_clone.is_empty() {
-                        let temp_path = output_pdf.with_extension("cloned.pdf");
+                        let expected = transfer_plan.pages_to_clone.len();
+                        let temp_path =
+                            output_pdf.with_extension(format!("{}.cloned.pdf", Uuid::new_v4()));
                         let eng = engine_for_tokio.clone();
                         let p_in = output_pdf.clone();
                         let p_out = temp_path.clone();
@@ -2637,22 +2654,40 @@ async fn process_job_inner(
                         let native_res = tokio::task::spawn_blocking(move || {
                             eng.clone_pages(&p_in, &p_out, idxs)
                         })
-                        .await
-                        .unwrap_or(Ok(0));
+                        .await;
 
-                        if let Ok(c) = native_res {
-                            if c > 0 {
-                                actual_pages_added = c;
-                                let _ = std::fs::rename(&temp_path, &output_pdf);
+                        match native_res {
+                            Ok(Ok(count)) if count == expected && temp_path.is_file() => {
+                                if let Err(error) = publish_surgery_output(&temp_path, &output_pdf)
+                                {
+                                    let _ = res_tx.send(JobResult::TransferFailed {
+                                        stage: "PdfSurgery".into(),
+                                        message: format!(
+                                            "Exact native page-clone publication failed: {error}"
+                                        ),
+                                    });
+                                    return;
+                                }
+                                actual_pages_added = count;
                                 tracing::info!(
-                                    "[TRANSFER] (Native) Cloned {} pages",
-                                    actual_pages_added
+                                    "[TRANSFER] (Native) Cloned exactly {count}/{expected} pages"
                                 );
+                            }
+                            Ok(Ok(count)) => {
+                                let _ = std::fs::remove_file(&temp_path);
+                                tracing::warn!(
+                                    "[TRANSFER] Native clone rejected: {count}/{expected} pages"
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!("[TRANSFER] Native clone failed exactly: {error}")
+                            }
+                            Err(error) => {
+                                tracing::warn!("[TRANSFER] Native clone task failed: {error}")
                             }
                         }
 
                         if actual_pages_added == 0 {
-                            tracing::warn!("[TRANSFER] Native ClonePages failed or returned 0. Falling back to Python.");
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let _ = py_tx.send((
                                 PythonJob::ClonePages {
@@ -2664,30 +2699,53 @@ async fn process_job_inner(
                             ));
                             match reply_rx.await {
                                 Ok(PythonJobResult::Json(json_str)) => {
-                                    if let Ok(res) =
+                                    let parsed =
                                         serde_json::from_str::<serde_json::Value>(&json_str)
-                                    {
-                                        if res["success"].as_bool().unwrap_or(false) {
-                                            actual_pages_added =
-                                                res["cloned"].as_u64().unwrap_or(0) as usize;
-                                            let _ = std::fs::rename(&temp_path, &output_pdf);
+                                            .unwrap_or_default();
+                                    let count = parsed["cloned"].as_u64().unwrap_or(0) as usize;
+                                    let exact = parsed["success"].as_bool().unwrap_or(false)
+                                        && count == expected
+                                        && temp_path.is_file();
+                                    if exact {
+                                        if let Err(error) =
+                                            publish_surgery_output(&temp_path, &output_pdf)
+                                        {
+                                            let _ = res_tx.send(JobResult::TransferFailed {
+                                                stage: "PdfSurgery".into(),
+                                                message: format!(
+                                                    "Exact Python page-clone publication failed: {error}"
+                                                ),
+                                            });
+                                            return;
                                         }
+                                        actual_pages_added = count;
+                                    } else {
+                                        let _ = std::fs::remove_file(&temp_path);
+                                        tracing::warn!(
+                                            "[TRANSFER] Python clone rejected: {count}/{expected} pages"
+                                        );
                                     }
-                                    tracing::info!(
-                                        "[TRANSFER] (Python) Cloned {} pages",
-                                        actual_pages_added
-                                    );
                                 }
                                 other => tracing::warn!(
-                                    "[TRANSFER] (Python) Page cloning failed: {:?}",
-                                    other
+                                    "[TRANSFER] Python page cloning failed: {other:?}"
                                 ),
                             }
+                        }
+                        if actual_pages_added != expected {
+                            let _ = res_tx.send(JobResult::TransferFailed {
+                                stage: "PdfSurgery".into(),
+                                message: format!(
+                                    "Page cloning incomplete: {actual_pages_added}/{expected}; source output preserved"
+                                ),
+                            });
+                            return;
                         }
                     }
 
                     if !transfer_plan.pages_to_remove.is_empty() {
-                        let temp_path = output_pdf.with_extension("removed.pdf");
+                        let expected = transfer_plan.pages_to_remove.len();
+                        let temp_path =
+                            output_pdf.with_extension(format!("{}.removed.pdf", Uuid::new_v4()));
                         let eng = engine_for_tokio.clone();
                         let p_in = output_pdf.clone();
                         let p_out = temp_path.clone();
@@ -2695,22 +2753,40 @@ async fn process_job_inner(
                         let native_res = tokio::task::spawn_blocking(move || {
                             eng.remove_pages(&p_in, &p_out, idxs)
                         })
-                        .await
-                        .unwrap_or(Ok(0));
+                        .await;
 
-                        if let Ok(c) = native_res {
-                            if c > 0 {
-                                actual_pages_removed = c;
-                                let _ = std::fs::rename(&temp_path, &output_pdf);
+                        match native_res {
+                            Ok(Ok(count)) if count == expected && temp_path.is_file() => {
+                                if let Err(error) = publish_surgery_output(&temp_path, &output_pdf)
+                                {
+                                    let _ = res_tx.send(JobResult::TransferFailed {
+                                        stage: "PdfSurgery".into(),
+                                        message: format!(
+                                            "Exact native page-removal publication failed: {error}"
+                                        ),
+                                    });
+                                    return;
+                                }
+                                actual_pages_removed = count;
                                 tracing::info!(
-                                    "[TRANSFER] (Native) Removed {} pages",
-                                    actual_pages_removed
+                                    "[TRANSFER] (Native) Removed exactly {count}/{expected} pages"
                                 );
+                            }
+                            Ok(Ok(count)) => {
+                                let _ = std::fs::remove_file(&temp_path);
+                                tracing::warn!(
+                                    "[TRANSFER] Native removal rejected: {count}/{expected} pages"
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!("[TRANSFER] Native removal failed exactly: {error}")
+                            }
+                            Err(error) => {
+                                tracing::warn!("[TRANSFER] Native removal task failed: {error}")
                             }
                         }
 
                         if actual_pages_removed == 0 {
-                            tracing::warn!("[TRANSFER] Native RemovePages failed or returned 0. Falling back to Python.");
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                             let _ = py_tx.send((
                                 PythonJob::RemovePages {
@@ -2722,25 +2798,46 @@ async fn process_job_inner(
                             ));
                             match reply_rx.await {
                                 Ok(PythonJobResult::Json(json_str)) => {
-                                    if let Ok(res) =
+                                    let parsed =
                                         serde_json::from_str::<serde_json::Value>(&json_str)
-                                    {
-                                        if res["success"].as_bool().unwrap_or(false) {
-                                            actual_pages_removed =
-                                                res["removed"].as_u64().unwrap_or(0) as usize;
-                                            let _ = std::fs::rename(&temp_path, &output_pdf);
+                                            .unwrap_or_default();
+                                    let count = parsed["removed"].as_u64().unwrap_or(0) as usize;
+                                    let exact = parsed["success"].as_bool().unwrap_or(false)
+                                        && count == expected
+                                        && temp_path.is_file();
+                                    if exact {
+                                        if let Err(error) =
+                                            publish_surgery_output(&temp_path, &output_pdf)
+                                        {
+                                            let _ = res_tx.send(JobResult::TransferFailed {
+                                                stage: "PdfSurgery".into(),
+                                                message: format!(
+                                                    "Exact Python page-removal publication failed: {error}"
+                                                ),
+                                            });
+                                            return;
                                         }
+                                        actual_pages_removed = count;
+                                    } else {
+                                        let _ = std::fs::remove_file(&temp_path);
+                                        tracing::warn!(
+                                            "[TRANSFER] Python removal rejected: {count}/{expected} pages"
+                                        );
                                     }
-                                    tracing::info!(
-                                        "[TRANSFER] (Python) Removed {} pages",
-                                        actual_pages_removed
-                                    );
                                 }
                                 other => tracing::warn!(
-                                    "[TRANSFER] (Python) Page removal failed: {:?}",
-                                    other
+                                    "[TRANSFER] Python page removal failed: {other:?}"
                                 ),
                             }
+                        }
+                        if actual_pages_removed != expected {
+                            let _ = res_tx.send(JobResult::TransferFailed {
+                                stage: "PdfSurgery".into(),
+                                message: format!(
+                                    "Page removal incomplete: {actual_pages_removed}/{expected}; prior output preserved"
+                                ),
+                            });
+                            return;
                         }
                     }
 

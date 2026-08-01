@@ -80,7 +80,7 @@ fn test_native_engine_clone_pages() {
 
     let engine = OxidizePdfEngine::new();
 
-    // Clone page index 1 (Page 2). This appends it to the end.
+    // Clone page index 1 (Page 2). The clone must follow its source immediately.
     engine.clone_pages(&input, &output, vec![1]).unwrap();
 
     let doc = Document::load(&output).unwrap();
@@ -88,7 +88,7 @@ fn test_native_engine_clone_pages() {
 
     assert_eq!(pages.len(), 4);
 
-    // We expect the texts: "Page 1", "Page 2", "Page 3", "Page 2"
+    // We expect the texts: "Page 1", "Page 2", "Page 2", "Page 3".
     let out_blocks_0 = engine.get_text_blocks(&output, 0).unwrap();
     let out_blocks_1 = engine.get_text_blocks(&output, 1).unwrap();
     let out_blocks_2 = engine.get_text_blocks(&output, 2).unwrap();
@@ -96,8 +96,8 @@ fn test_native_engine_clone_pages() {
 
     assert_eq!(out_blocks_0[0].text, "Page 1");
     assert_eq!(out_blocks_1[0].text, "Page 2");
-    assert_eq!(out_blocks_2[0].text, "Page 3");
-    assert_eq!(out_blocks_3[0].text, "Page 2");
+    assert_eq!(out_blocks_2[0].text, "Page 2");
+    assert_eq!(out_blocks_3[0].text, "Page 3");
 }
 
 #[test]
@@ -402,4 +402,54 @@ fn test_native_engine_render_page() {
         assert!(rendered.height_pts > 0.0);
         assert!(!rendered.png_bytes.is_empty());
     }
+}
+
+#[test]
+fn test_native_engine_multi_clone_preserves_exact_membership_and_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("multi_clone_in.pdf");
+    let output = dir.path().join("multi_clone_out.pdf");
+    create_multipage_pdf(&input, 3);
+    let engine = OxidizePdfEngine::new();
+
+    let cloned = engine.clone_pages(&input, &output, vec![0, 2]).unwrap();
+    assert_eq!(cloned, 2);
+    let observed = (0..5)
+        .map(|page| {
+            engine.get_text_blocks(&output, page).unwrap()[0]
+                .text
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observed, ["Page 1", "Page 1", "Page 2", "Page 3", "Page 3"]);
+}
+
+#[test]
+fn test_native_engine_page_surgery_rejects_non_exact_requests_non_destructively() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("surgery_guard_in.pdf");
+    let output = dir.path().join("surgery_guard_out.pdf");
+    create_multipage_pdf(&input, 3);
+    let engine = OxidizePdfEngine::new();
+    let sentinel = b"prior-output-must-survive";
+
+    std::fs::write(&output, sentinel).unwrap();
+    assert!(engine.clone_pages(&input, &output, vec![1, 1]).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+
+    std::fs::write(&output, sentinel).unwrap();
+    assert!(engine.clone_pages(&input, &output, vec![3]).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+
+    std::fs::write(&output, sentinel).unwrap();
+    assert!(engine.remove_pages(&input, &output, vec![1, 1]).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+
+    std::fs::write(&output, sentinel).unwrap();
+    assert!(engine.remove_pages(&input, &output, vec![3]).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
+
+    std::fs::write(&output, sentinel).unwrap();
+    assert!(engine.remove_pages(&input, &output, vec![0, 1, 2]).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), sentinel);
 }

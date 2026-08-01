@@ -1082,47 +1082,133 @@ impl PdfEngine for OxidizePdfEngine {
         output: &std::path::Path,
         page_indices: Vec<usize>,
     ) -> Result<usize, EngineError> {
-        let mut doc =
-            lopdf::Document::load(input).map_err(|e| EngineError::LoadFailed(format!("{e}")))?;
+        if page_indices.is_empty() {
+            return Err(EngineError::ApplyFailed("empty page-clone request".into()));
+        }
+        let unique = page_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != page_indices.len() {
+            return Err(EngineError::ApplyFailed(
+                "duplicate page indices are not an exact clone request".into(),
+            ));
+        }
 
-        let pages = doc.get_pages();
-        let mut cloned = 0;
-
-        for &idx in &page_indices {
-            if let Some(&page_id) = pages.get(&(idx as u32 + 1)) {
-                if let Ok(page_dict) = doc.get_object(page_id) {
-                    let page_dict_clone = page_dict.clone();
-                    let new_page_id = doc.add_object(page_dict_clone);
-
-                    // Manually append the new page to the Pages tree
-                    if let Ok(catalog) = doc.catalog() {
-                        if let Ok(pages_ref) = catalog.get(b"Pages") {
-                            if let Ok(pages_id) = pages_ref.as_reference() {
-                                if let Ok(pages_dict) = doc.get_dictionary_mut(pages_id) {
-                                    if let Ok(kids) = pages_dict.get_mut(b"Kids") {
-                                        if let Ok(kids_array) = kids.as_array_mut() {
-                                            kids_array.push(lopdf::Object::Reference(new_page_id));
-
-                                            // Update Count
-                                            if let Ok(count_obj) = pages_dict.get_mut(b"Count") {
-                                                if let Ok(count) = count_obj.as_i64() {
-                                                    *count_obj = lopdf::Object::Integer(count + 1);
-                                                    cloned += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        let mut document = lopdf::Document::load(input)
+            .map_err(|error| EngineError::LoadFailed(format!("{error}")))?;
+        let original_pages = document.page_iter().collect::<Vec<_>>();
+        for &index in &unique {
+            if index >= original_pages.len() {
+                return Err(EngineError::ApplyFailed(format!(
+                    "clone page index {index} is out of range for {} pages",
+                    original_pages.len()
+                )));
             }
         }
 
-        doc.save(output)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to save: {e}")))?;
-        Ok(cloned)
+        let mut clone_ids = std::collections::BTreeMap::new();
+        for &index in &unique {
+            let source_id = original_pages[index];
+            let mut page_object = document
+                .get_object(source_id)
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "failed to read clone source page {index}: {error}"
+                    ))
+                })?
+                .clone();
+            let parent_id = page_object
+                .as_dict()
+                .and_then(|dictionary| dictionary.get(b"Parent"))
+                .and_then(lopdf::Object::as_reference)
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "clone source page {index} has no valid Parent: {error}"
+                    ))
+                })?;
+            page_object
+                .as_dict_mut()
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "clone source page {index} is not a dictionary: {error}"
+                    ))
+                })?
+                .set("Parent", lopdf::Object::Reference(parent_id));
+            let clone_id = document.add_object(page_object);
+
+            {
+                let parent = document.get_dictionary_mut(parent_id).map_err(|error| {
+                    EngineError::ApplyFailed(format!(
+                        "failed to open parent page tree for page {index}: {error}"
+                    ))
+                })?;
+                let kids = parent
+                    .get_mut(b"Kids")
+                    .and_then(lopdf::Object::as_array_mut)
+                    .map_err(|error| {
+                        EngineError::ApplyFailed(format!(
+                            "parent page tree for page {index} has invalid Kids: {error}"
+                        ))
+                    })?;
+                let position = kids
+                    .iter()
+                    .position(|item| {
+                        item.as_reference()
+                            .map(|candidate| candidate == source_id)
+                            .unwrap_or(false)
+                    })
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "source page {index} is absent from its parent Kids array"
+                        ))
+                    })?;
+                kids.insert(position + 1, lopdf::Object::Reference(clone_id));
+            }
+
+            let mut current = Some(parent_id);
+            let mut visited = std::collections::HashSet::new();
+            while let Some(tree_id) = current {
+                if !visited.insert(tree_id) {
+                    return Err(EngineError::ApplyFailed(
+                        "cycle detected in page-tree Parent chain".into(),
+                    ));
+                }
+                let tree = document.get_dictionary_mut(tree_id).map_err(|error| {
+                    EngineError::ApplyFailed(format!("failed to update page-tree count: {error}"))
+                })?;
+                let count =
+                    tree.get(b"Count")
+                        .and_then(lopdf::Object::as_i64)
+                        .map_err(|error| {
+                            EngineError::ApplyFailed(format!(
+                                "page-tree node has invalid Count: {error}"
+                            ))
+                        })?;
+                tree.set("Count", count + 1);
+                current = tree
+                    .get(b"Parent")
+                    .and_then(lopdf::Object::as_reference)
+                    .ok();
+            }
+            clone_ids.insert(index, clone_id);
+        }
+
+        let mut expected_order = Vec::with_capacity(original_pages.len() + unique.len());
+        for (index, page_id) in original_pages.iter().copied().enumerate() {
+            expected_order.push(page_id);
+            if let Some(clone_id) = clone_ids.get(&index) {
+                expected_order.push(*clone_id);
+            }
+        }
+        let actual_order = document.page_iter().collect::<Vec<_>>();
+        if actual_order != expected_order {
+            return Err(EngineError::ApplyFailed(
+                "cloned page order does not match immediate-after-source contract".into(),
+            ));
+        }
+        save_lopdf_atomically(&mut document, output, expected_order.len())?;
+        Ok(unique.len())
     }
 
     fn remove_pages(
@@ -1131,18 +1217,57 @@ impl PdfEngine for OxidizePdfEngine {
         output: &std::path::Path,
         page_indices: Vec<usize>,
     ) -> Result<usize, EngineError> {
-        let mut doc =
-            lopdf::Document::load(input).map_err(|e| EngineError::LoadFailed(format!("{e}")))?;
-
-        let mut page_nums = Vec::new();
-        for &idx in &page_indices {
-            page_nums.push(idx as u32 + 1);
+        if page_indices.is_empty() {
+            return Err(EngineError::ApplyFailed(
+                "empty page-removal request".into(),
+            ));
+        }
+        let unique = page_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != page_indices.len() {
+            return Err(EngineError::ApplyFailed(
+                "duplicate page indices are not an exact removal request".into(),
+            ));
         }
 
-        doc.delete_pages(&page_nums);
-        doc.save(output)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to save: {e}")))?;
-        Ok(page_nums.len())
+        let mut document = lopdf::Document::load(input)
+            .map_err(|error| EngineError::LoadFailed(format!("{error}")))?;
+        let original_pages = document.page_iter().collect::<Vec<_>>();
+        for &index in &unique {
+            if index >= original_pages.len() {
+                return Err(EngineError::ApplyFailed(format!(
+                    "remove page index {index} is out of range for {} pages",
+                    original_pages.len()
+                )));
+            }
+        }
+        if unique.len() >= original_pages.len() {
+            return Err(EngineError::ApplyFailed(
+                "removing every page would create an invalid PDF".into(),
+            ));
+        }
+
+        let page_numbers = unique
+            .iter()
+            .map(|index| *index as u32 + 1)
+            .collect::<Vec<_>>();
+        document.delete_pages(&page_numbers);
+        let expected_order = original_pages
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, page_id)| (!unique.contains(&index)).then_some(page_id))
+            .collect::<Vec<_>>();
+        let actual_order = document.page_iter().collect::<Vec<_>>();
+        if actual_order != expected_order {
+            return Err(EngineError::ApplyFailed(
+                "remaining page order changed during exact removal".into(),
+            ));
+        }
+        save_lopdf_atomically(&mut document, output, expected_order.len())?;
+        Ok(unique.len())
     }
 }
 
