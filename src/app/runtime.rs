@@ -46,10 +46,6 @@ impl JobMetadata {
             deadline: std::time::Instant::now() + job.default_timeout(),
         }
     }
-
-    fn remaining(&self) -> std::time::Duration {
-        self.deadline.saturating_duration_since(std::time::Instant::now())
-    }
 }
 
 fn document_id_for_path(path: &Path) -> String {
@@ -1091,10 +1087,8 @@ impl Runtime {
         let result_tx_clone = result_tx.clone();
         let python_tx_clone = python_tx.clone();
 
-        let (fast_job_tx, mut fast_job_rx) =
-            tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
-        let (slow_job_tx, mut slow_job_rx) =
-            tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
+        let (fast_job_tx, mut fast_job_rx) = tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
+        let (slow_job_tx, mut slow_job_rx) = tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
 
         spawn_runtime_bridge(
             intake_rx,
@@ -7909,8 +7903,7 @@ mod tests {
     #[test]
     fn test_bridge_fail_loud() {
         let (job_tx, job_rx) = mpsc::channel::<JobEnvelope>();
-        let (tokio_job_tx, tokio_job_rx) =
-            tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
+        let (tokio_job_tx, tokio_job_rx) = tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
         let (watchdog, _watchdog_rx) = crate::app::watchdog::Watchdog::new();
         let watchdog = std::sync::Arc::new(watchdog);
