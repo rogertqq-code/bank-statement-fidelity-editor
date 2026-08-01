@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import hashlib
 import importlib
@@ -147,7 +148,11 @@ class WorkerRuntime:
         self.runtime_manifest: dict[str, Any] | None = None
         try:
             self.runtime_manifest = verify_runtime_manifest("base")
-            self.bridge = importlib.import_module("pymupdf_pro_integration")
+            # stdout is the machine-readable JSON-lines transport. Optional Pro
+            # packages can print license banners while importing, so route all
+            # third-party diagnostics to stderr and keep the protocol pristine.
+            with contextlib.redirect_stdout(sys.stderr):
+                self.bridge = importlib.import_module("pymupdf_pro_integration")
         except BaseException as error:  # startup must report even loader-level failures
             self.bridge_error_class = type(error).__name__
 
@@ -358,7 +363,10 @@ class WorkerRuntime:
         }.get(operation)
         if method is None:
             raise ProtocolError("UNSUPPORTED_OPERATION", f"unsupported operation: {operation}")
-        result = method()
+        # Bridge implementations and native extensions may print warnings or
+        # license notices. stdout belongs exclusively to protocol envelopes.
+        with contextlib.redirect_stdout(sys.stderr):
+            result = method()
         return self._outcome(operation, payload, result)
 
     def _outcome(
@@ -419,7 +427,7 @@ class WorkerRuntime:
         if not isinstance(result, dict):
             return 1 if operation == "replace_text_in_rect" else 0
         if operation == "apply_many_edits":
-            return int(result.get("applied_count", 0))
+            return int(result.get("placed", 0))
         if operation == "clone_pages":
             return int(result.get("cloned", 0))
         if operation == "remove_pages":
@@ -490,39 +498,70 @@ def classify_error(error: BaseException, operation: str) -> dict[str, Any]:
     }
 
 
-def _emit(value: Mapping[str, Any]) -> None:
-    sys.stdout.write(canonical_json(value) + "\n")
-    sys.stdout.flush()
+def _isolate_protocol_output():
+    """Reserve original stdout for JSON and quarantine all other output.
+
+    Some native extensions write license banners directly to file descriptor 1,
+    bypassing ``contextlib.redirect_stdout``. Duplicate the original descriptor
+    for protocol envelopes, then redirect descriptor 1 to stderr before loading
+    the bridge. This keeps the transport valid on Windows, macOS, and Linux.
+    """
+    try:
+        protocol_fd = os.dup(sys.stdout.fileno())
+        protocol_output = os.fdopen(
+            protocol_fd,
+            "w",
+            encoding=sys.stdout.encoding or "utf-8",
+            errors="backslashreplace",
+            buffering=1,
+        )
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        return protocol_output
+    except (AttributeError, OSError, ValueError):
+        return sys.stdout
+
+
+def _emit(value: Mapping[str, Any], output=None) -> None:
+    stream = sys.stdout if output is None else output
+    stream.write(canonical_json(value) + "\n")
+    stream.flush()
 
 
 def main() -> int:
-    runtime = WorkerRuntime()
-    _emit(runtime.handshake())
-    for line in sys.stdin.buffer:
-        if not line.strip():
-            continue
-        try:
-            _emit(runtime.execute(line))
-        except ProtocolError as error:
-            _emit(
-                {
-                    "event": "protocol_error",
-                    "code": error.code,
-                    "class": type(error).__name__,
-                    "message": str(error),
-                }
-            )
-        except BaseException as error:
-            _emit(
-                {
-                    "event": "worker_error",
-                    "code": "WORKER_INTERNAL_ERROR",
-                    "class": type(error).__name__,
-                    "message": str(error) or type(error).__name__,
-                }
-            )
-            traceback.print_exc(file=sys.stderr)
-    return 0
+    protocol_output = _isolate_protocol_output()
+    try:
+        runtime = WorkerRuntime()
+        _emit(runtime.handshake(), protocol_output)
+        for line in sys.stdin.buffer:
+            if not line.strip():
+                continue
+            try:
+                _emit(runtime.execute(line), protocol_output)
+            except ProtocolError as error:
+                _emit(
+                    {
+                        "event": "protocol_error",
+                        "code": error.code,
+                        "class": type(error).__name__,
+                        "message": str(error),
+                    },
+                    protocol_output,
+                )
+            except BaseException as error:
+                _emit(
+                    {
+                        "event": "worker_error",
+                        "code": "WORKER_INTERNAL_ERROR",
+                        "class": type(error).__name__,
+                        "message": str(error) or type(error).__name__,
+                    },
+                    protocol_output,
+                )
+                traceback.print_exc(file=sys.stderr)
+        return 0
+    finally:
+        if protocol_output is not sys.stdout:
+            protocol_output.close()
 
 
 if __name__ == "__main__":

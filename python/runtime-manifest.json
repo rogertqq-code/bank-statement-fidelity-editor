@@ -20,6 +20,6 @@
     "pymupdf_pro_integration.py": "b62d9a551b86c6864a0ad9458fb7252d44e1421f7ae5b93c62433d742ecc6986",
     "verify_runtime_manifest.py": "09f3d91d6f7fb035d362922970f7d3f00ad4c9658c0386a6a4453b868c48b45f",
     "verify_runtime_versions.py": "bbd3c8b67408e50f97086e236b0cf3ac14e87376f93f1f90cd2883561dadfe02",
-    "worker.py": "792baede9c5f45f4ef2c42ec59604402ac752e22ba19d16b28da9d934198cc44"
+    "worker.py": "f73929e05f13b6cdc2512ab992c084d8db2a2ec328005da7f1f6f236607d37c1"
   }
 }

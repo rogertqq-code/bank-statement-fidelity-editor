@@ -236,6 +236,13 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install pkg-config openssl@3
       - uses: Swatinem/rust-cache@v2
+      - name: Pro-installed worker protocol and exact-count contract
+        env:
+          PYTHONPATH: python
+        run: |
+          python -m unittest -v \
+            python.test_worker.WorkerTests.test_handshake_and_ping_are_versioned_and_complete \
+            python.test_worker.WorkerTests.test_pro_batch_maps_placed_count_and_publishes_exactly
       - name: Python exact-application regressions
         run: python python/test_apply_many_edits_contract.py
       - name: Audit snapshot and tamper regressions

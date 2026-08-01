@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -17,6 +18,14 @@ from worker import classify_error
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "python" / "worker.py"
+
+
+def pro_package_available() -> bool:
+    try:
+        importlib.metadata.version("PyMuPDFPro")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 
 def request(operation: str, payload: dict[str, object]) -> dict[str, object]:
@@ -205,6 +214,51 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(response["failure"]["code"], "INPUT_HASH_MISMATCH")
             self.assertEqual(output_path.read_bytes(), sentinel)
             self.assertEqual(list(output_path.parent.glob("*.worker-stage.pdf")), [])
+
+    @unittest.skipUnless(
+        pro_package_available(),
+        "PyMuPDF Pro package is not installed",
+    )
+    def test_pro_batch_maps_placed_count_and_publishes_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.pdf"
+            output_path = Path(directory) / "edited.pdf"
+            document = pymupdf.open()
+            try:
+                for text in ("PAGE ONE", "PAGE TWO"):
+                    page = document.new_page()
+                    page.insert_text((72, 72), text)
+                document.save(source_path)
+            finally:
+                document.close()
+            with pymupdf.open(source_path) as source:
+                edits = [
+                    {
+                        "page": page_number,
+                        "rect": list(source[page_number].search_for(text)[0]),
+                        "new_text": replacement,
+                    }
+                    for page_number, (text, replacement) in enumerate(
+                        (("PAGE ONE", "FIRST EDIT"), ("PAGE TWO", "SECOND EDIT"))
+                    )
+                ]
+            operation = request(
+                "apply_many_edits",
+                {
+                    "pdf_path": str(source_path),
+                    "output_path": str(output_path),
+                    "edits": edits,
+                    "font_path": None,
+                },
+            )
+            operation["input_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            response = parse_response(self.worker.send(operation))
+            self.assertEqual(response["disposition"], "succeeded", response)
+            self.assertEqual(response["requested_count"], 2)
+            self.assertEqual(response["applied_count"], 2)
+            self.assertEqual(response["payload"]["result"]["placed"], 2)
+            self.assertTrue(response["payload"]["artifact"]["committed"])
+            self.assertTrue(output_path.is_file())
 
     def test_successful_mutation_publishes_exact_artifact_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
