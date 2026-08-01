@@ -98,18 +98,43 @@ impl std::error::Error for RuntimeSubmitError {}
 
 #[derive(Clone)]
 pub struct RuntimeClient {
-    intake: mpsc::Sender<JobEnvelope>,
+    intake: Arc<Mutex<Option<mpsc::Sender<JobEnvelope>>>>,
 }
 
 impl RuntimeClient {
     fn new(intake: mpsc::Sender<JobEnvelope>) -> Self {
-        Self { intake }
+        Self {
+            intake: Arc::new(Mutex::new(Some(intake))),
+        }
+    }
+
+    fn sender(&self) -> Result<mpsc::Sender<JobEnvelope>, RuntimeSubmitError> {
+        self.intake
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .ok_or(RuntimeSubmitError)
+    }
+
+    pub fn close_intake(&self) {
+        if let Ok(mut guard) = self.intake.lock() {
+            guard.take();
+        }
+    }
+
+    pub fn is_accepting(&self) -> bool {
+        self.intake
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 
     pub fn send(&self, job: Job) -> Result<JobId, RuntimeSubmitError> {
         let envelope = JobEnvelope::broadcast(job);
         let id = envelope.metadata.job_id;
-        self.intake.send(envelope).map_err(|_| RuntimeSubmitError)?;
+        self.sender()?
+            .send(envelope)
+            .map_err(|_| RuntimeSubmitError)?;
         Ok(id)
     }
 
@@ -117,7 +142,9 @@ impl RuntimeClient {
         let (result_tx, result_rx) = mpsc::channel();
         let envelope = JobEnvelope::routed(job, result_tx);
         let metadata = envelope.metadata.clone();
-        self.intake.send(envelope).map_err(|_| RuntimeSubmitError)?;
+        self.sender()?
+            .send(envelope)
+            .map_err(|_| RuntimeSubmitError)?;
         Ok(JobTicket {
             metadata,
             results: result_rx,
@@ -209,11 +236,21 @@ impl CancellationRegistry {
         }
     }
 
-    /// Cancel every job in flight. Useful on app shutdown.
+    /// Request cancellation for every in-flight job while retaining registry
+    /// entries until their exactly-once terminal result confirms completion.
+    pub fn request_cancel_all(&self) {
+        if let Ok(g) = self.inner.lock() {
+            for token in g.values() {
+                token.cancel();
+            }
+        }
+    }
+
+    /// Force-clear every job token after a bounded graceful wait has expired.
     pub fn cancel_all(&self) {
         if let Ok(mut g) = self.inner.lock() {
-            for (_, t) in g.drain() {
-                t.cancel();
+            for (_, token) in g.drain() {
+                token.cancel();
             }
         }
     }
@@ -931,7 +968,10 @@ impl Drop for TerminalTrackerInner {
 }
 
 pub struct Runtime {
-    _tokio_rt: tokio::runtime::Runtime,
+    tokio_rt: Option<tokio::runtime::Runtime>,
+    runtime_client: RuntimeClient,
+    audit_log: Arc<Mutex<AuditLog>>,
+    shutdown_complete: bool,
     /// Registry of in-flight jobs and their cancellation tokens. Cloneable;
     /// pass to the GUI so it can cancel by id.
     pub cancellations: CancellationRegistry,
@@ -939,6 +979,38 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub fn shutdown(&mut self, timeout: std::time::Duration) -> bool {
+        if self.shutdown_complete {
+            return true;
+        }
+
+        self.runtime_client.close_intake();
+        self.cancellations.request_cancel_all();
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.cancellations.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let clean = self.cancellations.is_empty();
+        if !clean {
+            self.cancellations.cancel_all();
+        }
+
+        if let Ok(mut audit) = self.audit_log.lock() {
+            let status = if clean {
+                "Graceful shutdown completed"
+            } else {
+                "Graceful shutdown deadline expired; remaining jobs force-cancelled"
+            };
+            let _ = audit.append_line(status);
+        }
+
+        if let Some(runtime) = self.tokio_rt.take() {
+            runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        }
+        self.shutdown_complete = true;
+        clean
+    }
+
     pub fn start(
         audit_log: AuditLog,
         config: Arc<crate::app::config::AppConfig>,
@@ -968,6 +1040,7 @@ impl Runtime {
             mpsc::channel::<(PythonJob, oneshot::Sender<PythonJobResult>)>();
 
         let audit_log = Arc::new(Mutex::new(audit_log));
+        let runtime_audit_log = audit_log.clone();
         let history = Arc::new(Mutex::new(ChangeHistory::new()));
         let config_holder = Arc::new(Mutex::new(config));
 
@@ -1359,32 +1432,51 @@ impl Runtime {
         });
 
         let sig_cancellations = cancellations.clone();
+        let sig_runtime_client = runtime_client.clone();
         tokio_rt.spawn(async move {
             if let Ok(()) = tokio::signal::ctrl_c().await {
-                tracing::info!("Received Ctrl-C signal! Initiating graceful shutdown...");
+                tracing::info!("Received Ctrl-C signal; initiating bounded graceful shutdown");
+                sig_runtime_client.close_intake();
+                sig_cancellations.request_cancel_all();
 
-                if let Ok(mut lock) = sig_audit.lock() {
-                    let _ = lock.append_line("Graceful shutdown initiated via Ctrl-C");
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !sig_cancellations.is_empty() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-
-                sig_cancellations.cancel_all();
-
-                tracing::info!("Shutting down...");
-
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                std::process::exit(0);
+                let clean = sig_cancellations.is_empty();
+                if !clean {
+                    sig_cancellations.cancel_all();
+                }
+                if let Ok(mut lock) = sig_audit.lock() {
+                    let status = if clean {
+                        "Graceful shutdown completed after Ctrl-C"
+                    } else {
+                        "Ctrl-C shutdown deadline expired; remaining jobs force-cancelled"
+                    };
+                    let _ = lock.append_line(status);
+                }
+                std::process::exit(if clean { 0 } else { 2 });
             }
         });
 
         (
             Self {
-                _tokio_rt: tokio_rt,
+                tokio_rt: Some(tokio_rt),
+                runtime_client: runtime_client.clone(),
+                audit_log: runtime_audit_log,
+                shutdown_complete: false,
                 cancellations,
                 watchdog: watchdog_for_gui,
             },
             runtime_client,
             result_rx,
         )
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        let _ = self.shutdown(std::time::Duration::from_secs(5));
     }
 }
 
@@ -7813,6 +7905,32 @@ mod tests {
         assert!(t1.is_cancelled());
         assert!(t2.is_cancelled());
         assert!(t3.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_registry_request_cancel_all_waits_for_terminal_completion() {
+        let reg = CancellationRegistry::new();
+        let t1 = reg.register(11);
+        let t2 = reg.register(12);
+        reg.request_cancel_all();
+        assert_eq!(reg.len(), 2);
+        assert!(t1.is_cancelled());
+        assert!(t2.is_cancelled());
+        reg.complete(11);
+        assert_eq!(reg.len(), 1);
+        reg.complete(12);
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn runtime_client_close_intake_rejects_new_work() {
+        let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
+        let client = RuntimeClient::new(intake_tx);
+        assert!(client.is_accepting());
+        client.close_intake();
+        assert!(!client.is_accepting());
+        assert!(client.send(Job::Ping).is_err());
+        assert!(intake_rx.recv_timeout(Duration::from_millis(20)).is_err());
     }
 
     #[test]
