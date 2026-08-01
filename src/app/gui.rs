@@ -381,6 +381,7 @@ pub struct MyApp {
     /// Boot-time (and reload-time) API availability snapshot. Drives the
     /// UI auto-exclusion of unavailable backends with explanatory messages.
     pub api_availability: crate::app::config::ApiAvailability,
+    pub capability_registry: crate::app::capabilities::CapabilityRegistry,
     /// Result of the last `Job::ValidateCredentials` run. (Gemini, DocAI).
     pub credential_validation_status: Option<(Result<(), String>, Result<(), String>)>,
     /// True once the buffers have been seeded from the environment.
@@ -428,6 +429,8 @@ impl MyApp {
             let _ = fallback.ensure();
             fallback
         });
+        let capability_registry =
+            crate::app::capabilities::CapabilityRegistry::probe(&config, &app_paths);
         let run_workspace = app_paths
             .create_run_workspace(std::path::Path::new(&input_path))
             .ok();
@@ -520,6 +523,7 @@ impl MyApp {
             workflow_input_hash: None,
             workflow_cell_buffers: std::collections::HashMap::new(),
             api_availability: config.detect_availability(),
+            capability_registry,
             config: config.clone(),
             api_health: None,
             settings,
@@ -1726,6 +1730,11 @@ impl MyApp {
                     let fresh_avail = new_cfg.detect_availability();
                     fresh_avail.log_summary();
                     self.api_availability = fresh_avail;
+                    self.capability_registry =
+                        crate::app::capabilities::CapabilityRegistry::probe(
+                            &new_cfg,
+                            &self.app_paths,
+                        );
                     self.config = std::sync::Arc::new(new_cfg);
                 } else {
                     let fresh_avail = crate::app::config::AppConfig::from_env()

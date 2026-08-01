@@ -3,6 +3,25 @@ use crate::app::runtime::Job;
 use egui_plot::{Line, Plot};
 use std::path::PathBuf;
 
+fn capability_selectable_value<T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    label: &str,
+    status: Option<&crate::app::capabilities::CapabilityStatus>,
+) {
+    let enabled = status.is_some_and(|status| status.is_selectable());
+    let reason = status
+        .map(|status| status.reason.clone())
+        .unwrap_or_else(|| "Capability status is unavailable".to_string());
+    let response = ui
+        .add_enabled_ui(enabled, |ui| ui.selectable_value(current, value, label))
+        .response;
+    if !enabled {
+        response.on_hover_text(reason);
+    }
+}
+
 pub trait CommandPalette {
     fn draw_command_palette(&mut self, ctx: &egui::Context);
 }
@@ -355,6 +374,7 @@ impl AppModals for MyApp {
     }
 
     fn draw_backend_preferences(&mut self, ui: &mut egui::Ui) {
+        use crate::app::capabilities::Capability;
         use crate::app::config::*;
 
         let id = ui.make_persistent_id("backend_prefs_collapsing");
@@ -367,8 +387,18 @@ impl AppModals for MyApp {
                 ui.small("Options marked \u{26d4} require an API key that is not currently configured.");
                 ui.add_space(6.0);
 
-                // Snapshot availability for this frame (cheap clone)
-                let avail = self.api_availability.clone();
+                let capabilities = self.capability_registry.clone();
+                let dual_edit_status = if capabilities.is_ready(Capability::PythonPipeline)
+                    && capabilities.is_ready(Capability::Pdfium)
+                {
+                    crate::app::capabilities::CapabilityStatus::ready(
+                        "Python/PyMuPDF and Pdfium are both ready",
+                    )
+                } else {
+                    crate::app::capabilities::CapabilityStatus::unavailable(
+                        "Dual Concurrent requires both the Python/PyMuPDF pipeline and Pdfium",
+                    )
+                };
 
                 egui::Grid::new("backend_prefs_grid")
                     .num_columns(2)
@@ -380,10 +410,32 @@ impl AppModals for MyApp {
                         egui::ComboBox::from_id_salt("doc_parser_mode")
                             .selected_text(self.settings.document_parser.label())
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.settings.document_parser, DocumentParserMode::LlamaParse, DocumentParserMode::LlamaParse.label());
-                                // ui.selectable_value(&mut self.settings.document_parser, DocumentParserMode::DocumentAi, DocumentParserMode::DocumentAi.label()); // Temp disabled
-                                ui.selectable_value(&mut self.settings.document_parser, DocumentParserMode::LocalOcrs, DocumentParserMode::LocalOcrs.label());
-                                ui.selectable_value(&mut self.settings.document_parser, DocumentParserMode::OfflineHeuristic, DocumentParserMode::OfflineHeuristic.label());
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.settings.document_parser,
+                                    DocumentParserMode::DocumentAi,
+                                    DocumentParserMode::DocumentAi.label(),
+                                    capabilities.status(Capability::DocumentAi),
+                                );
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.settings.document_parser,
+                                    DocumentParserMode::LlamaParse,
+                                    DocumentParserMode::LlamaParse.label(),
+                                    capabilities.status(Capability::LlamaParse),
+                                );
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.settings.document_parser,
+                                    DocumentParserMode::LocalOcrs,
+                                    DocumentParserMode::LocalOcrs.label(),
+                                    capabilities.status(Capability::LocalOcr),
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.document_parser,
+                                    DocumentParserMode::OfflineHeuristic,
+                                    DocumentParserMode::OfflineHeuristic.label(),
+                                );
                             });
                         ui.end_row();
 
@@ -397,11 +449,39 @@ impl AppModals for MyApp {
                                 PdfEngineMode::TypstReconstruct => "Typst Reconstruct",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.edit_engine_mode, PdfEngineMode::DualConcurrent, "Dual Concurrent");
-                                ui.selectable_value(&mut self.edit_engine_mode, PdfEngineMode::PyMuPdfProPrimary, "PyMuPDF Pro Primary");
-                                ui.selectable_value(&mut self.edit_engine_mode, PdfEngineMode::NativeOnly, "Native Only");
-                                ui.selectable_value(&mut self.edit_engine_mode, PdfEngineMode::PyMuPdfOnly, "PyMuPDF Only");
-                                ui.selectable_value(&mut self.edit_engine_mode, PdfEngineMode::TypstReconstruct, "Typst Reconstruct");
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.edit_engine_mode,
+                                    PdfEngineMode::DualConcurrent,
+                                    "Dual Concurrent",
+                                    Some(&dual_edit_status),
+                                );
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.edit_engine_mode,
+                                    PdfEngineMode::PyMuPdfProPrimary,
+                                    "PyMuPDF Pro Primary",
+                                    capabilities.status(Capability::PyMuPdfPro),
+                                );
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.edit_engine_mode,
+                                    PdfEngineMode::NativeOnly,
+                                    "Native Only",
+                                    capabilities.status(Capability::Pdfium),
+                                );
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.edit_engine_mode,
+                                    PdfEngineMode::PyMuPdfOnly,
+                                    "PyMuPDF Only",
+                                    capabilities.status(Capability::PythonPipeline),
+                                );
+                                ui.selectable_value(
+                                    &mut self.edit_engine_mode,
+                                    PdfEngineMode::TypstReconstruct,
+                                    "Typst Reconstruct",
+                                );
                             });
                         ui.end_row();
 
@@ -413,12 +493,26 @@ impl AppModals for MyApp {
                         egui::ComboBox::from_id_salt("ai_provider_mode")
                             .selected_text(self.settings.ai_provider.label())
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.settings.ai_provider, AiProviderMode::GroqApiKey, AiProviderMode::GroqApiKey.label());
-                                ui.selectable_value(&mut self.settings.ai_provider, AiProviderMode::OpenRouterApiKey, AiProviderMode::OpenRouterApiKey.label());
-                                ui.selectable_value(&mut self.settings.ai_provider, AiProviderMode::MistralApiKey, AiProviderMode::MistralApiKey.label());
-                                // ui.selectable_value(&mut self.settings.ai_provider, AiProviderMode::GeminiApiKey, AiProviderMode::GeminiApiKey.label()); // Temp disabled
-                                // ui.selectable_value(&mut self.settings.ai_provider, AiProviderMode::GeminiVertex, AiProviderMode::GeminiVertex.label()); // Temp disabled
-                                ui.selectable_value(&mut self.settings.ai_provider, AiProviderMode::ManualOnly, AiProviderMode::ManualOnly.label());
+                                for (mode, capability) in [
+                                    (AiProviderMode::GeminiApiKey, Capability::Gemini),
+                                    (AiProviderMode::GeminiVertex, Capability::GeminiVertex),
+                                    (AiProviderMode::GroqApiKey, Capability::Groq),
+                                    (AiProviderMode::OpenRouterApiKey, Capability::OpenRouter),
+                                    (AiProviderMode::MistralApiKey, Capability::Mistral),
+                                ] {
+                                    capability_selectable_value(
+                                        ui,
+                                        &mut self.settings.ai_provider,
+                                        mode,
+                                        mode.label(),
+                                        capabilities.status(capability),
+                                    );
+                                }
+                                ui.selectable_value(
+                                    &mut self.settings.ai_provider,
+                                    AiProviderMode::ManualOnly,
+                                    AiProviderMode::ManualOnly.label(),
+                                );
                             });
                         ui.end_row();
 
@@ -430,8 +524,20 @@ impl AppModals for MyApp {
                         egui::ComboBox::from_id_salt("visual_qa_mode")
                             .selected_text(self.settings.verification_renderer.label())
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.settings.verification_renderer, VerificationMode::LocalPdfium, VerificationMode::LocalPdfium.label());
-                                ui.selectable_value(&mut self.settings.verification_renderer, VerificationMode::PdfRestCloud, VerificationMode::PdfRestCloud.label());
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.settings.verification_renderer,
+                                    VerificationMode::LocalPdfium,
+                                    VerificationMode::LocalPdfium.label(),
+                                    capabilities.status(Capability::Pdfium),
+                                );
+                                capability_selectable_value(
+                                    ui,
+                                    &mut self.settings.verification_renderer,
+                                    VerificationMode::PdfRestCloud,
+                                    VerificationMode::PdfRestCloud.label(),
+                                    capabilities.status(Capability::PdfRest),
+                                );
                             });
                         ui.end_row();
 
@@ -477,48 +583,106 @@ impl AppModals for MyApp {
                     });
 
                 // ── Unified availability warnings ──
-                let mut warnings: Vec<&str> = Vec::new();
+                let mut warnings: Vec<String> = Vec::new();
+                let mut warn_if_unavailable = |
+                    label: &str,
+                    status: Option<&crate::app::capabilities::CapabilityStatus>,
+                | {
+                    if let Some(status) = status {
+                        if !status.is_selectable() {
+                            warnings.push(format!("\u{26a0} {label}: {}", status.reason));
+                        }
+                    }
+                };
 
                 match self.settings.ai_provider {
-                    // AiProviderMode::GeminiApiKey if !avail.gemini_api_key => {
-                    //     self.toast(ToastKind::Error, "Gemini is unavailable (API key missing).");
-                    //     self.settings.ai_provider = original_ai_provider;
-                    // }
-                    // AiProviderMode::GeminiVertex if !avail.gemini_vertex => {
-                    //     self.toast(ToastKind::Error, "Gemini is unavailable (Vertex ADC/SA missing).");
-                    //     self.settings.ai_provider = original_ai_provider;
-                    // }
-                    AiProviderMode::GroqApiKey if !avail.groq_api_key => {
-                        warnings.push("\u{26a0} Groq (Llama 3) selected but GROQ_API_KEY is not set.");
+                    AiProviderMode::GeminiApiKey => {
+                        warn_if_unavailable("Gemini", capabilities.status(Capability::Gemini))
                     }
-                    AiProviderMode::OpenRouterApiKey if !avail.openrouter_api_key => {
-                        warnings.push("\u{26a0} OpenRouter selected but OPENROUTER_API_KEY is not set.");
+                    AiProviderMode::GeminiVertex => {
+                        warn_if_unavailable(
+                            "Gemini Vertex",
+                            capabilities.status(Capability::GeminiVertex),
+                        )
                     }
-                    AiProviderMode::MistralApiKey if !avail.mistral_api_key => {
-                        warnings.push("\u{26a0} Mistral selected but MISTRAL_API_KEY is not set.");
+                    AiProviderMode::GroqApiKey => {
+                        warn_if_unavailable("Groq", capabilities.status(Capability::Groq))
                     }
-                    _ => {}
+                    AiProviderMode::OpenRouterApiKey => {
+                        warn_if_unavailable(
+                            "OpenRouter",
+                            capabilities.status(Capability::OpenRouter),
+                        )
+                    }
+                    AiProviderMode::MistralApiKey => {
+                        warn_if_unavailable("Mistral", capabilities.status(Capability::Mistral))
+                    }
+                    AiProviderMode::ManualOnly => {}
                 }
 
                 match self.settings.document_parser {
-                    // DocumentParserMode::DocumentAi if !avail.document_ai => {
-                    //     self.toast(ToastKind::Error, "Document AI is unavailable (GCP config missing).");
-                    //     self.settings.document_parser = original_document_parser;
-                    // }
-                    DocumentParserMode::LlamaParse if !avail.llamaparse => {
-                        warnings.push("\u{26a0} LlamaParse selected but no API key configured. Workflow will auto-fallback to offline parser.");
+                    DocumentParserMode::DocumentAi => {
+                        warn_if_unavailable(
+                            "Document AI",
+                            capabilities.status(Capability::DocumentAi),
+                        )
+                    }
+                    DocumentParserMode::LlamaParse => {
+                        warn_if_unavailable(
+                            "LlamaParse",
+                            capabilities.status(Capability::LlamaParse),
+                        )
+                    }
+                    DocumentParserMode::LocalOcrs => {
+                        warn_if_unavailable("Local OCR", capabilities.status(Capability::LocalOcr))
+                    }
+                    DocumentParserMode::OfflineHeuristic => {}
+                }
+
+                match self.edit_engine_mode {
+                    PdfEngineMode::DualConcurrent => {
+                        warn_if_unavailable("Dual Concurrent", Some(&dual_edit_status))
+                    }
+                    PdfEngineMode::PyMuPdfProPrimary => {
+                        warn_if_unavailable(
+                            "PyMuPDF Pro",
+                            capabilities.status(Capability::PyMuPdfPro),
+                        )
+                    }
+                    PdfEngineMode::NativeOnly => {
+                        warn_if_unavailable(
+                            "Native Pdfium",
+                            capabilities.status(Capability::Pdfium),
+                        )
+                    }
+                    PdfEngineMode::PyMuPdfOnly => {
+                        warn_if_unavailable(
+                            "PyMuPDF",
+                            capabilities.status(Capability::PythonPipeline),
+                        )
                     }
                     _ => {}
                 }
 
-                if self.settings.verification_renderer == VerificationMode::PdfRestCloud && !avail.pdfrest {
-                    warnings.push("\u{26a0} pdfRest cloud verification selected but PDFREST_API_KEY missing. Falls back to local Pdfium.");
+                match self.settings.verification_renderer {
+                    VerificationMode::LocalPdfium => {
+                        warn_if_unavailable(
+                            "Local Pdfium verification",
+                            capabilities.status(Capability::Pdfium),
+                        )
+                    }
+                    VerificationMode::PdfRestCloud => {
+                        warn_if_unavailable(
+                            "pdfRest verification",
+                            capabilities.status(Capability::PdfRest),
+                        )
+                    }
                 }
 
                 if !warnings.is_empty() {
                     ui.add_space(4.0);
-                    for msg in warnings {
-                        ui.colored_label(self.settings.theme.palette().warn, msg);
+                    for message in warnings {
+                        ui.colored_label(self.settings.theme.palette().warn, message);
                     }
                 }
 
