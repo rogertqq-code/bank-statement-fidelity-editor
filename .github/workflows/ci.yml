@@ -40,7 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.89.0
-          components: clippy
+          components: clippy, rustfmt
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
