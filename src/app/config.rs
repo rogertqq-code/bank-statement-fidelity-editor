@@ -1143,4 +1143,49 @@ mod tests {
             .expect("missing vision backend should produce a reason");
         assert!(reason.contains("VISION_API_KEY"));
     }
+
+    #[test]
+    fn config_manager_advances_generation_and_preserves_old_snapshot() {
+        let mut initial = AppConfig::default();
+        initial.openrouter_model = "generation-0".into();
+        let manager = ConfigManager::new(Arc::new(initial));
+        let old = manager.snapshot();
+
+        let mut replacement = AppConfig::default();
+        replacement.openrouter_model = "generation-1".into();
+        let current = manager.replace(replacement);
+
+        assert_eq!(old.generation(), 0);
+        assert_eq!(old.config().openrouter_model, "generation-0");
+        assert_eq!(current.generation(), 1);
+        assert_eq!(current.config().openrouter_model, "generation-1");
+        assert_eq!(manager.snapshot().generation(), 1);
+    }
+
+    #[test]
+    fn config_manager_readers_never_observe_mixed_generations() {
+        let mut initial = AppConfig::default();
+        initial.openrouter_model = "generation-0".into();
+        let manager = ConfigManager::new(Arc::new(initial));
+        let reader_manager = manager.clone();
+
+        let reader = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                let snapshot = reader_manager.snapshot();
+                assert_eq!(
+                    snapshot.config().openrouter_model,
+                    format!("generation-{}", snapshot.generation())
+                );
+            }
+        });
+
+        for generation in 1..=100 {
+            let mut replacement = AppConfig::default();
+            replacement.openrouter_model = format!("generation-{generation}");
+            let snapshot = manager.replace(replacement);
+            assert_eq!(snapshot.generation(), generation);
+        }
+
+        reader.join().expect("configuration reader should not panic");
+    }
 }
