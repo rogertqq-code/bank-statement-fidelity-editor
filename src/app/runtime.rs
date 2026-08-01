@@ -88,10 +88,6 @@ impl JobEnvelope {
         }
     }
 
-    fn routed(job: Job, route: mpsc::Sender<JobResult>) -> Self {
-        Self::routed_with_mode(job, route, ExecutionMode::Interactive)
-    }
-
     fn broadcast_with_mode(job: Job, execution_mode: ExecutionMode) -> Self {
         Self {
             metadata: JobMetadata::for_job_with_mode(&job, execution_mode),
