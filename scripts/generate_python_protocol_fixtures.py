@@ -23,6 +23,7 @@ PAYLOADS = {
         "output_path": "scratch/output.pdf",
         "page_num": 0,
         "rect": [10.0, 20.0, 110.0, 40.0],
+        "old_text": "original",
         "new_text": "replacement",
         "font_path": None,
     },
@@ -50,6 +51,7 @@ PAYLOADS = {
             {
                 "page": 0,
                 "rect": [10.0, 20.0, 110.0, 40.0],
+                "old_text": "original",
                 "new_text": "replacement",
             }
         ],
