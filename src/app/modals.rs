@@ -1835,7 +1835,7 @@ impl AppModals for MyApp {
                 });
             });
         if confirm {
-            Self::discard_workflow_draft_quiet();
+            self.discard_active_workflow_draft_quiet();
             self.toast(ToastKind::Info, "Workflow draft discarded");
             self.active_modal = ActiveModal::None;
         }

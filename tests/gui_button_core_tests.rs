@@ -573,7 +573,13 @@ fn test_update_recent_files() {
 #[test]
 fn test_workflow_draft_path() {
     let path = MyApp::workflow_draft_path();
-    assert_eq!(path, PathBuf::from("audit/workflow.json"));
+    assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("workflow.json"));
+    assert_eq!(
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str()),
+        Some("audit")
+    );
 }
 
 #[test]

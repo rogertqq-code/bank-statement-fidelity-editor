@@ -270,6 +270,8 @@ pub struct MyApp {
     pub job_tx: RuntimeClient,
     pub job_rx: std::sync::mpsc::Receiver<JobResult>,
     pending_python: Option<tokio::sync::oneshot::Receiver<PythonJobResult>>,
+    app_paths: crate::app::paths::AppPaths,
+    run_workspace: Option<crate::app::paths::RunWorkspace>,
 
     // Render coalescing
     last_render_request: Option<(String, usize, u32)>,
@@ -418,13 +420,32 @@ impl MyApp {
             .first()
             .cloned()
             .unwrap_or_else(|| "examples/sample.pdf".to_string());
+        let app_paths = crate::app::paths::AppPaths::discover().unwrap_or_else(|error| {
+            tracing::error!("[gui] platform application root unavailable: {error}");
+            let fallback = crate::app::paths::AppPaths::with_root(
+                std::env::temp_dir().join("BankStatementFidelityEditor"),
+            );
+            let _ = fallback.ensure();
+            fallback
+        });
+        let run_workspace = app_paths
+            .create_run_workspace(std::path::Path::new(&input_path))
+            .ok();
+        let output_path = run_workspace
+            .as_ref()
+            .map(|workspace| workspace.output.join("edited.pdf"))
+            .unwrap_or_else(|| app_paths.root().join("edited.pdf"));
+        let export_path = run_workspace
+            .as_ref()
+            .map(|workspace| workspace.audit.join("history.json"))
+            .unwrap_or_else(|| app_paths.audit_dir().join("history.json"));
 
         let app = Self {
             input_path: input_path.clone(),
-            output_path: "output/edited.pdf".to_string(),
+            output_path: output_path.to_string_lossy().to_string(),
             current_pdf_path: PathBuf::new(),
             previous_pdf_path: None,
-            export_path: "audit/history.json".to_string(),
+            export_path: export_path.to_string_lossy().to_string(),
             current_page: 0,
             total_pages: 0,
             history_state: ChangeHistory::new(),
@@ -461,6 +482,8 @@ impl MyApp {
             job_tx,
             job_rx,
             pending_python: None,
+            app_paths,
+            run_workspace,
             last_render_request: None,
             command_query: String::new(),
             agent_autonomous_mode: false,
@@ -733,6 +756,47 @@ impl MyApp {
         });
         while self.toasts.len() > 5 {
             self.toasts.pop_front();
+        }
+    }
+
+    fn activate_run_workspace(&mut self, document: &std::path::Path) {
+        match self.app_paths.create_run_workspace(document) {
+            Ok(workspace) => {
+                self.output_path = workspace
+                    .output
+                    .join("edited.pdf")
+                    .to_string_lossy()
+                    .to_string();
+                self.export_path = workspace
+                    .audit
+                    .join("history.json")
+                    .to_string_lossy()
+                    .to_string();
+                self.run_workspace = Some(workspace);
+            }
+            Err(error) => {
+                tracing::error!("[gui] failed to create document workspace: {error}");
+                self.toast(
+                    ToastKind::Error,
+                    "Could not create an isolated document workspace",
+                );
+            }
+        }
+    }
+
+    fn active_workflow_draft_path(&self) -> PathBuf {
+        self.run_workspace
+            .as_ref()
+            .map(|workspace| workspace.drafts.join("workflow.json"))
+            .unwrap_or_else(Self::workflow_draft_path)
+    }
+
+    pub(crate) fn discard_active_workflow_draft_quiet(&self) {
+        let path = self.active_workflow_draft_path();
+        if path.exists() {
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!("[gui] removing workflow draft failed: {error}");
+            }
         }
     }
 
@@ -1936,7 +2000,7 @@ impl MyApp {
                 self.workflow_edits.clear();
                 self.workflow_cell_buffers.clear();
                 self.workflow_dirty = false;
-                Self::discard_workflow_draft_quiet();
+                self.discard_active_workflow_draft_quiet();
             }
             JobResult::WorkflowFailed(failure) => {
                 self.progress = None;
@@ -4991,6 +5055,7 @@ impl MyApp {
             return;
         }
         self.input_path = path.to_string_lossy().to_string();
+        self.activate_run_workspace(&path);
         self.current_pdf_path = path.clone();
         self.previous_pdf_path = None;
         self.history_state = ChangeHistory::new();
@@ -5018,7 +5083,9 @@ impl MyApp {
     /// Path of the on-disk autosave for the current workflow. One file per
     /// session - overwritten as edits change. Stage 5 / Item #9.
     pub fn workflow_draft_path() -> PathBuf {
-        PathBuf::from("audit").join("workflow.json")
+        crate::app::paths::AppPaths::discover()
+            .map(|paths| paths.audit_dir().join("workflow.json"))
+            .unwrap_or_else(|_| PathBuf::from("audit").join("workflow.json"))
     }
 
     /// Delete the on-disk draft if it exists. Used after a successful
@@ -5085,7 +5152,7 @@ impl MyApp {
             self.workflow_transactions.clone(),
             self.workflow_edits.clone(),
         );
-        let path = Self::workflow_draft_path();
+        let path = self.active_workflow_draft_path();
         match draft.save_to_file(&path) {
             Ok(()) => {
                 tracing::debug!("[gui] saved workflow draft to {}", path.display());
@@ -5105,7 +5172,7 @@ impl MyApp {
     /// but proceeds - the user might intentionally be loading a draft
     /// against a manually-saved copy.
     fn resume_workflow_draft(&mut self) {
-        let path = Self::workflow_draft_path();
+        let path = self.active_workflow_draft_path();
         if !path.exists() {
             self.toast(ToastKind::Warn, "No workflow draft to resume.");
             return;
@@ -5148,6 +5215,7 @@ impl MyApp {
         let same = draft.matches_pdf(&pdf_path);
         // Restore session state.
         self.input_path = pdf_path.to_string_lossy().to_string();
+        self.activate_run_workspace(&pdf_path);
         self.current_pdf_path = pdf_path.clone();
         self.workflow_validation = draft.validation.clone();
         self.workflow_transactions = draft.transactions.clone();
