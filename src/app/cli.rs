@@ -76,6 +76,19 @@ pub enum Commands {
         output: PathBuf,
     },
 
+    /// Extract every PDF under a directory with bounded workers and per-file results.
+    #[command(name = "extract-batch")]
+    ExtractBatch {
+        #[arg(long)]
+        input_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        max_concurrency: usize,
+        #[arg(long, default_value_t = 1)]
+        retries: usize,
+    },
+
     /// Reconstruct a bank statement via Typst (fallback mechanism)
     TypstReconstruct {
         #[arg(short, long)]
@@ -754,6 +767,201 @@ fn indent_block(text: &str) -> String {
         .join("\n")
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct BatchExtractionFileResult {
+    input: String,
+    output: Option<String>,
+    status: String,
+    attempts: usize,
+    row_count: usize,
+    error: Option<String>,
+}
+
+fn collect_pdf_files(root: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+    fn visit(directory: &std::path::Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, files)?;
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+            {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn run_extract_batch(
+    input_dir: PathBuf,
+    output_dir: PathBuf,
+    max_concurrency: usize,
+    retries: usize,
+    config: std::sync::Arc<crate::app::config::AppConfig>,
+) -> anyhow::Result<i32> {
+    if !input_dir.is_dir() {
+        anyhow::bail!("batch input is not a directory: {}", input_dir.display());
+    }
+    if !(1..=32).contains(&max_concurrency) {
+        anyhow::bail!("max-concurrency must be between 1 and 32");
+    }
+    if retries > 5 {
+        anyhow::bail!("retries must be between 0 and 5");
+    }
+    let files = collect_pdf_files(&input_dir)?;
+    if files.is_empty() {
+        anyhow::bail!("batch input contains no PDF files: {}", input_dir.display());
+    }
+    std::fs::create_dir_all(&output_dir)?;
+
+    let worker_count = max_concurrency.min(files.len()).max(1);
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+        files,
+    )));
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    std::thread::scope(|scope| {
+        for worker_id in 0..worker_count {
+            let queue = std::sync::Arc::clone(&queue);
+            let results = std::sync::Arc::clone(&results);
+            let config = std::sync::Arc::clone(&config);
+            let input_root = input_dir.clone();
+            let output_root = output_dir.clone();
+            scope.spawn(move || {
+                let audit_dir = output_root
+                    .join(".batch-audit")
+                    .join(format!("worker-{worker_id}"));
+                let audit_log = match crate::app::audit::AuditLog::open(&audit_dir) {
+                    Ok(log) => log,
+                    Err(error) => {
+                        tracing::error!("batch worker {worker_id} audit init failed: {error}");
+                        return;
+                    }
+                };
+                let (_runtime, job_tx, job_rx) =
+                    crate::app::runtime::Runtime::start(audit_log, config);
+
+                loop {
+                    let input = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                    let Some(input) = input else {
+                        break;
+                    };
+                    let relative = input.strip_prefix(&input_root).unwrap_or(input.as_path());
+                    let output = output_root.join(relative).with_extension("json");
+                    let mut final_result = None;
+
+                    for attempt in 1..=(retries + 1) {
+                        let submitted = job_tx.send_headless(Job::ExtractTransactions {
+                            path: input.clone(),
+                            parser_mode: crate::app::config::DocumentParserMode::OfflineHeuristic,
+                        });
+                        if submitted.is_err() {
+                            final_result = Some(BatchExtractionFileResult {
+                                input: input.display().to_string(),
+                                output: None,
+                                status: "failed".into(),
+                                attempts: attempt,
+                                row_count: 0,
+                                error: Some("runtime intake closed".into()),
+                            });
+                            break;
+                        }
+
+                        match wait_for_terminal_result(&job_rx) {
+                            Ok(JobResult::TransactionsExtracted(transactions)) => {
+                                let write_result = (|| -> anyhow::Result<()> {
+                                    if let Some(parent) = output.parent() {
+                                        std::fs::create_dir_all(parent)?;
+                                    }
+                                    let json = serde_json::to_vec_pretty(&transactions)?;
+                                    std::fs::write(&output, json)?;
+                                    Ok(())
+                                })();
+                                final_result = Some(match write_result {
+                                    Ok(()) => BatchExtractionFileResult {
+                                        input: input.display().to_string(),
+                                        output: Some(output.display().to_string()),
+                                        status: "success".into(),
+                                        attempts: attempt,
+                                        row_count: transactions.len(),
+                                        error: None,
+                                    },
+                                    Err(error) => BatchExtractionFileResult {
+                                        input: input.display().to_string(),
+                                        output: None,
+                                        status: "failed".into(),
+                                        attempts: attempt,
+                                        row_count: 0,
+                                        error: Some(format!("output write failed: {error}")),
+                                    },
+                                });
+                                break;
+                            }
+                            Ok(other) => {
+                                final_result = Some(BatchExtractionFileResult {
+                                    input: input.display().to_string(),
+                                    output: None,
+                                    status: "failed".into(),
+                                    attempts: attempt,
+                                    row_count: 0,
+                                    error: Some(format!("unexpected terminal result: {other:?}")),
+                                });
+                            }
+                            Err((label, error)) => {
+                                final_result = Some(BatchExtractionFileResult {
+                                    input: input.display().to_string(),
+                                    output: None,
+                                    status: "failed".into(),
+                                    attempts: attempt,
+                                    row_count: 0,
+                                    error: Some(format!("{label}: {error}")),
+                                });
+                            }
+                        }
+                    }
+
+                    if let (Some(result), Ok(mut all_results)) = (final_result, results.lock()) {
+                        all_results.push(result);
+                    }
+                }
+            });
+        }
+    });
+
+    let mut results = results
+        .lock()
+        .map_err(|_| anyhow::anyhow!("batch result lock poisoned"))?
+        .clone();
+    results.sort_by(|left, right| left.input.cmp(&right.input));
+    let manifest_path = output_dir.join("batch_manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&results)?)?;
+
+    let succeeded = results
+        .iter()
+        .filter(|result| result.status == "success")
+        .count();
+    let failed = results.len().saturating_sub(succeeded);
+    println!(
+        "Batch extraction complete: {succeeded} succeeded, {failed} failed. Manifest: {}",
+        manifest_path.display()
+    );
+    Ok(if failed == 0 {
+        exit_code::SUCCESS
+    } else {
+        exit_code::PARTIAL
+    })
+}
+
 pub fn run(
     cli: Cli,
     job_tx: RuntimeClient,
@@ -1073,6 +1281,12 @@ pub fn run_inner(
                 }
             }
         }
+        Commands::ExtractBatch {
+            input_dir,
+            output_dir,
+            max_concurrency,
+            retries,
+        } => run_extract_batch(input_dir, output_dir, max_concurrency, retries, config),
         Commands::Extract { input, output } => {
             let _ = job_tx.send_headless(Job::LoadDocument {
                 path: input.clone(),
@@ -1560,5 +1774,31 @@ pub fn run_inner(
                 _ => Ok(1),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn recursive_batch_discovery_is_complete_and_deterministic() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let nested = root.path().join("nested");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(root.path().join("b.pdf"), b"pdf-b")?;
+        std::fs::write(root.path().join("a.PDF"), b"pdf-a")?;
+        std::fs::write(nested.join("c.pdf"), b"pdf-c")?;
+        std::fs::write(nested.join("ignore.txt"), b"not a pdf")?;
+
+        let discovered = collect_pdf_files(root.path())?;
+        assert_eq!(discovered.len(), 3);
+        assert!(discovered.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(discovered.iter().all(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        }));
+        Ok(())
     }
 }
