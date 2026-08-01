@@ -1,0 +1,589 @@
+use crate::ai::python_protocol::{
+    PythonOperation, PythonRequestEnvelope, PythonResponseEnvelope, PYTHON_PROTOCOL_VERSION,
+};
+use serde::Deserialize;
+use std::fmt;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const STDERR_TAIL_LIMIT: usize = 32 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct PythonWorkerConfig {
+    pub python_executable: PathBuf,
+    pub worker_script: PathBuf,
+    pub working_directory: PathBuf,
+    pub python_path: PathBuf,
+    pub handshake_timeout: Duration,
+    pub operation_timeout: Duration,
+    pub shutdown_timeout: Duration,
+    pub queue_capacity: usize,
+    pub max_consecutive_restarts: usize,
+}
+
+impl Default for PythonWorkerConfig {
+    fn default() -> Self {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let executable = std::env::var_os("PYTHON_EXECUTABLE")
+            .or_else(|| std::env::var_os("PYO3_PYTHON"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    PathBuf::from("python")
+                } else {
+                    PathBuf::from("python3")
+                }
+            });
+        Self {
+            python_executable: executable,
+            worker_script: root.join("python").join("worker.py"),
+            working_directory: root.clone(),
+            python_path: root.join("python"),
+            handshake_timeout: Duration::from_secs(15),
+            operation_timeout: Duration::from_secs(120),
+            shutdown_timeout: Duration::from_secs(5),
+            queue_capacity: 32,
+            max_consecutive_restarts: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonWorkerHandshake {
+    pub event: String,
+    pub protocol_version: String,
+    pub worker_pid: u32,
+    pub python_version: String,
+    pub platform: String,
+    pub ready: bool,
+    pub bridge_error_class: Option<String>,
+    pub pymupdf_version: Option<String>,
+    pub pro_package_available: bool,
+    pub pro_import_error_class: Option<String>,
+    pub operations: Vec<String>,
+}
+
+impl PythonWorkerHandshake {
+    fn validate(&self) -> Result<(), PythonWorkerError> {
+        if self.event != "handshake" {
+            return Err(PythonWorkerError::InvalidHandshake(
+                "first worker event was not a handshake".to_string(),
+            ));
+        }
+        if self.protocol_version != PYTHON_PROTOCOL_VERSION {
+            return Err(PythonWorkerError::InvalidHandshake(format!(
+                "worker protocol {} does not match {}",
+                self.protocol_version, PYTHON_PROTOCOL_VERSION
+            )));
+        }
+        if self.worker_pid == 0 {
+            return Err(PythonWorkerError::InvalidHandshake(
+                "worker_pid must be non-zero".to_string(),
+            ));
+        }
+        let expected = PythonOperation::ALL
+            .iter()
+            .map(|operation| {
+                serde_json::to_value(operation)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        if self.operations != expected {
+            return Err(PythonWorkerError::InvalidHandshake(
+                "worker operation catalog does not match Rust".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonWorkerError {
+    Io(String),
+    HandshakeTimeout,
+    InvalidHandshake(String),
+    InvalidRequest(String),
+    InvalidResponse(String),
+    WorkerExited {
+        status: Option<i32>,
+        stderr_tail: String,
+    },
+    ResponseTimeout,
+    QueueFull,
+    QueueClosed,
+    ClientWaitTimeout,
+    RestartLimit,
+    RestartFailed(String),
+}
+
+impl fmt::Display for PythonWorkerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "Python worker I/O error: {error}"),
+            Self::HandshakeTimeout => write!(formatter, "Python worker handshake timed out"),
+            Self::InvalidHandshake(error) => write!(formatter, "invalid Python handshake: {error}"),
+            Self::InvalidRequest(error) => write!(formatter, "invalid Python request: {error}"),
+            Self::InvalidResponse(error) => write!(formatter, "invalid Python response: {error}"),
+            Self::WorkerExited {
+                status,
+                stderr_tail,
+            } => write!(
+                formatter,
+                "Python worker exited (status={status:?}, stderr_tail={stderr_tail:?})"
+            ),
+            Self::ResponseTimeout => write!(formatter, "Python operation timed out"),
+            Self::QueueFull => write!(formatter, "Python worker request queue is full"),
+            Self::QueueClosed => write!(formatter, "Python worker request queue is closed"),
+            Self::ClientWaitTimeout => write!(formatter, "timed out waiting for Python result"),
+            Self::RestartLimit => write!(formatter, "Python worker restart limit reached"),
+            Self::RestartFailed(error) => {
+                write!(formatter, "Python worker restart failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PythonWorkerError {}
+
+struct PythonWorkerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    lines: mpsc::Receiver<Result<String, String>>,
+    stderr_tail: Arc<Mutex<String>>,
+    handshake: PythonWorkerHandshake,
+}
+
+impl PythonWorkerProcess {
+    fn start(config: &PythonWorkerConfig) -> Result<Self, PythonWorkerError> {
+        let mut command = Command::new(&config.python_executable);
+        command
+            .arg(&config.worker_script)
+            .current_dir(&config.working_directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("PYTHONUNBUFFERED", "1");
+        let python_path = joined_python_path(&config.python_path)?;
+        command.env("PYTHONPATH", python_path);
+
+        let mut child = command
+            .spawn()
+            .map_err(|error| PythonWorkerError::Io(error.to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PythonWorkerError::Io("worker stdin was not piped".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PythonWorkerError::Io("worker stdout was not piped".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| PythonWorkerError::Io("worker stderr was not piped".to_string()))?;
+
+        let (line_tx, line_rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("python-worker-stdout".to_string())
+            .spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    let mapped = line.map_err(|error| error.to_string());
+                    if line_tx.send(mapped).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| PythonWorkerError::Io(error.to_string()))?;
+
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_tail_reader = Arc::clone(&stderr_tail);
+        thread::Builder::new()
+            .name("python-worker-stderr".to_string())
+            .spawn(move || collect_stderr_tail(stderr, &stderr_tail_reader))
+            .map_err(|error| PythonWorkerError::Io(error.to_string()))?;
+
+        let handshake_line = match line_rx.recv_timeout(config.handshake_timeout) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                return Err(PythonWorkerError::Io(error));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                return Err(PythonWorkerError::HandshakeTimeout);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let status = child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .and_then(|status| status.code());
+                let tail = locked_tail(&stderr_tail);
+                return Err(PythonWorkerError::WorkerExited {
+                    status,
+                    stderr_tail: tail,
+                });
+            }
+        };
+        let handshake: PythonWorkerHandshake = serde_json::from_str(&handshake_line)
+            .map_err(|error| PythonWorkerError::InvalidHandshake(error.to_string()))?;
+        handshake.validate()?;
+
+        Ok(Self {
+            child,
+            stdin,
+            lines: line_rx,
+            stderr_tail,
+            handshake,
+        })
+    }
+
+    fn execute(
+        &mut self,
+        request: &PythonRequestEnvelope,
+        default_timeout: Duration,
+    ) -> Result<PythonResponseEnvelope, PythonWorkerError> {
+        request
+            .validate()
+            .map_err(|error| PythonWorkerError::InvalidRequest(error.to_string()))?;
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(|error| PythonWorkerError::Io(error.to_string()))?
+        {
+            return Err(PythonWorkerError::WorkerExited {
+                status: status.code(),
+                stderr_tail: locked_tail(&self.stderr_tail),
+            });
+        }
+
+        let json = serde_json::to_string(request)
+            .map_err(|error| PythonWorkerError::InvalidRequest(error.to_string()))?;
+        self.stdin
+            .write_all(json.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| PythonWorkerError::Io(error.to_string()))?;
+
+        let timeout = request_timeout(request, default_timeout);
+        let line = match self.lines.recv_timeout(timeout) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => return Err(PythonWorkerError::Io(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.stop();
+                return Err(PythonWorkerError::ResponseTimeout);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let status = self
+                    .child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .and_then(|status| status.code());
+                return Err(PythonWorkerError::WorkerExited {
+                    status,
+                    stderr_tail: locked_tail(&self.stderr_tail),
+                });
+            }
+        };
+        let response = PythonResponseEnvelope::from_json_exact(&line)
+            .map_err(|error| PythonWorkerError::InvalidResponse(error.to_string()))?;
+        response
+            .validate_for(request)
+            .map_err(|error| PythonWorkerError::InvalidResponse(error.to_string()))?;
+        Ok(response)
+    }
+
+    fn stop(&mut self) {
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for PythonWorkerProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+pub struct PythonWorkerSupervisor {
+    config: PythonWorkerConfig,
+    worker: Option<PythonWorkerProcess>,
+    consecutive_restarts: usize,
+}
+
+impl PythonWorkerSupervisor {
+    pub fn start(config: PythonWorkerConfig) -> Result<Self, PythonWorkerError> {
+        let worker = PythonWorkerProcess::start(&config)?;
+        Ok(Self {
+            config,
+            worker: Some(worker),
+            consecutive_restarts: 0,
+        })
+    }
+
+    pub fn handshake(&self) -> Option<&PythonWorkerHandshake> {
+        self.worker.as_ref().map(|worker| &worker.handshake)
+    }
+
+    pub fn execute(
+        &mut self,
+        request: &PythonRequestEnvelope,
+    ) -> Result<PythonResponseEnvelope, PythonWorkerError> {
+        if self.worker.is_none() {
+            self.restart()?;
+        }
+        let result = self
+            .worker
+            .as_mut()
+            .ok_or(PythonWorkerError::RestartLimit)?
+            .execute(request, self.config.operation_timeout);
+        match result {
+            Ok(response) => {
+                self.consecutive_restarts = 0;
+                Ok(response)
+            }
+            Err(error) => {
+                if let Some(mut worker) = self.worker.take() {
+                    worker.stop();
+                }
+                let restart_result = self.restart();
+                if let Err(restart_error) = restart_result {
+                    return Err(PythonWorkerError::RestartFailed(format!(
+                        "{error}; {restart_error}"
+                    )));
+                }
+                // Never replay a failed request: a mutation may have reached the
+                // filesystem before a crash. The replacement worker serves only
+                // subsequent operations.
+                Err(error)
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Some(mut worker) = self.worker.take() {
+            worker.stop();
+        }
+    }
+
+    fn restart(&mut self) -> Result<(), PythonWorkerError> {
+        if self.consecutive_restarts >= self.config.max_consecutive_restarts {
+            return Err(PythonWorkerError::RestartLimit);
+        }
+        self.consecutive_restarts += 1;
+        self.worker = Some(PythonWorkerProcess::start(&self.config)?);
+        Ok(())
+    }
+}
+
+impl Drop for PythonWorkerSupervisor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+enum WorkerCommand {
+    Execute {
+        request: PythonRequestEnvelope,
+        reply: mpsc::SyncSender<Result<PythonResponseEnvelope, PythonWorkerError>>,
+    },
+    Shutdown {
+        reply: mpsc::SyncSender<()>,
+    },
+}
+
+#[derive(Clone)]
+pub struct PythonWorkerClient {
+    commands: mpsc::SyncSender<WorkerCommand>,
+    operation_timeout: Duration,
+}
+
+pub struct PythonWorkerTicket {
+    response: mpsc::Receiver<Result<PythonResponseEnvelope, PythonWorkerError>>,
+    timeout: Duration,
+}
+
+impl PythonWorkerTicket {
+    pub fn wait(self) -> Result<PythonResponseEnvelope, PythonWorkerError> {
+        match self.response.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(PythonWorkerError::ClientWaitTimeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PythonWorkerError::QueueClosed),
+        }
+    }
+}
+
+impl PythonWorkerClient {
+    pub fn start(config: PythonWorkerConfig) -> Result<Self, PythonWorkerError> {
+        let mut supervisor = PythonWorkerSupervisor::start(config.clone())?;
+        let (command_tx, command_rx) = mpsc::sync_channel(config.queue_capacity.max(1));
+        thread::Builder::new()
+            .name("python-worker-supervisor".to_string())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        WorkerCommand::Execute { request, reply } => {
+                            let result = supervisor.execute(&request);
+                            let _ = reply.send(result);
+                        }
+                        WorkerCommand::Shutdown { reply } => {
+                            supervisor.shutdown();
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| PythonWorkerError::Io(error.to_string()))?;
+        Ok(Self {
+            commands: command_tx,
+            operation_timeout: config.operation_timeout,
+        })
+    }
+
+    pub fn submit(
+        &self,
+        request: PythonRequestEnvelope,
+    ) -> Result<PythonWorkerTicket, PythonWorkerError> {
+        request
+            .validate()
+            .map_err(|error| PythonWorkerError::InvalidRequest(error.to_string()))?;
+        let timeout = request_timeout(&request, self.operation_timeout)
+            .saturating_add(Duration::from_secs(1));
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        match self.commands.try_send(WorkerCommand::Execute {
+            request,
+            reply: reply_tx,
+        }) {
+            Ok(()) => Ok(PythonWorkerTicket {
+                response: reply_rx,
+                timeout,
+            }),
+            Err(mpsc::TrySendError::Full(_)) => Err(PythonWorkerError::QueueFull),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(PythonWorkerError::QueueClosed),
+        }
+    }
+
+    pub fn execute(
+        &self,
+        request: PythonRequestEnvelope,
+    ) -> Result<PythonResponseEnvelope, PythonWorkerError> {
+        self.submit(request)?.wait()
+    }
+
+    pub fn shutdown(&self, timeout: Duration) -> Result<(), PythonWorkerError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.commands
+            .send(WorkerCommand::Shutdown { reply: reply_tx })
+            .map_err(|_| PythonWorkerError::QueueClosed)?;
+        reply_rx
+            .recv_timeout(timeout)
+            .map_err(|_| PythonWorkerError::ClientWaitTimeout)
+    }
+}
+
+fn joined_python_path(primary: &Path) -> Result<std::ffi::OsString, PythonWorkerError> {
+    let mut paths = vec![primary.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).map_err(|error| PythonWorkerError::Io(error.to_string()))
+}
+
+fn request_timeout(request: &PythonRequestEnvelope, default_timeout: Duration) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let deadline_timeout = Duration::from_millis(request.deadline_unix_ms.saturating_sub(now));
+    if deadline_timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        deadline_timeout.min(default_timeout)
+    }
+}
+
+fn collect_stderr_tail<R: Read>(reader: R, tail: &Arc<Mutex<String>>) {
+    let reader = BufReader::new(reader);
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(mut current) = tail.lock() {
+            current.push_str(&line);
+            current.push('\n');
+            if current.len() > STDERR_TAIL_LIMIT {
+                let split = current.len() - STDERR_TAIL_LIMIT;
+                let safe_split = current
+                    .char_indices()
+                    .find_map(|(index, _)| (index >= split).then_some(index))
+                    .unwrap_or(split);
+                current.drain(..safe_split);
+            }
+        }
+    }
+}
+
+fn locked_tail(tail: &Arc<Mutex<String>>) -> String {
+    tail.lock().map(|value| value.clone()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn ping_request() -> PythonRequestEnvelope {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        PythonRequestEnvelope::new(
+            PythonOperation::Ping,
+            Uuid::new_v4(),
+            now,
+            now + 30_000,
+            None,
+            json!({}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn real_worker_handshake_and_ping_match_protocol() {
+        let mut supervisor = PythonWorkerSupervisor::start(PythonWorkerConfig::default()).unwrap();
+        let handshake = supervisor.handshake().unwrap();
+        assert_eq!(handshake.protocol_version, PYTHON_PROTOCOL_VERSION);
+        assert_eq!(handshake.operations.len(), PythonOperation::ALL.len());
+        let request = ping_request();
+        let response = supervisor.execute(&request).unwrap();
+        response.validate_for(&request).unwrap();
+        assert_eq!(
+            response.disposition,
+            crate::ai::python_protocol::PythonDisposition::Succeeded
+        );
+        supervisor.shutdown();
+    }
+
+    #[test]
+    fn bounded_client_delivers_exactly_one_correlated_response() {
+        let config = PythonWorkerConfig {
+            queue_capacity: 1,
+            ..PythonWorkerConfig::default()
+        };
+        let client = PythonWorkerClient::start(config).unwrap();
+        let request = ping_request();
+        let operation_id = request.operation_id;
+        let response = client.execute(request).unwrap();
+        assert_eq!(response.operation_id, operation_id);
+        client.shutdown(Duration::from_secs(5)).unwrap();
+    }
+}
