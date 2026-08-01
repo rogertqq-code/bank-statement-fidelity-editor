@@ -211,28 +211,29 @@ def render_page_to_png(pdf_path: str, page_num: int = 0, dpi: float = 150.0):
 
 
 def get_text_blocks(pdf_path: str, page_num: int = 0):
-    """Return list of text spans with precise bounding boxes and font info"""
-    # Pro unlock without page limit guard, as text extraction is a free tier feature.
-    _ensure_pro_unlocked()
-    doc = pymupdf.open(pdf_path)
-    page = doc[page_num]
+    """Return text spans using the core PyMuPDF extraction API.
 
+    Text extraction does not require PyMuPDF Pro. Keep this operation available in
+    the base runtime and use a context manager so every success and failure path
+    deterministically closes the document handle.
+    """
     blocks = []
-    for block in page.get_text("dict")["blocks"]:
-        if "lines" not in block:
-            continue
-        for line in block["lines"]:
-            for span in line["spans"]:
-                blocks.append({
-                    "page": page_num,
-                    "text": span["text"],
-                    "bbox": list(span["bbox"]),      # [x0, y0, x1, y1]
-                    "font": span["font"],
-                    "size": round(span["size"], 2),
-                    "color": span["color"],
-                    "origin": list(span.get("origin", [0, 0])),
-                })
-    doc.close()
+    with pymupdf.open(pdf_path) as doc:
+        page = doc[page_num]
+        for block in page.get_text("dict")["blocks"]:
+            if "lines" not in block:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    blocks.append({
+                        "page": page_num,
+                        "text": span["text"],
+                        "bbox": list(span["bbox"]),      # [x0, y0, x1, y1]
+                        "font": span["font"],
+                        "size": round(span["size"], 2),
+                        "color": span["color"],
+                        "origin": list(span.get("origin", [0, 0])),
+                    })
     return blocks
 
 

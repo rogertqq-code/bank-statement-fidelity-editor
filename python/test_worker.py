@@ -123,6 +123,25 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(response["failure"]["class"], "FileNotFoundError")
         self.assertNotIn("traceback", response["failure"]["context"])
 
+    def test_core_text_extraction_succeeds_without_optional_pro(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "core-text.pdf"
+            document = pymupdf.open()
+            try:
+                page = document.new_page()
+                page.insert_text((72, 72), "CORE TEXT")
+                document.save(source_path)
+            finally:
+                document.close()
+            operation = request(
+                "get_text_blocks",
+                {"pdf_path": str(source_path), "page_num": 0},
+            )
+            response = parse_response(self.worker.send(operation))
+            self.assertEqual(response["disposition"], "succeeded", response)
+            spans = response["payload"]["result"]
+            self.assertEqual([span["text"] for span in spans], ["CORE TEXT"])
+
     def test_pro_page_limit_cannot_be_bypassed_and_preserves_source(self) -> None:
         self.worker.terminate()
         self.worker = WorkerProcess({"IGNORE_PRO_LIMIT": "100"})
