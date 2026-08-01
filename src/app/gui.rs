@@ -2096,9 +2096,30 @@ impl MyApp {
                     serde_json::to_string_pretty(&report).unwrap_or_default(),
                 );
             }
-            JobResult::JobCompleted(_label) => {
+            JobResult::JobCompleted {
+                job_label,
+                disposition,
+                artifact,
+                message,
+            } => {
+                use crate::app::runtime::OperationDisposition;
                 self.progress = None;
                 self.in_flight = self.in_flight.saturating_sub(1);
+                let (kind, prefix) = match disposition {
+                    OperationDisposition::Succeeded => (ToastKind::Success, "Completed"),
+                    OperationDisposition::NoOp => (ToastKind::Info, "No changes"),
+                    OperationDisposition::Partial => (ToastKind::Warning, "Partially completed"),
+                    OperationDisposition::Failed => (ToastKind::Error, "Failed"),
+                    OperationDisposition::Cancelled => (ToastKind::Warning, "Cancelled"),
+                    OperationDisposition::TimedOut => (ToastKind::Error, "Timed out"),
+                };
+                let artifact_note = artifact
+                    .as_ref()
+                    .map(|path| format!(" -> {}", path.display()))
+                    .unwrap_or_default();
+                let status = format!("{prefix} [{job_label}]: {message}{artifact_note}");
+                self.status = status.clone();
+                self.toast(kind, status);
             }
             JobResult::TransferComplete(result) => {
                 self.progress = None;

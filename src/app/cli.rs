@@ -3,7 +3,7 @@
 
 use crate::app::audit::AuditLogParser;
 use crate::app::env_spec::{self, Requirement};
-use crate::app::runtime::{Job, JobResult, RuntimeClient};
+use crate::app::runtime::{Job, JobResult, OperationDisposition, RuntimeClient};
 use crate::engine::history::ChangeHistory;
 use crate::error::exit_code;
 use clap::{Parser, Subcommand};
@@ -358,6 +358,67 @@ fn wait_for_terminal_result(job_rx: &Receiver<JobResult>) -> Result<JobResult, (
             Ok(res) => return Ok(res),
             Err(e) => return Err(("runtime".into(), format!("Disconnected: {e}"))),
         }
+    }
+}
+
+struct OperationCompletion {
+    disposition: OperationDisposition,
+    artifact: Option<PathBuf>,
+    message: String,
+}
+
+fn wait_for_operation_completion(
+    job_rx: &Receiver<JobResult>,
+    expected_job_label: &str,
+) -> Result<OperationCompletion, (String, String)> {
+    loop {
+        match job_rx.recv() {
+            Ok(JobResult::Progress { label, fraction }) => {
+                tracing::info!("[progress] {}: {:.0}%", label, fraction * 100.0);
+            }
+            Ok(JobResult::JobCompleted {
+                job_label,
+                disposition,
+                artifact,
+                message,
+            }) if job_label == expected_job_label => {
+                return Ok(OperationCompletion {
+                    disposition,
+                    artifact,
+                    message,
+                });
+            }
+            Ok(JobResult::Error { job_label, message }) => {
+                return Err((job_label, message));
+            }
+            Ok(JobResult::Cancelled { id }) => {
+                return Err((expected_job_label.into(), format!("Job {id} was cancelled")));
+            }
+            Ok(JobResult::TimedOut { id, job_label }) => {
+                return Err((job_label, format!("Job {id} exceeded its deadline")));
+            }
+            Ok(other) => tracing::debug!(
+                expected_job_label,
+                result = ?other,
+                "[cli] ignoring intermediate result while awaiting operation completion"
+            ),
+            Err(error) => {
+                return Err((
+                    "runtime".into(),
+                    format!("Disconnected while awaiting {expected_job_label}: {error}"),
+                ));
+            }
+        }
+    }
+}
+
+fn disposition_exit_code(disposition: OperationDisposition) -> i32 {
+    match disposition {
+        OperationDisposition::Succeeded => exit_code::SUCCESS,
+        OperationDisposition::NoOp | OperationDisposition::Partial => exit_code::PARTIAL,
+        OperationDisposition::Failed
+        | OperationDisposition::Cancelled
+        | OperationDisposition::TimedOut => exit_code::GENERAL,
     }
 }
 
@@ -1438,21 +1499,42 @@ pub fn run_inner(
             } else {
                 crate::engine::date_adjust::DateAdjustMode::ShiftDays(30)
             };
-            let _ = job_tx.send_headless(Job::AdjustDatePeriods {
+            if let Err(error) = job_tx.send_headless(Job::AdjustDatePeriods {
                 input,
-                output,
+                output: output.clone(),
                 mode: parsed_mode,
-            });
-            match wait_for_terminal_result(&job_rx) {
-                Ok(JobResult::DatesAdjusted { records, .. }) => {
-                    println!("✅ Adjusted {} dates.", records.len());
-                    Ok(0)
+            }) {
+                eprintln!("Could not submit date adjustment: {error}");
+                return Ok(exit_code::GENERAL);
+            }
+            match wait_for_operation_completion(&job_rx, "adjust_dates") {
+                Ok(completion) => {
+                    let exit = disposition_exit_code(completion.disposition);
+                    if completion.disposition == OperationDisposition::Succeeded {
+                        let artifact_is_exact = completion.artifact.as_ref() == Some(&output);
+                        let artifact_is_durable = std::fs::metadata(&output)
+                            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                            .unwrap_or(false);
+                        if !artifact_is_exact || !artifact_is_durable {
+                            eprintln!(
+                                "Date adjustment reported success without the exact durable requested artifact: {}",
+                                output.display()
+                            );
+                            return Ok(exit_code::GENERAL);
+                        }
+                        println!("{}", completion.message);
+                    } else {
+                        eprintln!(
+                            "Date adjustment ended as {:?}: {}",
+                            completion.disposition, completion.message
+                        );
+                    }
+                    Ok(exit)
                 }
-                Err((lbl, msg)) => {
-                    eprintln!("❌ [{lbl}] {msg}");
-                    Ok(1)
+                Err((label, message)) => {
+                    eprintln!("[{label}] {message}");
+                    Ok(exit_code::GENERAL)
                 }
-                _ => Ok(1),
             }
         }
         Commands::RunTransferTests {

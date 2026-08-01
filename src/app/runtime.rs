@@ -714,6 +714,19 @@ impl Job {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationDisposition {
+    Succeeded,
+    NoOp,
+    Partial,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
 #[derive(Debug)]
 pub enum JobResult {
     Pong,
@@ -828,7 +841,12 @@ pub enum JobResult {
     TransferTestsComplete(crate::engine::transfer_test_harness::TestHarnessReport),
 
     // ----- General Lifecycle -----------------------------------------------
-    JobCompleted(String),
+    JobCompleted {
+        job_label: String,
+        disposition: OperationDisposition,
+        artifact: Option<PathBuf>,
+        message: String,
+    },
 
     // ----- Document AI Version Management ----------------------------------
     DocAiVersionsListed(Vec<crate::ai::document_ai::ProcessorVersionInfo>),
@@ -844,16 +862,38 @@ impl JobResult {
     /// True only for results that definitively end a tracked job lifecycle.
     /// Intermediate payloads must be enumerated by consumers, not inferred as
     /// terminal merely because they are not progress messages.
+    pub fn disposition(&self) -> Option<OperationDisposition> {
+        match self {
+            Self::Error { .. } | Self::WorkflowFailed(_) | Self::TransferFailed { .. } => {
+                Some(OperationDisposition::Failed)
+            }
+            Self::Cancelled { .. } => Some(OperationDisposition::Cancelled),
+            Self::TimedOut { .. } => Some(OperationDisposition::TimedOut),
+            Self::WorkflowComplete(_) | Self::TransferComplete(_) => {
+                Some(OperationDisposition::Succeeded)
+            }
+            Self::JobCompleted { disposition, .. } => Some(*disposition),
+            _ => None,
+        }
+    }
+
+    /// True only for results that definitively end a tracked job lifecycle.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Error { .. }
-                | Self::Cancelled { .. }
-                | Self::TimedOut { .. }
-                | Self::WorkflowComplete(_)
-                | Self::WorkflowFailed(_)
-                | Self::JobCompleted(_)
-        )
+        self.disposition().is_some()
+    }
+
+    pub fn completed(
+        job_label: impl Into<String>,
+        disposition: OperationDisposition,
+        artifact: Option<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::JobCompleted {
+            job_label: job_label.into(),
+            disposition,
+            artifact,
+            message: message.into(),
+        }
     }
 }
 
@@ -3340,72 +3380,142 @@ async fn process_job_inner(
                     ),
                 };
 
-                // Clone the PDF and apply date changes
-                if let Err(e) = std::fs::copy(&input, &output) {
-                    let _ = res_tx.send(JobResult::Error {
-                        job_label: "adjust_dates".into(),
-                        message: format!("Failed to clone PDF: {e}"),
-                    });
+                let total = records.len();
+                if total == 0 {
+                    let _ = res_tx.send(JobResult::completed(
+                        "adjust_dates",
+                        OperationDisposition::NoOp,
+                        None,
+                        "No transaction dates matched the requested adjustment; the output was left untouched",
+                    ));
                     return;
                 }
 
-                let total = records.len();
-                let mut skipped = 0usize;
-                for (i, rec) in records.iter().enumerate() {
-                    // Find the bbox for this transaction's date field.
-                    // Offline-parsed transactions have empty FieldBboxes, so
-                    // date_bbox may be None — skip gracefully and warn.
-                    if let Some(tx) = transactions
-                        .iter()
-                        .find(|t| t.page == rec.page && t.line_on_page == rec.line_on_page)
-                    {
-                        if let Some(date_bbox) = tx.field_bboxes.date {
-                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                            let _ = py_tx.send((
-                                PythonJob::ReplaceTextInRect {
-                                    pdf_path: output.to_string_lossy().to_string(),
-                                    output_path: output.to_string_lossy().to_string(),
-                                    page_num: rec.page,
-                                    rect: date_bbox,
-                                    new_text: rec.new_date.clone(),
-                                    font_path: None,
-                                },
-                                reply_tx,
-                            ));
-                            let _ = reply_rx.await;
-                        } else {
-                            tracing::warn!(
-                                            "[adjust_dates] No date bbox for page {} line {} — skipping PDF edit (offline parser limitation)",
-                                            rec.page, rec.line_on_page,
-                                        );
-                            skipped += 1;
-                        }
+                let output_parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let staged_output = match crate::app::commit::staging_path(
+                    output_parent,
+                    ".date-adjust-",
+                    ".pdf",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::completed(
+                            "adjust_dates",
+                            OperationDisposition::Failed,
+                            None,
+                            format!("Could not create an isolated output stage: {error}"),
+                        ));
+                        return;
                     }
-                    let frac = 0.4 + (0.5 * (i + 1) as f32 / total.max(1) as f32);
+                };
+                if let Err(error) = std::fs::copy(&input, &staged_output) {
+                    let _ = res_tx.send(JobResult::completed(
+                        "adjust_dates",
+                        OperationDisposition::Failed,
+                        None,
+                        format!("Could not stage the source PDF: {error}"),
+                    ));
+                    return;
+                }
+
+                let mut applied = 0usize;
+                let mut failures = Vec::new();
+                for (index, record) in records.iter().enumerate() {
+                    let transaction = transactions.iter().find(|transaction| {
+                        transaction.page == record.page
+                            && transaction.line_on_page == record.line_on_page
+                    });
+                    let Some(date_bbox) = transaction.and_then(|tx| tx.field_bboxes.date) else {
+                        failures.push(format!(
+                            "page {} line {} has no date geometry",
+                            record.page, record.line_on_page
+                        ));
+                        continue;
+                    };
+
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if let Err(error) = py_tx.send((
+                        PythonJob::ReplaceTextInRect {
+                            pdf_path: staged_output.to_string_lossy().to_string(),
+                            output_path: staged_output.to_string_lossy().to_string(),
+                            page_num: record.page,
+                            rect: date_bbox,
+                            new_text: record.new_date.clone(),
+                            font_path: None,
+                        },
+                        reply_tx,
+                    )) {
+                        failures.push(format!(
+                            "page {} line {} could not reach the Python worker: {error}",
+                            record.page, record.line_on_page
+                        ));
+                        continue;
+                    }
+
+                    match reply_rx.await {
+                        Ok(PythonJobResult::Success) => applied += 1,
+                        Ok(PythonJobResult::ReplacedWithReviewWarning { reason }) => {
+                            failures.push(format!(
+                                "page {} line {} requires review: {reason}",
+                                record.page, record.line_on_page
+                            ));
+                        }
+                        Ok(PythonJobResult::Error(error)) => failures.push(format!(
+                            "page {} line {} failed: {error}",
+                            record.page, record.line_on_page
+                        )),
+                        Ok(other) => failures.push(format!(
+                            "page {} line {} returned an invalid Python result: {other:?}",
+                            record.page, record.line_on_page
+                        )),
+                        Err(error) => failures.push(format!(
+                            "page {} line {} lost its Python reply: {error}",
+                            record.page, record.line_on_page
+                        )),
+                    }
+
+                    let fraction = 0.4 + (0.5 * (index + 1) as f32 / total as f32);
                     let _ = res_tx.send(JobResult::Progress {
-                        label: format!("Updating date {}/{}", i + 1, total),
-                        fraction: frac,
+                        label: format!("Updating date {}/{}", index + 1, total),
+                        fraction,
                     });
                 }
 
-                if skipped > 0 {
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: format!(
-                            "Dates adjusted ✓ ({skipped} skipped — no bbox from offline parser)"
+                if applied != total || !failures.is_empty() {
+                    let _ = res_tx.send(JobResult::completed(
+                        "adjust_dates",
+                        OperationDisposition::Failed,
+                        None,
+                        format!(
+                            "Date adjustment was not published: applied {applied}/{total}; {}",
+                            failures.join("; ")
                         ),
-                        fraction: 1.0,
-                    });
-                } else {
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: "Dates adjusted ✓".to_string(),
-                        fraction: 1.0,
-                    });
+                    ));
+                    return;
                 }
+
+                let mut barrier = crate::app::commit::FileCommitBarrier::new();
+                if let Err(error) = barrier.publish(&staged_output, &output) {
+                    let _ = res_tx.send(JobResult::completed(
+                        "adjust_dates",
+                        OperationDisposition::Failed,
+                        None,
+                        format!("Could not publish the verified date-adjusted PDF: {error}"),
+                    ));
+                    return;
+                }
+                barrier.commit();
 
                 let _ = res_tx.send(JobResult::DatesAdjusted {
                     records,
-                    output_path: output,
+                    output_path: output.clone(),
                 });
+                let _ = res_tx.send(JobResult::completed(
+                    "adjust_dates",
+                    OperationDisposition::Succeeded,
+                    Some(output),
+                    format!("Applied all {total} date changes"),
+                ));
             });
         }
         Job::AiConfirmationResponse(response) => {
@@ -5663,8 +5773,28 @@ async fn process_job_inner(
                                     fraction: 1.0,
                                 });
                             }
-                            let _ =
-                                res_tx.send(JobResult::JobCompleted("BalanceAndApplyAll".into()));
+                            let (disposition, message) = if changes.is_empty() {
+                                (
+                                    OperationDisposition::NoOp,
+                                    "Statement is already balanced; no changes were required",
+                                )
+                            } else if auto_apply {
+                                (
+                                    OperationDisposition::Partial,
+                                    "Changes were proposed and await explicit confirmation; no output was published",
+                                )
+                            } else {
+                                (
+                                    OperationDisposition::Succeeded,
+                                    "Balance analysis completed and proposals are ready for review",
+                                )
+                            };
+                            let _ = res_tx.send(JobResult::completed(
+                                "balance_and_apply_all",
+                                disposition,
+                                None,
+                                message,
+                            ));
                         }
                         Err(crate::engine::statement::EngineError::LowConfidence(c)) => {
                             let _ = res_tx.send(JobResult::Error { job_label: "balance_and_apply_all".into(), message: format!("Gemini confidence {c:.2} below 0.7 threshold; not enough certainty to auto-apply adjustments.") });
@@ -5768,7 +5898,28 @@ async fn process_job_inner(
                             fraction: 1.0,
                         });
                     }
-                    let _ = res_tx.send(JobResult::JobCompleted("BalanceAndApplyAll".into()));
+                    let (disposition, message) = if changes.is_empty() {
+                        (
+                            OperationDisposition::NoOp,
+                            "Statement is already balanced; no changes were required",
+                        )
+                    } else if auto_apply {
+                        (
+                            OperationDisposition::Partial,
+                            "Changes were proposed and await explicit confirmation; no output was published",
+                        )
+                    } else {
+                        (
+                            OperationDisposition::Succeeded,
+                            "Offline balance analysis completed and proposals are ready for review",
+                        )
+                    };
+                    let _ = res_tx.send(JobResult::completed(
+                        "balance_and_apply_all",
+                        disposition,
+                        None,
+                        message,
+                    ));
                 }
             });
         }
@@ -6446,7 +6597,12 @@ async fn process_job_inner(
                 let _ = res_tx.send(JobResult::WorkflowStageChanged {
                     stage: crate::engine::workflow::WorkflowStage::Editing(validation),
                 });
-                let _ = res_tx.send(JobResult::JobCompleted("WorkflowParseAndValidate".into()));
+                let _ = res_tx.send(JobResult::completed(
+                    "workflow_parse_and_validate",
+                    OperationDisposition::Succeeded,
+                    None,
+                    "Statement parsing and completeness validation completed",
+                ));
             });
         }
 
@@ -8246,7 +8402,18 @@ mod tests {
             ))
             .is_terminal()
         );
-        assert!(JobResult::JobCompleted("done".into()).is_terminal());
+        for disposition in [
+            OperationDisposition::Succeeded,
+            OperationDisposition::NoOp,
+            OperationDisposition::Partial,
+            OperationDisposition::Failed,
+            OperationDisposition::Cancelled,
+            OperationDisposition::TimedOut,
+        ] {
+            let terminal = JobResult::completed("done", disposition, None, "complete");
+            assert_eq!(terminal.disposition(), Some(disposition));
+            assert!(terminal.is_terminal());
+        }
     }
 
     #[test]
