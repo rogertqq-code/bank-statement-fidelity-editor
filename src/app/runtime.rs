@@ -6020,7 +6020,7 @@ async fn process_job_inner(
             version,
             parser_mode,
             ai_provider,
-            ignore_offline_fallback: _,
+            ignore_offline_fallback,
         } => {
             let res_tx = TerminalTracker::new(result_tx_clone.clone(), "WorkflowParseAndValidate");
             let mut cfg_override = (*config_for_tokio).clone();
@@ -6058,11 +6058,13 @@ async fn process_job_inner(
                                                 None,
                                             );
                                         }
-                                        req = req.add_alternative(
-                                            "offline_parser",
-                                            "Fall back to Offline Parser (Local)",
-                                            None,
-                                        );
+                                        if !ignore_offline_fallback {
+                                            req = req.add_alternative(
+                                                "offline_parser",
+                                                "Fall back to Offline Parser (Local)",
+                                                None,
+                                            );
+                                        }
                                         req = req.add_alternative("cancel", "Cancel Workflow", None);
 
                                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -6090,7 +6092,7 @@ async fn process_job_inner(
                                             "offline_parser" => Some(DocumentParserMode::OfflineHeuristic),
                                             _ => None,
                                         }
-                                    } else if $next_parser.is_some() {
+                                    } else if $next_parser.is_some() && !ignore_offline_fallback {
                                         Some(DocumentParserMode::OfflineHeuristic)
                                     } else {
                                         None
