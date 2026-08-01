@@ -6283,7 +6283,7 @@ async fn process_job_inner(
                                         router,
                                         res_tx,
                                         format!("Offline parser failed: {e}"),
-                                        None
+                                        None::<DocumentParserMode>
                                     ) {
                                         current_parser_mode = next;
                                         continue;
@@ -6304,7 +6304,7 @@ async fn process_job_inner(
                                         router,
                                         res_tx,
                                         format!("Offline parser panicked: {e}"),
-                                        None
+                                        None::<DocumentParserMode>
                                     ) {
                                         current_parser_mode = next;
                                         continue;
