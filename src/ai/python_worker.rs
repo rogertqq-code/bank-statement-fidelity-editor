@@ -31,22 +31,45 @@ pub struct PythonWorkerConfig {
 
 impl Default for PythonWorkerConfig {
     fn default() -> Self {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let executable = std::env::var_os("PYTHON_EXECUTABLE")
+        let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let executable_directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let bundle_root = executable_directory
+            .as_deref()
+            .and_then(discover_bundled_python_root);
+        let bundled_executable = bundle_root.as_deref().map(bundled_python_executable);
+        let default_executable = bundled_executable.unwrap_or_else(|| {
+            if cfg!(windows) {
+                PathBuf::from("python")
+            } else {
+                PathBuf::from("python3")
+            }
+        });
+        let python_executable = std::env::var_os("PYTHON_EXECUTABLE")
             .or_else(|| std::env::var_os("PYO3_PYTHON"))
             .map(PathBuf::from)
+            .unwrap_or(default_executable);
+        let worker_script = std::env::var_os("PYTHON_WORKER_SCRIPT")
+            .map(PathBuf::from)
             .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    PathBuf::from("python")
-                } else {
-                    PathBuf::from("python3")
-                }
+                bundle_root
+                    .as_ref()
+                    .map(|root| root.join("worker.py"))
+                    .unwrap_or_else(|| source_root.join("python").join("worker.py"))
             });
+        let python_path = bundle_root
+            .clone()
+            .unwrap_or_else(|| source_root.join("python"));
+        let working_directory = bundle_root
+            .as_ref()
+            .and_then(|root| root.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| source_root.clone());
         Self {
-            python_executable: executable,
-            worker_script: root.join("python").join("worker.py"),
-            working_directory: root.clone(),
-            python_path: root.join("python"),
+            python_executable,
+            worker_script,
+            working_directory,
+            python_path,
             environment: Vec::new(),
             handshake_timeout: Duration::from_secs(15),
             operation_timeout: Duration::from_secs(120),
@@ -58,6 +81,24 @@ impl Default for PythonWorkerConfig {
             max_handle_growth: 32,
         }
     }
+}
+
+fn bundled_python_executable(bundle_root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        bundle_root.join("runtime").join("python.exe")
+    } else {
+        bundle_root.join("runtime").join("bin").join("python3")
+    }
+}
+
+fn discover_bundled_python_root(executable_directory: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![executable_directory.join("resources").join("python")];
+    if let Some(contents) = executable_directory.parent() {
+        candidates.push(contents.join("Resources").join("python"));
+    }
+    candidates
+        .into_iter()
+        .find(|root| root.join("worker.py").is_file() && bundled_python_executable(root).is_file())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -605,6 +646,45 @@ mod tests {
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn discovers_adjacent_packaged_python_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable_directory = directory.path().join("app");
+        let bundle_root = executable_directory.join("resources").join("python");
+        let interpreter = bundled_python_executable(&bundle_root);
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(bundle_root.join("worker.py"), "# worker").unwrap();
+        std::fs::write(&interpreter, b"runtime").unwrap();
+        assert_eq!(
+            discover_bundled_python_root(&executable_directory),
+            Some(bundle_root)
+        );
+    }
+
+    #[test]
+    fn discovers_macos_resources_layout_and_rejects_incomplete_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable_directory = directory
+            .path()
+            .join("Editor.app")
+            .join("Contents")
+            .join("MacOS");
+        let bundle_root = executable_directory
+            .parent()
+            .unwrap()
+            .join("Resources")
+            .join("python");
+        let interpreter = bundled_python_executable(&bundle_root);
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(bundle_root.join("worker.py"), "# worker").unwrap();
+        assert_eq!(discover_bundled_python_root(&executable_directory), None);
+        std::fs::write(&interpreter, b"runtime").unwrap();
+        assert_eq!(
+            discover_bundled_python_root(&executable_directory),
+            Some(bundle_root)
+        );
+    }
 
     fn ping_request() -> PythonRequestEnvelope {
         let now = SystemTime::now()
