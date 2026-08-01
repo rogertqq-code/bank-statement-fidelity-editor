@@ -2858,6 +2858,7 @@ impl MyApp {
                         .job_tx
                         .send(crate::app::runtime::Job::ExtractTransactions {
                             path: std::path::PathBuf::from(&self.transfer_source_path),
+                            parser_mode: self.settings.document_parser,
                         });
                     self.in_flight += 1;
                 }
@@ -4205,7 +4206,10 @@ impl MyApp {
                 let has_files = !self.batch_files.is_empty();
                 if ui.add_enabled(has_files, egui::Button::new("Extract All to JSON")).clicked() {
                     for file in &self.batch_files {
-                        if let Err(e) = self.job_tx.send(Job::ExtractTransactions { path: file.clone() }) { tracing::error!("Runtime disconnected: {}", e); }
+                        if let Err(e) = self.job_tx.send(Job::ExtractTransactions {
+                            path: file.clone(),
+                            parser_mode: self.settings.document_parser,
+                        }) { tracing::error!("Runtime disconnected: {}", e); }
                         self.in_flight += 1;
                     }
                     self.toast(ToastKind::Info, format!("Queued {} extraction jobs", self.batch_files.len()));

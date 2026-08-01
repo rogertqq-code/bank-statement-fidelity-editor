@@ -1080,7 +1080,10 @@ pub fn run_inner(
             });
             match wait_for_terminal_result(&job_rx) {
                 Ok(JobResult::DocumentLoaded { .. }) => {
-                    let _ = job_tx.send_headless(Job::ExtractTransactions { path: input });
+                    let _ = job_tx.send_headless(Job::ExtractTransactions {
+                        path: input,
+                        parser_mode: crate::app::config::DocumentParserMode::OfflineHeuristic,
+                    });
                     match wait_for_terminal_result(&job_rx) {
                         Ok(JobResult::TransactionsExtracted(transactions)) => {
                             let json = match serde_json::to_string_pretty(&transactions) {

@@ -2078,7 +2078,8 @@ impl AppModals for MyApp {
                         self.job_tx
                             .send(crate::app::runtime::Job::ExtractTransactions {
                                 path: std::path::PathBuf::from(&self.input_path),
-                                // Note: To force offline parser, we could adjust config or add a flag, but this is a good start.
+                                parser_mode:
+                                    crate::app::config::DocumentParserMode::OfflineHeuristic,
                             })
                     {
                         tracing::error!("Failed to dispatch ExtractTransactions fallback: {}", e);

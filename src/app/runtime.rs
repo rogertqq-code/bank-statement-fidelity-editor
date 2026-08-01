@@ -722,6 +722,7 @@ pub enum Job {
     },
     ExtractTransactions {
         path: PathBuf,
+        parser_mode: crate::app::config::DocumentParserMode,
     },
     NaturalLanguageEdit {
         prompt: String,
@@ -947,7 +948,7 @@ impl Job {
             | Self::RenderPage { path, .. }
             | Self::CompleteFont { path, .. }
             | Self::BalanceStatement { path }
-            | Self::ExtractTransactions { path } => Some(path),
+            | Self::ExtractTransactions { path, .. } => Some(path),
             Self::ApplyChange { input, .. }
             | Self::ApplyProposedChanges { input, .. }
             | Self::GenerateVisualAlternatives { input, .. }
@@ -1261,6 +1262,24 @@ impl ResultSink {
 type InteractiveFallbackRouter = std::sync::Arc<
     tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<String>>>,
 >;
+
+fn extraction_provider_order(
+    selected: crate::app::config::DocumentParserMode,
+) -> Vec<crate::app::config::DocumentParserMode> {
+    use crate::app::config::DocumentParserMode;
+    match selected {
+        DocumentParserMode::OfflineHeuristic => vec![DocumentParserMode::OfflineHeuristic],
+        DocumentParserMode::LlamaParse => vec![
+            DocumentParserMode::LlamaParse,
+            DocumentParserMode::OfflineHeuristic,
+        ],
+        DocumentParserMode::DocumentAi => vec![
+            DocumentParserMode::DocumentAi,
+            DocumentParserMode::OfflineHeuristic,
+        ],
+        DocumentParserMode::LocalOcrs => vec![DocumentParserMode::LocalOcrs],
+    }
+}
 
 async fn wait_for_interactive_choice(
     router: &InteractiveFallbackRouter,
@@ -4835,7 +4854,7 @@ async fn process_job_inner(
                 let _ = res_tx.send(JobResult::CategorizationReady(transactions));
             });
         }
-        Job::ExtractTransactions { path } => {
+        Job::ExtractTransactions { path, parser_mode } => {
             let res_tx = result_tx_clone.clone();
             let eng = engine_for_tokio.clone();
             let cfg = config_for_tokio.clone();
@@ -4854,27 +4873,35 @@ async fn process_job_inner(
                     }
                 };
 
-                let cache_key = match tokio::fs::read(&path).await {
+                let source_hash = match tokio::fs::read(&path).await {
                     Ok(bytes) => crate::engine::workflow::sha256_hex_of(&bytes),
                     Err(_) => path.to_string_lossy().to_string(),
                 };
+                let cache_key = format!("{parser_mode:?}:{source_hash}");
 
                 {
                     let mut cache = cache_for_job.lock().await;
-                    if let Some(cached_stmt) = cache.get(&cache_key) {
-                        tracing::info!(
-                            "[runtime] LRU cache HIT for ExtractTransactions: {}",
-                            cache_key
+                    if let Some(mut cached_stmt) = cache.get(&cache_key).cloned() {
+                        cached_stmt.ensure_canonical_metadata();
+                        let issues = crate::engine::workflow::deterministic_parse_issues(
+                            cached_stmt.total_pages,
+                            &cached_stmt.transactions,
+                            cached_stmt.opening_balance,
+                            cached_stmt.closing_balance,
                         );
-                        if !cached_stmt.transactions.is_empty() {
-                            let _ = res_tx.send(JobResult::TransactionsExtracted(
-                                cached_stmt.transactions.clone(),
-                            ));
+                        if issues.is_empty() {
+                            tracing::info!(
+                                "[runtime] validated extraction cache hit: {}",
+                                cache_key
+                            );
+                            let _ = res_tx
+                                .send(JobResult::TransactionsExtracted(cached_stmt.transactions));
                             return;
                         }
                         tracing::warn!(
-                            "[runtime] ignoring invalid zero-row extraction cache entry: {}",
-                            cache_key
+                            "[runtime] ignoring invalid extraction cache entry {}: {}",
+                            cache_key,
+                            issues.join("; ")
                         );
                     }
                 }
@@ -4884,154 +4911,155 @@ async fn process_job_inner(
                     fraction: 0.1,
                 });
 
-                let mut final_txs = None;
+                let provider_order = extraction_provider_order(parser_mode);
+                let mut failures = Vec::new();
+                let mut accepted_statement = None;
 
-                // 1. Try LlamaParse
-                if final_txs.is_none() {
+                for (attempt_index, provider) in provider_order.into_iter().enumerate() {
                     let _ = res_tx.send(JobResult::Progress {
-                        label: "Extracting with LlamaParse...".to_string(),
-                        fraction: 0.1,
+                        label: format!("Extracting with {}", provider.label()),
+                        fraction: 0.15 + attempt_index as f32 * 0.15,
                     });
-                    if let Ok(client) =
-                        crate::ai::llamaparse::LlamaParseClient::from_app_config(&cfg)
-                    {
-                        match crate::engine::pro_edit::perform_pro_edit(
-                            "LlamaParse",
-                            async {
-                                client
-                                    .parse_statement(&path)
-                                    .await
-                                    .map_err(anyhow::Error::from)
-                            },
-                            wdog.clone(),
-                        )
-                        .await
-                        {
-                            Ok(stmt) => final_txs = Some(stmt.transactions),
-                            Err(e) => tracing::warn!("[extract] LlamaParse failed: {}", e),
-                        }
-                    }
-                }
 
-                // 2. Try Document AI
-                if final_txs.is_none() {
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: "Extracting with Document AI...".to_string(),
-                        fraction: 0.15,
-                    });
-                    if let Ok(client) =
-                        crate::ai::document_ai::DocumentAiClient::from_app_config(&cfg)
-                    {
-                        let doc_ai: std::sync::Arc<crate::ai::document_ai::DocumentAiClient> =
-                            Arc::new(client);
-                        match crate::engine::pro_edit::perform_pro_edit(
-                            "DocumentAI",
-                            async {
-                                doc_ai
-                                    .parse_entire_statement(&path, None::<&str>)
+                    let attempt: Result<crate::ai::document_ai::BankStatement, String> =
+                        match provider {
+                            crate::app::config::DocumentParserMode::LlamaParse => {
+                                match crate::ai::llamaparse::LlamaParseClient::from_app_config(&cfg) {
+                                    Ok(client) => crate::engine::pro_edit::perform_pro_edit(
+                                        "LlamaParse",
+                                        async {
+                                            client
+                                                .parse_statement(&path)
+                                                .await
+                                                .map_err(anyhow::Error::from)
+                                        },
+                                        wdog.clone(),
+                                    )
                                     .await
-                                    .map_err(anyhow::Error::from)
-                            },
-                            wdog.clone(),
-                        )
-                        .await
-                        {
-                            Ok(stmt) => final_txs = Some(stmt.transactions),
-                            Err(e) => tracing::warn!("[extract] Document AI failed: {}", e),
+                                    .map_err(|error| error.to_string()),
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                            crate::app::config::DocumentParserMode::DocumentAi => {
+                                match crate::ai::document_ai::DocumentAiClient::from_app_config(&cfg)
+                                {
+                                    Ok(client) => {
+                                        let client = Arc::new(client);
+                                        crate::engine::pro_edit::perform_pro_edit(
+                                            "DocumentAI",
+                                            async {
+                                                client
+                                                    .parse_entire_statement(&path, None::<&str>)
+                                                    .await
+                                                    .map_err(anyhow::Error::from)
+                                            },
+                                            wdog.clone(),
+                                        )
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                            crate::app::config::DocumentParserMode::OfflineHeuristic => {
+                                let engine = eng.clone();
+                                let input = path.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    crate::engine::offline_parser::parse_statement_offline(
+                                        &input, engine,
+                                    )
+                                })
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(error) => {
+                                        Err(format!("offline parser task failed: {error}"))
+                                    }
+                                }
+                            }
+                            crate::app::config::DocumentParserMode::LocalOcrs => Err(
+                                "Local OCR PDF parsing is not supported in v1; select Offline Heuristic"
+                                    .to_string(),
+                            ),
+                        };
+
+                    let mut statement = match attempt {
+                        Ok(statement) => statement,
+                        Err(error) => {
+                            failures.push(format!("{}: {error}", provider.label()));
+                            continue;
                         }
-                    }
-                }
-                // 4. Try Offline Parser
-                let transactions = if let Some(txs) = final_txs {
-                    txs
-                } else {
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: "Using offline parser...".to_string(),
-                        fraction: 0.3,
-                    });
-                    let eng_clone = eng.clone();
-                    let path_clone = path.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        crate::engine::offline_parser::parse_statement_offline(
-                            &path_clone,
-                            eng_clone,
-                        )
+                    };
+                    statement.ensure_canonical_metadata();
+
+                    let template_provider = Arc::new(crate::extractors::BankTemplateProvider::new(
+                        std::path::PathBuf::from("bank_templates").as_path(),
+                        eng.clone(),
+                    ));
+                    let merger = crate::extractors::HybridMerger::new(vec![
+                        template_provider as Arc<dyn crate::extractors::GeometryProvider>,
+                    ]);
+                    let input = path.clone();
+                    let transactions = std::mem::take(&mut statement.transactions);
+                    let report = match tokio::task::spawn_blocking(move || {
+                        let mut geometries = Vec::new();
+                        for geometry_provider in &merger.providers {
+                            if let Ok(geometry) = geometry_provider.extract_line_geometry(&input) {
+                                geometries.extend(geometry);
+                            }
+                        }
+                        merger.merge(transactions, geometries)
                     })
                     .await
                     {
-                        Ok(Ok(stmt)) => stmt.transactions,
-                        Ok(Err(e)) => {
-                            let _ = res_tx.send(JobResult::Error {
-                                job_label: "extract_transactions".into(),
-                                message: format!("Offline extraction failed: {e}"),
-                            });
-                            return;
+                        Ok(report) => report,
+                        Err(error) => {
+                            failures.push(format!(
+                                "{} geometry merge failed: {error}",
+                                provider.label()
+                            ));
+                            continue;
                         }
-                        Err(e) => {
-                            let _ = res_tx.send(JobResult::Error {
-                                job_label: "extract_transactions".into(),
-                                message: format!("Offline extraction panicked: {e}"),
-                            });
-                            return;
-                        }
+                    };
+                    statement.transactions = report.transactions;
+                    statement.ensure_canonical_metadata();
+
+                    let issues = crate::engine::workflow::deterministic_parse_issues(
+                        statement.total_pages,
+                        &statement.transactions,
+                        statement.opening_balance,
+                        statement.closing_balance,
+                    );
+                    if issues.is_empty() {
+                        accepted_statement = Some(statement);
+                        break;
                     }
-                };
+                    failures.push(format!(
+                        "{} output rejected: {}",
+                        provider.label(),
+                        issues.join("; ")
+                    ));
+                }
 
-                let template_provider = Arc::new(crate::extractors::BankTemplateProvider::new(
-                    std::path::PathBuf::from("bank_templates").as_path(),
-                    eng.clone(),
-                ));
-
-                let merger = crate::extractors::HybridMerger::new(vec![
-                    template_provider as Arc<dyn crate::extractors::GeometryProvider>,
-                ]);
-
-                let path_clone = path.clone();
-                let report = match tokio::task::spawn_blocking(move || {
-                    let mut geometries = Vec::new();
-                    for provider in &merger.providers {
-                        if let Ok(geo) = provider.extract_line_geometry(&path_clone) {
-                            geometries.extend(geo);
-                        }
-                    }
-                    merger.merge(transactions, geometries)
-                })
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
+                let statement = match accepted_statement {
+                    Some(statement) => statement,
+                    None => {
                         let _ = res_tx.send(JobResult::Error {
                             job_label: "extract_transactions".into(),
-                            message: format!("Geometry extraction panicked: {e}"),
+                            message: format!(
+                                "Extraction incomplete: no transaction rows passed deterministic validation. {}",
+                                failures.join(" | ")
+                            ),
                         });
                         return;
                     }
                 };
 
-                if report.transactions.is_empty() {
-                    let _ = res_tx.send(JobResult::Error {
-                        job_label: "extract_transactions".into(),
-                        message: "Extraction incomplete: no transaction rows were found. No empty result was published."
-                            .into(),
-                    });
-                    return;
-                }
-
-                let mut full_stmt = crate::ai::document_ai::BankStatement {
-                    total_pages: 0,
-                    transactions: Vec::new(),
-                    opening_balance: rust_decimal::Decimal::ZERO,
-                    closing_balance: rust_decimal::Decimal::ZERO,
-                    account_number: None,
-                    bank_name: None,
-                };
-                full_stmt.transactions = report.transactions.clone();
                 {
                     let mut cache = cache_for_job.lock().await;
-                    cache.put(cache_key, full_stmt);
+                    cache.put(cache_key, statement.clone());
                 }
-
-                let _ = res_tx.send(JobResult::TransactionsExtracted(report.transactions));
+                let _ = res_tx.send(JobResult::TransactionsExtracted(statement.transactions));
             });
         }
         Job::BalanceStatement { path } => {
@@ -8901,6 +8929,34 @@ mod tests {
         // Cleanup
         drop(job_tx);
         handle.abort();
+    }
+
+    #[test]
+    fn extraction_router_honors_selected_provider_without_unrelated_cloud_calls() {
+        use crate::app::config::DocumentParserMode;
+
+        assert_eq!(
+            extraction_provider_order(DocumentParserMode::OfflineHeuristic),
+            vec![DocumentParserMode::OfflineHeuristic]
+        );
+        assert_eq!(
+            extraction_provider_order(DocumentParserMode::LlamaParse),
+            vec![
+                DocumentParserMode::LlamaParse,
+                DocumentParserMode::OfflineHeuristic
+            ]
+        );
+        assert_eq!(
+            extraction_provider_order(DocumentParserMode::DocumentAi),
+            vec![
+                DocumentParserMode::DocumentAi,
+                DocumentParserMode::OfflineHeuristic
+            ]
+        );
+        assert_eq!(
+            extraction_provider_order(DocumentParserMode::LocalOcrs),
+            vec![DocumentParserMode::LocalOcrs]
+        );
     }
 
     #[test]

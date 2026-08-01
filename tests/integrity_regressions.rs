@@ -186,6 +186,50 @@ fn confirm_and_render_rejects_unbalanced_ledger_before_output_mutation() {
 }
 
 #[test]
+fn ordered_offline_router_extracts_complete_canonical_ledger() {
+    let workspace = tempfile::tempdir().unwrap();
+    let input = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/stress_pdfs/Standard_Bank_Statement_01.pdf");
+    let config = Arc::new(dual_core_pdf_pipeline::app::config::AppConfig::default());
+    let audit_log = dual_core_pdf_pipeline::app::audit::AuditLog::open(workspace.path()).unwrap();
+    let (_runtime, job_tx, result_rx) =
+        dual_core_pdf_pipeline::app::runtime::Runtime::start(audit_log, config);
+
+    job_tx
+        .send(Job::ExtractTransactions {
+            path: input,
+            parser_mode: dual_core_pdf_pipeline::app::config::DocumentParserMode::OfflineHeuristic,
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        match result_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(JobResult::TransactionsExtracted(transactions)) => {
+                assert_eq!(transactions.len(), 30);
+                for transaction in transactions {
+                    assert_eq!(
+                        transaction.canonical.stable_row_id,
+                        format!("p{}:r{}", transaction.page, transaction.line_on_page)
+                    );
+                    assert!(transaction
+                        .canonical
+                        .confidence
+                        .is_some_and(|value| value >= 0.85));
+                    assert!(!transaction.canonical.review_required);
+                }
+                return;
+            }
+            Ok(JobResult::Error { message, .. }) => panic!("offline extraction failed: {message}"),
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("result channel failed: {error}"),
+        }
+    }
+    panic!("offline extraction did not produce a terminal result");
+}
+
+#[test]
 fn zero_row_statement_is_never_reported_as_extraction_or_balance_success() {
     let workspace = tempfile::tempdir().unwrap();
     let input = workspace.path().join("non-statement.pdf");
@@ -199,6 +243,7 @@ fn zero_row_statement_is_never_reported_as_extraction_or_balance_success() {
     job_tx
         .send(Job::ExtractTransactions {
             path: input.clone(),
+            parser_mode: dual_core_pdf_pipeline::app::config::DocumentParserMode::OfflineHeuristic,
         })
         .unwrap();
     let extract_deadline = Instant::now() + Duration::from_secs(45);
