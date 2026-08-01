@@ -105,13 +105,18 @@ class MutationTransaction:
             raise ProtocolError("OUTPUT_ARTIFACT_EMPTY", "staged output is empty")
         sha256 = _sha256_file(self.stage_path)
         os.replace(self.stage_path, self.final_path)
-        try:
-            directory_fd = os.open(self.final_path.parent, os.O_RDONLY)
-        except OSError:
-            directory_fd = None
+        directory_fd = None
+        if os.name != "nt":
+            try:
+                directory_fd = os.open(self.final_path.parent, os.O_RDONLY)
+            except OSError:
+                directory_fd = None
         if directory_fd is not None:
             try:
                 os.fsync(directory_fd)
+            except OSError:
+                # Some Unix filesystems do not support fsync on directories.
+                pass
             finally:
                 os.close(directory_fd)
         return {
