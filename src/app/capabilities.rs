@@ -78,34 +78,63 @@ impl CapabilityRegistry {
     pub fn probe(config: &AppConfig, app_paths: &AppPaths) -> Self {
         let mut registry = Self::default();
 
-        match crate::ai::pyo3_bridge::PyEngine::init() {
-            Ok(_) => registry.set(
-                Capability::PythonPipeline,
-                CapabilityStatus::ready(
-                    "Python and the embedded PyMuPDF bridge imported successfully",
-                ),
-            ),
+        let mut worker_pro_package = false;
+        match crate::ai::python_worker::PythonWorkerSupervisor::start(
+            crate::ai::python_worker::PythonWorkerConfig::default(),
+        ) {
+            Ok(mut supervisor) => {
+                let handshake = supervisor.handshake().cloned();
+                supervisor.shutdown();
+                match handshake {
+                    Some(handshake) if handshake.ready => {
+                        worker_pro_package = handshake.pro_package_available;
+                        registry.set(
+                            Capability::PythonPipeline,
+                            CapabilityStatus::ready(format!(
+                                "Supervised Python {} worker is ready with PyMuPDF {}",
+                                handshake.python_version,
+                                handshake.pymupdf_version.as_deref().unwrap_or("unknown")
+                            )),
+                        );
+                    }
+                    Some(handshake) => registry.set(
+                        Capability::PythonPipeline,
+                        CapabilityStatus::unavailable(format!(
+                            "Python worker started but bridge import failed ({})",
+                            handshake.bridge_error_class.as_deref().unwrap_or("unknown")
+                        )),
+                    ),
+                    None => registry.set(
+                        Capability::PythonPipeline,
+                        CapabilityStatus::unavailable(
+                            "Python worker did not provide a capability handshake",
+                        ),
+                    ),
+                }
+            }
             Err(error) => registry.set(
                 Capability::PythonPipeline,
                 CapabilityStatus::unavailable(format!(
-                    "Python/PyMuPDF bridge initialization failed: {error}"
+                    "Supervised Python worker initialization failed: {error}"
                 )),
             ),
         }
 
         let python_ready = registry.is_ready(Capability::PythonPipeline);
-        if config.pro_editing_available() && python_ready {
+        if config.pro_editing_available() && python_ready && worker_pro_package {
             registry.set(
                 Capability::PyMuPdfPro,
                 CapabilityStatus::configured(
-                    "PyMuPDF Pro key is configured; entitlement is verified on first unlock",
+                    "PyMuPDF Pro package and key are configured; entitlement is verified on first unlock",
                 ),
             );
         } else {
             let reason = if !python_ready {
-                "PyMuPDF Pro requires the Python pipeline"
+                "PyMuPDF Pro requires the supervised Python pipeline".to_string()
+            } else if !worker_pro_package {
+                "PyMuPDF Pro package is not installed in the worker runtime".to_string()
             } else {
-                config.pro_editing_status_reason()
+                config.pro_editing_status_reason().to_string()
             };
             registry.set(
                 Capability::PyMuPdfPro,
