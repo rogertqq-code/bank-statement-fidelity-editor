@@ -179,7 +179,12 @@ fn test_native_engine_apply_many_edits_baseline() {
     assert_eq!(out_blocks[1].text, "Beta");
 }
 
-fn create_pdf_with_operations(path: &Path, operations: Vec<Operation>, rotation: Option<i64>) {
+fn create_pdf_with_operations(
+    path: &Path,
+    operations: Vec<Operation>,
+    rotation: Option<i64>,
+    crop_box: Option<[f32; 4]>,
+) {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -203,6 +208,9 @@ fn create_pdf_with_operations(path: &Path, operations: Vec<Operation>, rotation:
     };
     if let Some(rotation) = rotation {
         page.set("Rotate", rotation);
+    }
+    if let Some([x0, y0, x1, y1]) = crop_box {
+        page.set("CropBox", vec![x0.into(), y0.into(), x1.into(), y1.into()]);
     }
     let page_id = doc.add_object(page);
     doc.objects.insert(
@@ -333,6 +341,7 @@ fn native_batch_applies_one_ctm_transformed_target_exactly() {
             Operation::new("Q", vec![]),
         ],
         None,
+        None,
     );
     let engine = OxidizePdfEngine::new();
     let blocks = engine.get_text_blocks(&input, 0).unwrap();
@@ -355,7 +364,59 @@ fn native_batch_applies_one_ctm_transformed_target_exactly() {
 }
 
 #[test]
-fn native_batch_rejects_rotated_page_without_publishing() {
+fn native_batch_applies_one_cropped_target_at_visible_geometry() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("cropped-input.pdf");
+    let output = dir.path().join("cropped-output.pdf");
+    create_pdf_with_operations(
+        &input,
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.0.into()]),
+            Operation::new(
+                "Tm",
+                vec![
+                    1.0.into(),
+                    0.0.into(),
+                    0.0.into(),
+                    1.0.into(),
+                    82.0.into(),
+                    740.0.into(),
+                ],
+            ),
+            Operation::new(
+                "Tj",
+                vec![Object::String(b"CROPPED".to_vec(), StringFormat::Literal)],
+            ),
+            Operation::new("ET", vec![]),
+        ],
+        None,
+        Some([10.0, 20.0, 585.0, 822.0]),
+    );
+    let engine = OxidizePdfEngine::new();
+    let blocks = engine.get_text_blocks(&input, 0).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert!((blocks[0].bbox[0] - 72.0).abs() < 0.01);
+    assert!((blocks[0].bbox[1] - 70.0).abs() < 0.01);
+    let edits = serde_json::json!([{
+        "page": 0,
+        "rect": blocks[0].bbox,
+        "old_text": "CROPPED",
+        "new_text": "UPDATED"
+    }]);
+
+    let applied = engine
+        .apply_many_edits(&input, &output, &edits.to_string(), None)
+        .unwrap();
+    assert_eq!(applied, 1);
+    let output_blocks = engine.get_text_blocks(&output, 0).unwrap();
+    assert_eq!(output_blocks[0].text, "UPDATED");
+    assert!((output_blocks[0].bbox[0] - blocks[0].bbox[0]).abs() < 0.01);
+    assert!((output_blocks[0].bbox[1] - blocks[0].bbox[1]).abs() < 0.01);
+}
+
+#[test]
+fn native_batch_applies_one_rotated_target_at_visible_geometry() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("rotated-input.pdf");
     let output = dir.path().join("rotated-output.pdf");
@@ -382,6 +443,7 @@ fn native_batch_rejects_rotated_page_without_publishing() {
             Operation::new("ET", vec![]),
         ],
         Some(90),
+        None,
     );
     std::fs::write(&output, b"prior-output").unwrap();
     let engine = OxidizePdfEngine::new();
@@ -393,9 +455,14 @@ fn native_batch_rejects_rotated_page_without_publishing() {
         "new_text": "REPLACED"
     }]);
 
-    let result = engine.apply_many_edits(&input, &output, &edits.to_string(), None);
-    assert!(
-        matches!(result, Err(EngineError::ApplyFailed(message)) if message.contains("rotation 90"))
-    );
-    assert_eq!(std::fs::read(&output).unwrap(), b"prior-output");
+    let applied = engine
+        .apply_many_edits(&input, &output, &edits.to_string(), None)
+        .unwrap();
+    assert_eq!(applied, 1);
+    let output_blocks = engine.get_text_blocks(&output, 0).unwrap();
+    assert_eq!(output_blocks.len(), 1);
+    assert_eq!(output_blocks[0].text, "REPLACED");
+    assert!((output_blocks[0].bbox[0] - bbox[0]).abs() < 0.01);
+    assert!((output_blocks[0].bbox[1] - bbox[1]).abs() < 0.01);
+    assert_ne!(std::fs::read(&output).unwrap(), b"prior-output");
 }

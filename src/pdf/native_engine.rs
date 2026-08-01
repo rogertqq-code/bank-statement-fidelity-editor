@@ -64,9 +64,11 @@ impl OxidizePdfEngine {
                 EngineError::ExtractFailed(format!("Failed to decode content stream: {error}"))
             })?
             .operations;
-        let targets = collect_native_text_targets(&operations, page_box).map_err(|error| {
-            EngineError::ExtractFailed(format!("Failed to map positioned text: {error}"))
-        })?;
+        let rotation = inherited_page_rotation(&document, page_id);
+        let targets =
+            collect_native_text_targets(&operations, page_box, rotation).map_err(|error| {
+                EngineError::ExtractFailed(format!("Failed to map positioned text: {error}"))
+            })?;
         Ok(targets
             .into_iter()
             .map(|target| TextBlock {
@@ -102,15 +104,73 @@ struct CanonicalPageBox {
 }
 
 impl CanonicalPageBox {
-    fn content_span_to_top_left(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
-        [
-            x - self.x_min,
-            self.y_max - (y + height),
-            x - self.x_min + width,
-            self.y_max - y,
-        ]
+    fn width(self) -> f32 {
+        self.x_max - self.x_min
     }
 
+    fn height(self) -> f32 {
+        self.y_max - self.y_min
+    }
+
+    fn content_point_to_top_left(
+        self,
+        x: f32,
+        y: f32,
+        rotation: i32,
+    ) -> Result<(f32, f32), EngineError> {
+        let unrotated_x = x - self.x_min;
+        let unrotated_y = self.y_max - y;
+        match rotation.rem_euclid(360) {
+            0 => Ok((unrotated_x, unrotated_y)),
+            90 => Ok((self.height() - unrotated_y, unrotated_x)),
+            180 => Ok((self.width() - unrotated_x, self.height() - unrotated_y)),
+            270 => Ok((unrotated_y, self.width() - unrotated_x)),
+            value => Err(EngineError::ApplyFailed(format!(
+                "unsupported page rotation {value}; expected a multiple of 90 degrees"
+            ))),
+        }
+    }
+
+    fn content_rect_to_top_left(
+        self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        rotation: i32,
+    ) -> Result<[f32; 4], EngineError> {
+        let corners = [
+            self.content_point_to_top_left(x0, y0, rotation)?,
+            self.content_point_to_top_left(x1, y0, rotation)?,
+            self.content_point_to_top_left(x0, y1, rotation)?,
+            self.content_point_to_top_left(x1, y1, rotation)?,
+        ];
+        let min_x = corners
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = corners
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::INFINITY, f32::min);
+        let max_y = corners
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Ok([min_x, min_y, max_x, max_y])
+    }
+
+    #[cfg(test)]
+    fn content_span_to_top_left(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+        self.content_rect_to_top_left(x, y, x + width, y + height, 0)
+            .expect("zero-degree page rotation is always supported")
+    }
+
+    #[cfg(test)]
     fn top_left_to_content(self, bbox: [f32; 4]) -> [f32; 4] {
         [
             self.x_min + bbox[0],
@@ -274,11 +334,12 @@ fn operation_text_and_advance(
 
 fn canonical_text_bbox(
     page_box: CanonicalPageBox,
+    rotation: i32,
     ctm: PdfMatrix,
     text_matrix: PdfMatrix,
     advance: f32,
     font_size: f32,
-) -> [f32; 4] {
+) -> Result<[f32; 4], EngineError> {
     let render = matrix_multiply(ctm, text_matrix);
     let corners = [
         transform_point(render, 0.0, 0.0),
@@ -302,12 +363,13 @@ fn canonical_text_bbox(
         .iter()
         .map(|point| point.1)
         .fold(f32::NEG_INFINITY, f32::max);
-    page_box.content_span_to_top_left(min_x, min_y, max_x - min_x, max_y - min_y)
+    page_box.content_rect_to_top_left(min_x, min_y, max_x, max_y, rotation)
 }
 
 fn collect_native_text_targets(
     operations: &[lopdf::content::Operation],
     page_box: CanonicalPageBox,
+    rotation: i32,
 ) -> Result<Vec<NativeTextTarget>, EngineError> {
     let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut ctm = identity;
@@ -413,7 +475,9 @@ fn collect_native_text_targets(
                         targets.push(NativeTextTarget {
                             operation_index,
                             text,
-                            bbox: canonical_text_bbox(page_box, ctm, tm, advance, font_size),
+                            bbox: canonical_text_bbox(
+                                page_box, rotation, ctm, tm, advance, font_size,
+                            )?,
                             font: current_font.clone(),
                             size: font_size,
                         });
@@ -821,218 +885,26 @@ impl PdfEngine for OxidizePdfEngine {
         bbox: [f32; 4],
         new_text: &str,
         old_text: &str,
-        _font_path: Option<&Path>,
+        font_path: Option<&Path>,
     ) -> Result<ReplaceOutcome, EngineError> {
-        // Stage 1 Strict Font Guard:
-        // The native engine blindly writes into the content stream. If the embedded
-        // font subset is missing glyphs, the PDF will show boxes. As a robust heuristic,
-        // if the new text contains non-ASCII characters (e.g. symbols, CJK), we refuse
-        // to edit so the Selector auto-falls back to PyMuPDF Pro which has font replication.
-        if !new_text.is_ascii() {
-            return Err(EngineError::FontCoverageMissing(
-                "Native engine requires ASCII for safe subset coverage; complex chars detected"
-                    .into(),
-            ));
+        let edits_json = serde_json::json!([{
+            "page": page,
+            "rect": bbox,
+            "old_text": old_text,
+            "new_text": new_text,
+        }])
+        .to_string();
+        let applied = self.apply_many_edits(input, output, &edits_json, font_path)?;
+        if applied != 1 {
+            return Err(EngineError::ApplyFailed(format!(
+                "native single edit applied {applied}/1 targets"
+            )));
         }
-
-        // Load the document
-        let mut doc =
-            lopdf::Document::load(input).map_err(|e| EngineError::LoadFailed(format!("{e}")))?;
-
-        let pages = doc.get_pages();
-        let page_id = *pages.get(&(page as u32 + 1)).ok_or_else(|| {
-            EngineError::ApplyFailed(format!(
-                "Page {} not found (document has {} pages)",
-                page,
-                pages.len()
-            ))
-        })?;
-        let content_bbox = effective_page_box(&doc, page_id)?.top_left_to_content(bbox);
-
-        // Get the page content
-        let content_bytes = doc
-            .get_page_content(page_id)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to get page content: {e}")))?;
-
-        let mut content = lopdf::content::Content::decode(&content_bytes)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to decode content: {e}")))?;
-
-        // Walk the content stream and find the text span that overlaps `bbox`.
-        // Replace it with `new_text`.
-        let mut tm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
-        let mut tlm = tm;
-        let mut font_size: f32 = 12.0;
-        let mut text_leading: f32 = 0.0;
-        let mut in_text = false;
-        let mut replaced = false;
-
-        for op in &mut content.operations {
-            match op.operator.as_str() {
-                "BT" => {
-                    in_text = true;
-                    tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                    tlm = tm;
-                }
-                "ET" => {
-                    in_text = false;
-                }
-                "Tf" if in_text => {
-                    if op.operands.len() >= 2 {
-                        font_size = operand_to_f32(&op.operands[1]).unwrap_or(12.0);
-                    }
-                }
-                "Tl" if in_text => {
-                    if !op.operands.is_empty() {
-                        text_leading = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                    }
-                }
-                "Tm" if in_text => {
-                    if op.operands.len() >= 6 {
-                        for (i, operand) in op.operands.iter().enumerate().take(6) {
-                            tm[i] = operand_to_f32(operand).unwrap_or(0.0);
-                        }
-                        tlm = tm;
-                    }
-                }
-                "Td" if in_text => {
-                    if op.operands.len() >= 2 {
-                        let tx = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                        let ty = operand_to_f32(&op.operands[1]).unwrap_or(0.0);
-                        tlm[4] += tx;
-                        tlm[5] += ty;
-                        tm = tlm;
-                    }
-                }
-                "TD" if in_text => {
-                    if op.operands.len() >= 2 {
-                        let tx = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                        let ty = operand_to_f32(&op.operands[1]).unwrap_or(0.0);
-                        text_leading = -ty;
-                        tlm[4] += tx;
-                        tlm[5] += ty;
-                        tm = tlm;
-                    }
-                }
-                "T*" if in_text => {
-                    let shift = if text_leading == 0.0 {
-                        font_size
-                    } else {
-                        text_leading
-                    };
-                    tlm[5] -= shift;
-                    tm = tlm;
-                }
-                "Tj" if in_text && !replaced => {
-                    let x = tm[4];
-                    let y = tm[5];
-                    let x_matches = x >= content_bbox[0] - 5.0 && x <= content_bbox[2] + 5.0;
-                    let y_matches = y >= content_bbox[1] - 1.0 && y <= content_bbox[3] + 1.0;
-                    let coords_ok = x_matches && y_matches;
-
-                    // T2: Tightened span selection.
-                    // When text IS extractable, require both text AND coordinates to match.
-                    // Coordinate-only matching is only allowed for opaque/undecodable operators.
-                    let mut text_extractable = false;
-                    let mut text_matches = false;
-                    if let Some(text) = extract_string_operand(&op.operands) {
-                        text_extractable = true;
-                        if !text.trim().is_empty() && text.trim() == old_text.trim() {
-                            text_matches = true;
-                        }
-                    }
-
-                    let should_replace = if text_extractable {
-                        // Require both text match AND coordinate match
-                        text_matches && coords_ok
-                    } else {
-                        // Opaque operator: coordinate-only fallback
-                        coords_ok
-                    };
-
-                    if coords_ok {
-                        tracing::debug!(x, y, text_matches, text_extractable, "Tj span candidate");
-                    }
-
-                    if should_replace {
-                        // Replace the string operand
-                        if !op.operands.is_empty() {
-                            op.operands[0] = lopdf::Object::String(
-                                new_text.as_bytes().to_vec(),
-                                lopdf::StringFormat::Literal,
-                            );
-                            replaced = true;
-                        }
-                    }
-                }
-                "TJ" if in_text && !replaced => {
-                    let x = tm[4];
-                    let y = tm[5];
-                    let x_matches = x >= content_bbox[0] - 5.0 && x <= content_bbox[2] + 5.0;
-                    let y_matches = y >= content_bbox[1] - 1.0 && y <= content_bbox[3] + 1.0;
-                    let coords_ok = x_matches && y_matches;
-
-                    // T2: Tightened span selection (TJ variant).
-                    let mut text_extractable = false;
-                    let mut text_matches = false;
-                    if let Some(lopdf::Object::Array(ref arr)) = op.operands.first() {
-                        let mut combined = String::new();
-                        for item in arr {
-                            if let lopdf::Object::String(bytes, _) = item {
-                                combined.push_str(&String::from_utf8_lossy(bytes));
-                            }
-                        }
-                        text_extractable = true;
-                        if !combined.trim().is_empty() && combined.trim() == old_text.trim() {
-                            text_matches = true;
-                        }
-                    }
-
-                    let should_replace = if text_extractable {
-                        text_matches && coords_ok
-                    } else {
-                        coords_ok
-                    };
-
-                    if coords_ok {
-                        tracing::debug!(x, y, text_matches, text_extractable, "TJ span candidate");
-                    }
-
-                    if should_replace {
-                        // Replace the entire TJ array with a single Tj string
-                        op.operator = "Tj".to_string();
-                        op.operands = vec![lopdf::Object::String(
-                            new_text.as_bytes().to_vec(),
-                            lopdf::StringFormat::Literal,
-                        )];
-                        replaced = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if !replaced {
-            return Err(EngineError::ApplyFailed(
-                "No matching text span found at the specified bbox".into(),
-            ));
-        }
-
-        // Re-encode the content stream and set it back on the page
-        let new_content_bytes = content
-            .encode()
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to encode content: {e}")))?;
-
-        doc.change_page_content(page_id, new_content_bytes)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to update page: {e}")))?;
-
-        doc.save(output)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to save: {e}")))?;
-
         Ok(ReplaceOutcome {
             success: true,
-            font_used: "original".to_string(),
+            font_used: "original-content-stream-font".into(),
             overflow: false,
-            obj_id: Some(format!("ObjId({}, {})", page_id.0, page_id.1)),
+            obj_id: None,
         })
     }
 
@@ -1129,11 +1001,6 @@ impl PdfEngine for OxidizePdfEngine {
                 .get(&(page_index as u32 + 1))
                 .ok_or_else(|| EngineError::ApplyFailed(format!("Page {page_index} not found")))?;
             let rotation = inherited_page_rotation(&document, page_id);
-            if rotation != 0 {
-                return Err(EngineError::ApplyFailed(format!(
-                    "native exact editor does not support page {page_index} rotation {rotation}; use the Pro engine"
-                )));
-            }
             let page_box = effective_page_box(&document, page_id)?;
             let content_bytes = document.get_page_content(page_id).map_err(|error| {
                 EngineError::ApplyFailed(format!(
@@ -1148,7 +1015,7 @@ impl PdfEngine for OxidizePdfEngine {
             let mut content = lopdf::content::Content::decode(&content_bytes).map_err(|error| {
                 EngineError::ApplyFailed(format!("Failed to decode page {page_index}: {error}"))
             })?;
-            let targets = collect_native_text_targets(&content.operations, page_box)?;
+            let targets = collect_native_text_targets(&content.operations, page_box, rotation)?;
             let mut selected_operations = std::collections::HashSet::new();
             let mut replacements = Vec::new();
 
@@ -1312,6 +1179,53 @@ mod tests {
         assert_eq!(
             page_box.top_left_to_content(canonical),
             [82.0, 740.0, 202.0, 752.0]
+        );
+    }
+
+    #[test]
+    fn crop_origin_rotation_mappings_are_exact() {
+        let page_box = CanonicalPageBox {
+            x_min: 10.0,
+            y_min: 20.0,
+            x_max: 110.0,
+            y_max: 220.0,
+        };
+        let content_rect = [20.0, 30.0, 40.0, 50.0];
+        assert_eq!(
+            page_box
+                .content_rect_to_top_left(
+                    content_rect[0],
+                    content_rect[1],
+                    content_rect[2],
+                    content_rect[3],
+                    90,
+                )
+                .unwrap(),
+            [10.0, 10.0, 30.0, 30.0]
+        );
+        assert_eq!(
+            page_box
+                .content_rect_to_top_left(
+                    content_rect[0],
+                    content_rect[1],
+                    content_rect[2],
+                    content_rect[3],
+                    180,
+                )
+                .unwrap(),
+            [70.0, 10.0, 90.0, 30.0]
+        );
+        assert_eq!(
+            page_box
+                .content_rect_to_top_left(
+                    content_rect[0],
+                    content_rect[1],
+                    content_rect[2],
+                    content_rect[3],
+                    270,
+                )
+                .unwrap(),
+            [170.0, 70.0, 190.0, 90.0]
         );
     }
 
