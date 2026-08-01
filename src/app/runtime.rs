@@ -878,6 +878,31 @@ impl ResultSink {
     }
 }
 
+type InteractiveFallbackRouter = std::sync::Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<String>>,
+    >,
+>;
+
+async fn wait_for_interactive_choice(
+    router: &InteractiveFallbackRouter,
+    request_id: uuid::Uuid,
+    receiver: tokio::sync::oneshot::Receiver<String>,
+    timeout: std::time::Duration,
+) -> Result<String, &'static str> {
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(choice)) => Ok(choice),
+        Ok(Err(_)) => {
+            router.lock().await.remove(&request_id);
+            Err("response channel closed")
+        }
+        Err(_) => {
+            router.lock().await.remove(&request_id);
+            Err("interactive response timed out")
+        }
+    }
+}
+
 fn spawn_job_lifecycle_monitor(
     result_sink: ResultSink,
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -1574,11 +1599,7 @@ async fn process_job_inner(
     api_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     segment_map: &mut Option<SegmentMap>,
     segment_manager: &mut Option<SegmentManager>,
-    fallback_router: std::sync::Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<String>>,
-        >,
-    >,
+    fallback_router: InteractiveFallbackRouter,
     parse_cache: std::sync::Arc<
         tokio::sync::Mutex<lru::LruCache<String, crate::ai::document_ai::BankStatement>>,
     >,
@@ -2140,13 +2161,30 @@ async fn process_job_inner(
                             req = req.add_alternative("cancel", "Cancel Transfer", None);
 
                             let (tx, rx) = tokio::sync::oneshot::channel();
+                            let request_id = req.id;
                             {
                                 let mut map = router.lock().await;
-                                map.insert(req.id, tx);
+                                map.insert(request_id, tx);
                             }
                             let _ = res_tx.send(JobResult::InteractiveFallbackRequired(req));
 
-                            let choice = rx.await.unwrap_or_else(|_| "cancel".to_string());
+                            let choice = match wait_for_interactive_choice(
+                                &router,
+                                request_id,
+                                rx,
+                                std::time::Duration::from_secs(300),
+                            )
+                            .await
+                            {
+                                Ok(choice) => choice,
+                                Err(reason) => {
+                                    let _ = res_tx.send(JobResult::TransferFailed {
+                                        stage: "AiFormatMapping".into(),
+                                        message: format!("Interactive fallback {reason}"),
+                                    });
+                                    return;
+                                }
+                            };
                             if choice == "cancel" {
                                 let _ = res_tx.send(JobResult::TransferFailed {
                                     stage: "AiFormatMapping".into(),
@@ -3025,13 +3063,29 @@ async fn process_job_inner(
                             req = req.add_alternative("finish", "Use Best Result & Finish", None);
 
                             let (tx, rx) = tokio::sync::oneshot::channel();
+                            let request_id = req.id;
                             {
                                 let mut map = router.lock().await;
-                                map.insert(req.id, tx);
+                                map.insert(request_id, tx);
                             }
                             let _ = res_tx.send(JobResult::InteractiveFallbackRequired(req));
 
-                            let choice = rx.await.unwrap_or_else(|_| "finish".to_string());
+                            let choice = match wait_for_interactive_choice(
+                                &router,
+                                request_id,
+                                rx,
+                                std::time::Duration::from_secs(300),
+                            )
+                            .await
+                            {
+                                Ok(choice) => choice,
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        "[TRANSFER] Interactive fallback {reason}; using best verified result"
+                                    );
+                                    "finish".to_string()
+                                }
+                            };
                             if choice == "finish" {
                                 tracing::info!("[TRANSFER] User chose to finish with best result.");
                                 break;
@@ -5945,12 +5999,23 @@ async fn process_job_inner(
                                         req = req.add_alternative("cancel", "Cancel Workflow", None);
 
                                         let (tx, rx) = tokio::sync::oneshot::channel();
+                                        let request_id = req.id;
                                         {
                                             let mut map = $router.lock().await;
-                                            map.insert(req.id, tx);
+                                            map.insert(request_id, tx);
                                         }
                                         let _ = $res_tx.send(JobResult::InteractiveFallbackRequired(req));
-                                        let choice = rx.await.unwrap_or_else(|_| "cancel".to_string());
+                                        let choice = wait_for_interactive_choice(
+                                            &$router,
+                                            request_id,
+                                            rx,
+                                            std::time::Duration::from_secs(300),
+                                        )
+                                        .await
+                                        .unwrap_or_else(|reason| {
+                                            tracing::warn!("[parser] Interactive fallback {reason}; cancelling workflow");
+                                            "cancel".to_string()
+                                        });
                                         match choice.as_str() {
 
                                             "document_ai" => Some(DocumentParserMode::DocumentAi),
@@ -7985,6 +8050,46 @@ mod tests {
             cancel.job,
             Job::Cancel { id } if id == ticket.metadata().job_id
         ));
+    }
+
+    #[tokio::test]
+    async fn interactive_fallback_timeout_removes_stale_route() {
+        let router: InteractiveFallbackRouter =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let request_id = uuid::Uuid::new_v4();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        router.lock().await.insert(request_id, sender);
+
+        let result = wait_for_interactive_choice(
+            &router,
+            request_id,
+            receiver,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, Err("interactive response timed out"));
+        assert!(!router.lock().await.contains_key(&request_id));
+    }
+
+    #[tokio::test]
+    async fn interactive_fallback_routes_exact_response() {
+        let router: InteractiveFallbackRouter =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let request_id = uuid::Uuid::new_v4();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        router.lock().await.insert(request_id, sender);
+        let response_sender = router.lock().await.remove(&request_id).unwrap();
+        response_sender.send("offline_parser".to_string()).unwrap();
+
+        let result = wait_for_interactive_choice(
+            &router,
+            request_id,
+            receiver,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.as_deref(), Ok("offline_parser"));
+        assert!(!router.lock().await.contains_key(&request_id));
     }
 
     #[tokio::test]
