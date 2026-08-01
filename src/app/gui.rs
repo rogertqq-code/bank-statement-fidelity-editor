@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::app::modals::AppModals;
-use crate::app::runtime::{Job, JobResult, PythonJob, PythonJobResult};
+use crate::app::runtime::{Job, JobResult, PythonJob, PythonJobResult, RuntimeClient};
 use crate::engine::history::ChangeHistory;
 use crate::engine::verification::VerificationReport;
 use egui_plot::PlotPoints;
@@ -264,7 +264,7 @@ pub struct MyApp {
     toasts: VecDeque<Toast>,
 
     // Channels
-    pub job_tx: std::sync::mpsc::Sender<Job>,
+    pub job_tx: RuntimeClient,
     pub job_rx: std::sync::mpsc::Receiver<JobResult>,
     pending_python: Option<tokio::sync::oneshot::Receiver<PythonJobResult>>,
 
@@ -402,11 +402,12 @@ pub struct MyApp {
 }
 
 impl MyApp {
-    pub fn new(
-        job_tx: std::sync::mpsc::Sender<Job>,
+    pub fn new<T: Into<RuntimeClient>>(
+        job_tx: T,
         job_rx: std::sync::mpsc::Receiver<JobResult>,
         config: std::sync::Arc<crate::app::config::AppConfig>,
     ) -> Self {
+        let job_tx = job_tx.into();
         let settings: AppSettings =
             confy::load("bank-statement-modifier", None).unwrap_or_default();
         let input_path = settings
@@ -1172,7 +1173,7 @@ impl MyApp {
                         ignore_font_coverage: false,
                         ignore_visual_fidelity: false,
                     }) {
-                        Ok(()) => {
+                        Ok(_) => {
                             self.in_flight += 1;
                             self.toast(ToastKind::Info, "Confirm + Render triggered (Ctrl+3)");
                         }
@@ -5235,7 +5236,7 @@ fn load_icon() -> egui::IconData {
 }
 
 pub fn run_gui(
-    job_tx: std::sync::mpsc::Sender<Job>,
+    job_tx: RuntimeClient,
     job_rx: std::sync::mpsc::Receiver<JobResult>,
     config: std::sync::Arc<crate::app::config::AppConfig>,
 ) -> Result<(), eframe::Error> {

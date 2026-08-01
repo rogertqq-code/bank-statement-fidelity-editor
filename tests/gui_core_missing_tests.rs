@@ -1,11 +1,11 @@
 use dual_core_pdf_pipeline::app::audit::AuditLog;
 use dual_core_pdf_pipeline::app::config::AppConfig;
-use dual_core_pdf_pipeline::app::runtime::{Job, JobResult, Runtime};
+use dual_core_pdf_pipeline::app::runtime::{Job, JobResult, Runtime, RuntimeClient};
 use dual_core_pdf_pipeline::engine::model::{FieldBboxes, Provenance, Transaction};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn setup_worker() -> (Runtime, mpsc::Sender<Job>, mpsc::Receiver<JobResult>) {
+fn setup_worker() -> (Runtime, RuntimeClient, mpsc::Receiver<JobResult>) {
     let audit_log = AuditLog::open("audit.log").unwrap();
     let config = Arc::new(AppConfig::default());
     Runtime::start(audit_log, config)

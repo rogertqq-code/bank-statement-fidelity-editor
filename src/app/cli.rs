@@ -3,12 +3,12 @@
 
 use crate::app::audit::AuditLogParser;
 use crate::app::env_spec::{self, Requirement};
-use crate::app::runtime::{Job, JobResult};
+use crate::app::runtime::{Job, JobResult, RuntimeClient};
 use crate::engine::history::ChangeHistory;
 use crate::error::exit_code;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 
 #[derive(Parser)]
 #[command(name = "dual-core-pdf-pipeline")]
@@ -365,7 +365,7 @@ fn wait_for_terminal_result(job_rx: &Receiver<JobResult>) -> Result<JobResult, (
 /// the edit changed the page (and only locally). Drives the same Job runtime
 /// the GUI uses. Returns a process exit code (0 = PASS).
 fn run_selftest(
-    job_tx: &Sender<Job>,
+    job_tx: &RuntimeClient,
     job_rx: &Receiver<JobResult>,
     input: Option<PathBuf>,
 ) -> anyhow::Result<i32> {
@@ -531,7 +531,7 @@ fn print_status(status: &CheckStatus, name: &str, detail: &str) {
 /// `PARTIAL` when only optional/recommended items are absent.
 fn run_doctor(
     config: &crate::app::config::AppConfig,
-    job_tx: &Sender<Job>,
+    job_tx: &RuntimeClient,
     job_rx: &Receiver<JobResult>,
 ) -> anyhow::Result<i32> {
     println!("══════════════════════════════════════════════════════════");
@@ -695,7 +695,7 @@ fn indent_block(text: &str) -> String {
 
 pub fn run(
     cli: Cli,
-    job_tx: Sender<Job>,
+    job_tx: RuntimeClient,
     job_rx: Receiver<JobResult>,
     config: std::sync::Arc<crate::app::config::AppConfig>,
 ) -> i32 {
@@ -710,7 +710,7 @@ pub fn run(
 
 pub fn run_inner(
     cli: Cli,
-    job_tx: Sender<Job>,
+    job_tx: RuntimeClient,
     job_rx: Receiver<JobResult>,
     config: std::sync::Arc<crate::app::config::AppConfig>,
 ) -> anyhow::Result<i32> {

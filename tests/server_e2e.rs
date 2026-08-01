@@ -1,5 +1,5 @@
-use dual_core_pdf_pipeline::app::runtime::{Job, JobResult};
-use std::sync::mpsc;
+use dual_core_pdf_pipeline::app::audit::AuditLog;
+use dual_core_pdf_pipeline::app::runtime::Runtime;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,27 +38,14 @@ fn test_headless_server_e2e() {
     }
 
     let cfg = Arc::new(dual_core_pdf_pipeline::app::config::AppConfig::default());
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let (res_tx, res_rx) = mpsc::channel::<JobResult>();
-
-    // We must spawn a fake worker thread that answers Job::Ping with JobResult::Pong
-    // so that the /readyz endpoint works. When the job_tx sender is dropped
-    // (at the end of this test), job_rx.recv() returns Err and this thread exits.
-    let _worker_handle = thread::spawn(move || {
-        while let Ok(job) = job_rx.recv() {
-            if let Job::Ping = job {
-                let _ = res_tx.send(JobResult::Pong);
-            }
-        }
-    });
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(runtime_dir.path()).unwrap();
+    let (_runtime, job_tx, res_rx) = Runtime::start(audit, cfg.clone());
 
     // Spawn the server in the background. The server blocks on
-    // `listener.incoming()` which is a blocking iterator. To ensure this
-    // thread exits when the test finishes, we drop the `job_tx` sender which
-    // causes the worker to exit. The server thread itself will be detached
-    // and will terminate when the test binary exits (all spawned threads are
-    // killed at process exit). Setting a non-blocking timeout on the listener
-    // from the test side isn't possible since `run_server` owns the listener.
+    // `listener.incoming()` which is a blocking iterator. The server thread is
+    // detached and terminates with the test process; the real runtime remains
+    // alive for the full test scope.
     //
     // The resource impact is bounded: one thread + one TCP port per test
     // invocation, automatically reclaimed at process exit.

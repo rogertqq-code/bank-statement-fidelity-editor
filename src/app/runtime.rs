@@ -25,6 +25,154 @@ pub fn alloc_job_id() -> JobId {
     NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst)
 }
 
+#[derive(Debug, Clone)]
+pub struct JobMetadata {
+    pub job_id: JobId,
+    pub document_id: Option<String>,
+    pub correlation_id: Uuid,
+    pub label: &'static str,
+    pub submitted_at: std::time::SystemTime,
+    pub deadline: std::time::Instant,
+}
+
+impl JobMetadata {
+    fn for_job(job: &Job) -> Self {
+        Self {
+            job_id: alloc_job_id(),
+            document_id: job.document_path().map(document_id_for_path),
+            correlation_id: Uuid::new_v4(),
+            label: job.label(),
+            submitted_at: std::time::SystemTime::now(),
+            deadline: std::time::Instant::now() + job.default_timeout(),
+        }
+    }
+
+    fn remaining(&self) -> std::time::Duration {
+        self.deadline.saturating_duration_since(std::time::Instant::now())
+    }
+}
+
+fn document_id_for_path(path: &Path) -> String {
+    use sha2::Digest;
+    let normalized = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    sha2::Sha256::digest(normalized.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct JobEnvelope {
+    metadata: JobMetadata,
+    job: Job,
+    route: Option<mpsc::Sender<JobResult>>,
+}
+
+impl JobEnvelope {
+    fn broadcast(job: Job) -> Self {
+        Self {
+            metadata: JobMetadata::for_job(&job),
+            job,
+            route: None,
+        }
+    }
+
+    fn routed(job: Job, route: mpsc::Sender<JobResult>) -> Self {
+        Self {
+            metadata: JobMetadata::for_job(&job),
+            job,
+            route: Some(route),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeSubmitError;
+
+impl std::fmt::Display for RuntimeSubmitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("runtime intake channel is disconnected")
+    }
+}
+
+impl std::error::Error for RuntimeSubmitError {}
+
+#[derive(Clone)]
+pub struct RuntimeClient {
+    intake: mpsc::Sender<JobEnvelope>,
+}
+
+impl RuntimeClient {
+    fn new(intake: mpsc::Sender<JobEnvelope>) -> Self {
+        Self { intake }
+    }
+
+    pub fn send(&self, job: Job) -> Result<JobId, RuntimeSubmitError> {
+        let envelope = JobEnvelope::broadcast(job);
+        let id = envelope.metadata.job_id;
+        self.intake.send(envelope).map_err(|_| RuntimeSubmitError)?;
+        Ok(id)
+    }
+
+    pub fn submit(&self, job: Job) -> Result<JobTicket, RuntimeSubmitError> {
+        let (result_tx, result_rx) = mpsc::channel();
+        let envelope = JobEnvelope::routed(job, result_tx);
+        let metadata = envelope.metadata.clone();
+        self.intake.send(envelope).map_err(|_| RuntimeSubmitError)?;
+        Ok(JobTicket {
+            metadata,
+            results: result_rx,
+            client: self.clone(),
+        })
+    }
+}
+
+impl From<mpsc::Sender<Job>> for RuntimeClient {
+    fn from(job_tx: mpsc::Sender<Job>) -> Self {
+        let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
+        std::thread::spawn(move || {
+            while let Ok(envelope) = intake_rx.recv() {
+                if job_tx.send(envelope.job).is_err() {
+                    break;
+                }
+            }
+        });
+        Self::new(intake_tx)
+    }
+}
+
+pub struct JobTicket {
+    metadata: JobMetadata,
+    results: mpsc::Receiver<JobResult>,
+    client: RuntimeClient,
+}
+
+impl JobTicket {
+    pub fn metadata(&self) -> &JobMetadata {
+        &self.metadata
+    }
+
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<JobResult, mpsc::RecvTimeoutError> {
+        self.results.recv_timeout(timeout)
+    }
+
+    pub fn try_recv(&self) -> Result<JobResult, mpsc::TryRecvError> {
+        self.results.try_recv()
+    }
+
+    pub fn cancel(&self) -> Result<JobId, RuntimeSubmitError> {
+        self.client.send(Job::Cancel {
+            id: self.metadata.job_id,
+        })
+    }
+}
+
 /// A registry of currently-running jobs and their cancellation tokens.
 /// Cloneable; the runtime keeps one and the dispatcher keeps another.
 #[derive(Clone, Default)]
@@ -395,6 +543,94 @@ impl Job {
                 | Job::CleanupTempFiles
         )
     }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Python(..) => "python",
+            Self::LoadDocument { .. } => "load_document",
+            Self::AnalyzeFonts { .. } => "analyze_fonts",
+            Self::RenderPage { .. } => "render_page",
+            Self::ApplyChange { .. } => "apply_change",
+            Self::CompleteFont { .. } => "complete_font",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::BalanceStatement { .. } => "balance_statement",
+            Self::ExtractTransactions { .. } => "extract_transactions",
+            Self::NaturalLanguageEdit { .. } => "natural_language_edit",
+            Self::CategorizeTransactions { .. } => "categorize_transactions",
+            Self::ApplyProposedChanges { .. } => "apply_proposed_changes",
+            Self::GenerateVisualAlternatives { .. } => "generate_visual_alternatives",
+            Self::ExportChangeHistory { .. } => "export_change_history",
+            Self::LoadHistory { .. } => "load_history",
+            Self::Verify { .. } => "verify",
+            Self::Cancel { .. } => "cancel",
+            Self::SubmitBugReport { .. } => "submit_bug_report",
+            Self::TypstReconstruct { .. } => "typst_reconstruct",
+            Self::ReloadConfig => "reload_config",
+            Self::ValidateCredentials => "validate_credentials",
+            Self::BalanceAndApplyAll { .. } => "balance_and_apply_all",
+            Self::CleanupTempFiles => "cleanup_temp_files",
+            Self::WorkflowParseAndValidate { .. } => "workflow_parse_and_validate",
+            Self::WorkflowPreview { .. } => "workflow_preview",
+            Self::WorkflowConfirmAndRender { .. } => "workflow_confirm_and_render",
+            Self::AiFixVisualFidelity { .. } => "ai_fix_visual_fidelity",
+            Self::TransferTransactions { .. } => "transfer_transactions",
+            Self::AdjustDatePeriods { .. } => "adjust_date_periods",
+            Self::AiConfirmationResponse(_) => "ai_confirmation_response",
+            Self::InteractiveFallbackResponse(_) => "interactive_fallback_response",
+            Self::RunTransferTests { .. } => "run_transfer_tests",
+            Self::AiCommand { .. } => "ai_command",
+            Self::ListDocAiVersions => "list_docai_versions",
+            Self::DeployDocAiVersion { .. } => "deploy_docai_version",
+            Self::UndeployDocAiVersion { .. } => "undeploy_docai_version",
+            Self::SetDefaultDocAiVersion { .. } => "set_default_docai_version",
+            Self::TrainDocAiVersion { .. } => "train_docai_version",
+        }
+    }
+
+    fn document_path(&self) -> Option<&Path> {
+        match self {
+            Self::LoadDocument { path, .. }
+            | Self::AnalyzeFonts { path }
+            | Self::RenderPage { path, .. }
+            | Self::CompleteFont { path, .. }
+            | Self::BalanceStatement { path }
+            | Self::ExtractTransactions { path } => Some(path),
+            Self::ApplyChange { input, .. }
+            | Self::ApplyProposedChanges { input, .. }
+            | Self::GenerateVisualAlternatives { input, .. }
+            | Self::TypstReconstruct { input, .. }
+            | Self::BalanceAndApplyAll { input, .. }
+            | Self::WorkflowParseAndValidate { input, .. }
+            | Self::WorkflowConfirmAndRender { input, .. }
+            | Self::AiFixVisualFidelity { input, .. }
+            | Self::AdjustDatePeriods { input, .. } => Some(input),
+            Self::Verify { edited, .. } => Some(edited),
+            Self::TransferTransactions { target_pdf, .. } => Some(target_pdf),
+            Self::AiCommand { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn default_timeout(&self) -> std::time::Duration {
+        use std::time::Duration;
+        match self {
+            Self::Ping
+            | Self::Undo
+            | Self::Redo
+            | Self::Cancel { .. }
+            | Self::ReloadConfig
+            | Self::CleanupTempFiles => Duration::from_secs(30),
+            Self::WorkflowParseAndValidate { .. }
+            | Self::WorkflowConfirmAndRender { .. }
+            | Self::TransferTransactions { .. }
+            | Self::RunTransferTests { .. }
+            | Self::Verify { .. }
+            | Self::TypstReconstruct { .. } => Duration::from_secs(15 * 60),
+            _ => Duration::from_secs(5 * 60),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -534,16 +770,54 @@ impl JobResult {
 }
 
 #[derive(Clone)]
+struct ResultSink {
+    broadcast: mpsc::Sender<JobResult>,
+    metadata: JobMetadata,
+    route: Option<mpsc::Sender<JobResult>>,
+    cancellations: CancellationRegistry,
+}
+
+impl ResultSink {
+    fn new(
+        broadcast: mpsc::Sender<JobResult>,
+        metadata: JobMetadata,
+        route: Option<mpsc::Sender<JobResult>>,
+        cancellations: CancellationRegistry,
+    ) -> Self {
+        Self {
+            broadcast,
+            metadata,
+            route,
+            cancellations,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn send(&self, result: JobResult) -> Result<(), mpsc::SendError<JobResult>> {
+        let terminal = result.is_terminal();
+        let outcome = if let Some(route) = &self.route {
+            route.send(result)
+        } else {
+            self.broadcast.send(result)
+        };
+        if terminal {
+            self.cancellations.complete(self.metadata.job_id);
+        }
+        outcome
+    }
+}
+
+#[derive(Clone)]
 pub struct TerminalTracker(std::sync::Arc<TerminalTrackerInner>);
 
 struct TerminalTrackerInner {
-    tx: std::sync::mpsc::Sender<JobResult>,
+    tx: ResultSink,
     label: String,
     terminal_sent: std::sync::atomic::AtomicBool,
 }
 
 impl TerminalTracker {
-    pub fn new(tx: std::sync::mpsc::Sender<JobResult>, label: impl Into<String>) -> Self {
+    fn new(tx: ResultSink, label: impl Into<String>) -> Self {
         Self(std::sync::Arc::new(TerminalTrackerInner {
             tx,
             label: label.into(),
@@ -607,13 +881,23 @@ impl Runtime {
     pub fn start(
         audit_log: AuditLog,
         config: Arc<crate::app::config::AppConfig>,
-    ) -> (Self, mpsc::Sender<Job>, mpsc::Receiver<JobResult>) {
+    ) -> (Self, RuntimeClient, mpsc::Receiver<JobResult>) {
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("Failed to start Tokio runtime");
 
-        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
+        let runtime_client = RuntimeClient::new(intake_tx.clone());
+        let (legacy_job_tx, legacy_job_rx) = mpsc::channel::<Job>();
+        let legacy_intake_tx = intake_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(job) = legacy_job_rx.recv() {
+                if legacy_intake_tx.send(JobEnvelope::broadcast(job)).is_err() {
+                    break;
+                }
+            }
+        });
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
         let (watchdog, mut watchdog_rx) = crate::app::watchdog::Watchdog::new();
         let watchdog = std::sync::Arc::new(watchdog);
@@ -626,7 +910,7 @@ impl Runtime {
         let history = Arc::new(Mutex::new(ChangeHistory::new()));
         let config_holder = Arc::new(Mutex::new(config));
 
-        let primary_engine = Arc::new(crate::pdf::PyMuPdfEngine::new(job_tx.clone()));
+        let primary_engine = Arc::new(crate::pdf::PyMuPdfEngine::new(legacy_job_tx));
         let fallback_engine = Arc::new(crate::pdf::OxidizePdfEngine::new());
         let engine: Arc<dyn crate::pdf::PdfEngine> = Arc::new(crate::pdf::PdfEngineSelector::new(
             primary_engine,
@@ -807,11 +1091,13 @@ impl Runtime {
         let result_tx_clone = result_tx.clone();
         let python_tx_clone = python_tx.clone();
 
-        let (fast_job_tx, mut fast_job_rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
-        let (slow_job_tx, mut slow_job_rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        let (fast_job_tx, mut fast_job_rx) =
+            tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
+        let (slow_job_tx, mut slow_job_rx) =
+            tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
 
         spawn_runtime_bridge(
-            job_rx,
+            intake_rx,
             fast_job_tx.clone(),
             slow_job_tx.clone(),
             result_tx.clone(),
@@ -823,7 +1109,7 @@ impl Runtime {
         // takes effect on subsequent jobs without an application restart.
 
         let api_semaphore = Arc::new(tokio::sync::Semaphore::new(3));
-        let _ = fast_job_tx.send(Job::CleanupTempFiles);
+        let _ = fast_job_tx.send(JobEnvelope::broadcast(Job::CleanupTempFiles));
 
         let watchdog_clone = watchdog.clone();
         let tokio_rt_handle = tokio_rt.handle().clone();
@@ -851,7 +1137,8 @@ impl Runtime {
                                 tracing::info!(
                                     "[config] .env file changed. Triggering hot-reload."
                                 );
-                                let _ = hot_reload_job_tx.send(Job::ReloadConfig);
+                                let _ = hot_reload_job_tx
+                                    .send(JobEnvelope::broadcast(Job::ReloadConfig));
                             }
                             last_modified = modified;
                         }
@@ -910,7 +1197,21 @@ impl Runtime {
                 >,
             > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-            while let Some(job) = slow_job_rx.recv().await {
+            while let Some(envelope) = slow_job_rx.recv().await {
+                let JobEnvelope {
+                    metadata,
+                    job,
+                    route,
+                } = envelope;
+                if !matches!(&job, Job::Cancel { .. }) {
+                    cancellations_for_loop.register(metadata.job_id);
+                }
+                let result_sink = ResultSink::new(
+                    result_tx_clone.clone(),
+                    metadata,
+                    route,
+                    cancellations_for_loop.clone(),
+                );
                 let wdog = watchdog_clone.clone();
                 let config_for_tokio: Arc<crate::app::config::AppConfig> = config_holder
                     .lock()
@@ -919,7 +1220,7 @@ impl Runtime {
                 process_job_inner(
                     job,
                     python_tx_clone.clone(),
-                    result_tx_clone.clone(),
+                    result_sink,
                     engine_for_tokio.clone(),
                     config_for_tokio.clone(),
                     wdog.clone(),
@@ -931,7 +1232,6 @@ impl Runtime {
                     &mut segment_manager,
                     fallback_router.clone(),
                     parse_cache.clone(),
-                    slow_job_tx.clone(),
                     config_holder.clone(),
                 )
                 .await;
@@ -948,7 +1248,21 @@ impl Runtime {
                 >,
             > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-            while let Some(job) = fast_job_rx.recv().await {
+            while let Some(envelope) = fast_job_rx.recv().await {
+                let JobEnvelope {
+                    metadata,
+                    job,
+                    route,
+                } = envelope;
+                if !matches!(&job, Job::Cancel { .. }) {
+                    fast_cancellations_for_loop.register(metadata.job_id);
+                }
+                let result_sink = ResultSink::new(
+                    fast_result_tx_clone.clone(),
+                    metadata,
+                    route,
+                    fast_cancellations_for_loop.clone(),
+                );
                 let wdog = fast_watchdog_clone.clone();
                 let config_for_tokio: Arc<crate::app::config::AppConfig> = fast_config_holder
                     .lock()
@@ -957,7 +1271,7 @@ impl Runtime {
                 process_job_inner(
                     job,
                     fast_python_tx_clone.clone(),
-                    fast_result_tx_clone.clone(),
+                    result_sink,
                     fast_engine_for_tokio.clone(),
                     config_for_tokio.clone(),
                     wdog.clone(),
@@ -969,7 +1283,6 @@ impl Runtime {
                     &mut segment_manager,
                     fallback_router.clone(),
                     parse_cache.clone(),
-                    fast_job_tx.clone(),
                     fast_config_holder.clone(),
                 )
                 .await;
@@ -1000,33 +1313,36 @@ impl Runtime {
                 cancellations,
                 watchdog: watchdog_for_gui,
             },
-            job_tx,
+            runtime_client,
             result_rx,
         )
     }
 }
 
 fn spawn_runtime_bridge(
-    job_rx: mpsc::Receiver<Job>,
-    fast_tx: tokio::sync::mpsc::UnboundedSender<Job>,
-    slow_tx: tokio::sync::mpsc::UnboundedSender<Job>,
+    job_rx: mpsc::Receiver<JobEnvelope>,
+    fast_tx: tokio::sync::mpsc::UnboundedSender<JobEnvelope>,
+    slow_tx: tokio::sync::mpsc::UnboundedSender<JobEnvelope>,
     result_tx: mpsc::Sender<JobResult>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        while let Ok(job) = job_rx.recv() {
-            if job.is_fast() {
-                if fast_tx.send(job).is_err() {
-                    let _ = result_tx.send(JobResult::Error {
-                        job_label: "runtime_bridge".into(),
-                        message: "Tokio worker disconnected".into(),
-                    });
-                    break;
-                }
-            } else if slow_tx.send(job).is_err() {
-                let _ = result_tx.send(JobResult::Error {
-                    job_label: "runtime_bridge".into(),
+        while let Ok(envelope) = job_rx.recv() {
+            let outcome = if envelope.job.is_fast() {
+                fast_tx.send(envelope)
+            } else {
+                slow_tx.send(envelope)
+            };
+            if let Err(error) = outcome {
+                let envelope = error.0;
+                let result = JobResult::Error {
+                    job_label: envelope.metadata.label.into(),
                     message: "Tokio worker disconnected".into(),
-                });
+                };
+                if let Some(route) = envelope.route {
+                    let _ = route.send(result);
+                } else {
+                    let _ = result_tx.send(result);
+                }
                 break;
             }
         }
@@ -1087,7 +1403,7 @@ async fn process_job_inner(
         PythonJob,
         tokio::sync::oneshot::Sender<PythonJobResult>,
     )>,
-    result_tx_clone: std::sync::mpsc::Sender<JobResult>,
+    result_tx_clone: ResultSink,
     engine_for_tokio: std::sync::Arc<dyn crate::pdf::PdfEngine>,
     config_for_tokio: std::sync::Arc<crate::app::config::AppConfig>,
     wdog: std::sync::Arc<crate::app::watchdog::Watchdog>,
@@ -1105,7 +1421,6 @@ async fn process_job_inner(
     parse_cache: std::sync::Arc<
         tokio::sync::Mutex<lru::LruCache<String, crate::ai::document_ai::BankStatement>>,
     >,
-    tokio_job_tx_clone: tokio::sync::mpsc::UnboundedSender<Job>,
     config_holder: std::sync::Arc<std::sync::Mutex<std::sync::Arc<crate::app::config::AppConfig>>>,
 ) {
     match job {
@@ -1383,8 +1698,7 @@ async fn process_job_inner(
                     .map(std::sync::Arc::new);
 
                 // Helper to send progress
-                let send_progress = |res_tx: &std::sync::mpsc::Sender<JobResult>,
-                                     stage: TransferStage| {
+                let send_progress = |res_tx: &ResultSink, stage: TransferStage| {
                     let (lo, _hi) = stage.fraction_range();
                     let _ = res_tx.send(JobResult::Progress {
                         label: stage.label().to_string(),
@@ -1398,7 +1712,7 @@ async fn process_job_inner(
                     |pdf_path: PathBuf,
                      cfg: std::sync::Arc<crate::app::config::AppConfig>,
                      engine: std::sync::Arc<dyn crate::pdf::PdfEngine>,
-                     res_tx: std::sync::mpsc::Sender<JobResult>,
+                     res_tx: ResultSink,
                      stage_name: String,
                      wdog: std::sync::Arc<crate::app::watchdog::Watchdog>| async move {
                         let mut tasks = Vec::new();
@@ -5007,7 +5321,6 @@ async fn process_job_inner(
             let res_tx = TerminalTracker::new(result_tx_clone.clone(), "BalanceAndApplyAll");
             let eng = engine_for_tokio.clone();
             let cfg = config_for_tokio.clone();
-            let _job_tx_ref = tokio_job_tx_clone.clone();
             let semaphore = api_semaphore.clone();
 
             tokio::spawn(async move {
@@ -7380,6 +7693,15 @@ mod tests {
     use crate::app::config::AppConfig;
     use std::time::Duration;
 
+    fn test_sink(broadcast: mpsc::Sender<JobResult>) -> ResultSink {
+        ResultSink::new(
+            broadcast,
+            JobMetadata::for_job(&Job::Ping),
+            None,
+            CancellationRegistry::new(),
+        )
+    }
+
     #[test]
     fn cancellation_registry_register_and_cancel_round_trip() {
         let reg = CancellationRegistry::new();
@@ -7434,6 +7756,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_client_routes_results_by_job_and_document_identity() {
+        let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
+        let client = RuntimeClient::new(intake_tx);
+        let path = PathBuf::from("fixtures/account.pdf");
+        let first = client
+            .submit(Job::LoadDocument {
+                path: path.clone(),
+                three_page_mode: false,
+            })
+            .unwrap();
+        let second = client
+            .submit(Job::LoadDocument {
+                path,
+                three_page_mode: true,
+            })
+            .unwrap();
+        let first_envelope = intake_rx.recv().unwrap();
+        let second_envelope = intake_rx.recv().unwrap();
+        assert_ne!(first.metadata().job_id, second.metadata().job_id);
+        assert_eq!(first.metadata().document_id, second.metadata().document_id);
+        assert_eq!(first.metadata().job_id, first_envelope.metadata.job_id);
+        assert_eq!(second.metadata().job_id, second_envelope.metadata.job_id);
+        first_envelope.route.unwrap().send(JobResult::Pong).unwrap();
+        assert!(matches!(
+            first.recv_timeout(Duration::from_secs(1)),
+            Ok(JobResult::Pong)
+        ));
+        assert!(second.try_recv().is_err());
+    }
+
+    #[test]
+    fn job_ticket_cancellation_targets_its_own_job_id() {
+        let (intake_tx, intake_rx) = mpsc::channel::<JobEnvelope>();
+        let client = RuntimeClient::new(intake_tx);
+        let ticket = client.submit(Job::Ping).unwrap();
+        let _original = intake_rx.recv().unwrap();
+        ticket.cancel().unwrap();
+        let cancel = intake_rx.recv().unwrap();
+        assert!(matches!(
+            cancel.job,
+            Job::Cancel { id } if id == ticket.metadata().job_id
+        ));
+    }
+
+    #[test]
     fn job_result_terminal_classification_is_explicit() {
         let intermediate =
             JobResult::WorkflowVisualAttempt(crate::engine::workflow::VisualAttempt {
@@ -7471,7 +7838,7 @@ mod tests {
     #[test]
     fn terminal_tracker_emits_exactly_one_terminal_and_suppresses_followups() {
         let (tx, rx) = mpsc::channel();
-        let tracker = TerminalTracker::new(tx, "exactly-once-test");
+        let tracker = TerminalTracker::new(test_sink(tx), "exactly-once-test");
         tracker
             .send(JobResult::WorkflowVisualAttempt(
                 crate::engine::workflow::VisualAttempt {
@@ -7516,7 +7883,7 @@ mod tests {
     #[test]
     fn terminal_tracker_drop_emits_one_failure_after_only_intermediate_results() {
         let (tx, rx) = mpsc::channel();
-        let tracker = TerminalTracker::new(tx, "silent-task");
+        let tracker = TerminalTracker::new(test_sink(tx), "silent-task");
         tracker
             .send(JobResult::Progress {
                 label: "started".into(),
@@ -7541,8 +7908,9 @@ mod tests {
 
     #[test]
     fn test_bridge_fail_loud() {
-        let (job_tx, job_rx) = mpsc::channel::<Job>();
-        let (tokio_job_tx, tokio_job_rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        let (job_tx, job_rx) = mpsc::channel::<JobEnvelope>();
+        let (tokio_job_tx, tokio_job_rx) =
+            tokio::sync::mpsc::unbounded_channel::<JobEnvelope>();
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
         let (watchdog, _watchdog_rx) = crate::app::watchdog::Watchdog::new();
         let watchdog = std::sync::Arc::new(watchdog);
@@ -7554,12 +7922,12 @@ mod tests {
         let handle = spawn_runtime_bridge(job_rx, tokio_job_tx.clone(), tokio_job_tx, result_tx);
 
         // Send a job
-        let _ = job_tx.send(Job::Ping);
+        let _ = job_tx.send(JobEnvelope::broadcast(Job::Ping));
 
         // Expect error
         match result_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(JobResult::Error { job_label, message }) => {
-                assert_eq!(job_label, "runtime_bridge");
+                assert_eq!(job_label, "ping");
                 assert!(message.contains("disconnected"));
             }
             res => panic!("Expected bridge error, got {res:?}"),
@@ -7570,7 +7938,7 @@ mod tests {
         }
 
         // Subsequent send should fail because job_rx is dropped
-        assert!(job_tx.send(Job::Ping).is_err());
+        assert!(job_tx.send(JobEnvelope::broadcast(Job::Ping)).is_err());
     }
 
     #[tokio::test]

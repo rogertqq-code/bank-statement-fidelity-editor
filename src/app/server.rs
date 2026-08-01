@@ -23,17 +23,16 @@
 //! this automatically), defaulting to `8080`. The bind address is always
 //! `0.0.0.0` so the container is reachable from the platform proxy.
 
-use crate::app::runtime::{Job, JobResult};
+use crate::app::runtime::{Job, JobResult, RuntimeClient};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// The existing runtime channel, guarded so concurrent connections take
-/// turns when they need to exercise the worker (readiness probe). Liveness
-/// probes never touch this.
-type RuntimeChannel = Arc<Mutex<(Sender<Job>, Receiver<JobResult>)>>;
+/// Readiness uses a job-scoped result ticket, so concurrent probes cannot
+/// consume or discard results owned by GUI, CLI, or other server requests.
+type RuntimeChannel = Arc<RuntimeClient>;
 
 /// Default listen port when `$PORT` is unset.
 const DEFAULT_PORT: u16 = 8080;
@@ -44,8 +43,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Run the blocking accept loop. Returns only on a fatal listener error;
 /// in normal operation it runs for the lifetime of the process.
 pub fn run_server(
-    job_tx: Sender<Job>,
-    job_rx: Receiver<JobResult>,
+    job_tx: RuntimeClient,
+    _job_rx: Receiver<JobResult>,
     _config: Arc<crate::app::config::AppConfig>,
 ) -> std::io::Result<()> {
     let port = std::env::var("PORT")
@@ -58,7 +57,7 @@ pub fn run_server(
     tracing::info!("[serve] listening on http://{addr} (GET /health for liveness)");
     println!("[serve] listening on http://{addr}  •  liveness: /health  •  readiness: /readyz");
 
-    let channel: RuntimeChannel = Arc::new(Mutex::new((job_tx, job_rx)));
+    let channel: RuntimeChannel = Arc::new(job_tx);
 
     for stream in listener.incoming() {
         match stream {
@@ -183,24 +182,15 @@ fn route(
     }
 }
 
-/// Exercise the worker actor over the existing channel: send `Job::Ping`
-/// and wait (bounded) for `JobResult::Pong`. Serialised behind the mutex so
-/// concurrent readiness probes don't race on the single-consumer receiver.
+/// Exercise the worker actor with a private result route. Each readiness
+/// probe receives only the result stream for its own `Ping` job.
 fn ping_worker(channel: &RuntimeChannel) -> bool {
-    let guard = match channel.lock() {
-        Ok(g) => g,
+    let ticket = match channel.submit(Job::Ping) {
+        Ok(ticket) => ticket,
         Err(_) => return false,
     };
-    let (tx, rx) = &*guard;
-
-    if tx.send(Job::Ping).is_err() {
-        return false;
-    }
-
-    // Drain until we see the Pong or time out. In serve mode nothing else
-    // produces results, so this normally returns on the first message.
     loop {
-        match rx.recv_timeout(READY_TIMEOUT) {
+        match ticket.recv_timeout(READY_TIMEOUT) {
             Ok(JobResult::Pong) => return true,
             Ok(_) => continue,
             Err(_) => return false,
