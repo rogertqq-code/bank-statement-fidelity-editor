@@ -218,8 +218,9 @@ Visual Check:  Applitools + SSIM + Tile-max + Perceptual Hash (additive layers)
 AI Vision:     Gemini Vision â†’ graceful skip (pass on local metrics only)
 ```
 
-### Remote Engine Mode
-The GUI can be configured to offload processing to a remote engine via the `ConnectionMode`. When toggled in Advanced Mode, the GUI acts as a thin client (ðŸŸ¢ Local vs ðŸ”µ Remote status indicator), dispatching `Runtime` jobs to a hosted version of the backend over HTTP.
+### Processing boundary
+
+Version 1 processes documents through the local application runtime. It does not expose or claim a remote document-processing engine. The optional headless server currently provides operational health/readiness endpoints only; any future remote processing service requires a separately designed, authenticated, versioned API and threat model.
 
 ## Forensics & watermarking caveats
 

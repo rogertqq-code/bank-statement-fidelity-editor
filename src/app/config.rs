@@ -158,19 +158,6 @@ pub enum PdfEngineMode {
     TypstReconstruct,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionMode {
-    Local,
-    Remote { url: String },
-}
-
-impl Default for ConnectionMode {
-    fn default() -> Self {
-        Self::Local
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Backend preference enums (persisted in AppSettings, used by runtime)
 // ---------------------------------------------------------------------------
@@ -315,8 +302,6 @@ pub struct AppConfig {
     pub gemini_auth_mode: GeminiAuthMode,
     /// Whether we're in development mode (relaxed security requirements)
     pub is_dev_mode: bool,
-    /// The connection mode (Local vs Remote Engine)
-    pub connection_mode: ConnectionMode,
     /// Which PDF engine backend to use
     pub engine_mode: PdfEngineMode,
     pub llamaparse_api_key: Option<String>,
@@ -396,7 +381,6 @@ impl Default for AppConfig {
             webhook_url: None,
             gemini_auth_mode: GeminiAuthMode::ApiKey,
             is_dev_mode: cfg!(debug_assertions),
-            connection_mode: ConnectionMode::Local,
             engine_mode: PdfEngineMode::PyMuPdfProPrimary,
             llamaparse_api_key: None,
             interactive_fallbacks: true,
@@ -612,7 +596,6 @@ impl AppConfig {
             webhook_url,
             gemini_auth_mode,
             is_dev_mode,
-            connection_mode: ConnectionMode::Local,
             engine_mode: match env::var("PDF_ENGINE_MODE")
                 .unwrap_or_default()
                 .to_lowercase()
