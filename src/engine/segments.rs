@@ -214,7 +214,7 @@ impl SegmentManager {
     /// `temp_dir`, `max_pages_per_segment`, and per-segment `index`/`edited`/
     /// `edited_path`) whose `total_pages` equals the original page count
     /// (Requirement 2.6). Splitting uses only the pure-Rust `lopdf` module
-    /// (`pdf_split_merge::split_pdf`) - no `PyEngine` / PyMuPDF is involved.
+    /// (`pdf_split_merge::split_pdf`) - no Python worker or PyMuPDF is involved.
     ///
     /// On split failure (Requirement 12.1): abort preparation and build no map,
     /// best-effort remove any partial `segment_*.pdf` files written into the

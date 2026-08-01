@@ -7,7 +7,6 @@ pub mod llamaparse;
 pub mod openai_client;
 
 pub mod pdfrest;
-pub mod pyo3_bridge;
 pub mod python_protocol;
 pub mod python_worker;
 pub mod repair;

@@ -1,4 +1,4 @@
-// pyo3_bridge removed - zero FFI architecture
+// Python operations run only through the supervised versioned worker process.
 use crate::app::audit::AuditLog;
 use crate::engine::history::{ChangeHistory, ChangeRecord};
 use crate::engine::segments::{GlobalEdit, SegmentManager, SegmentMap};

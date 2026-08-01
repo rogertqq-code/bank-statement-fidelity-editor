@@ -24,7 +24,6 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 ocr = ["dep:ocrs", "dep:rten", "dep:rten-imageproc", "dep:rten-tensor"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["auto-initialize", "abi3-py38"] }
 pdfium-render = "0.8"
 
 clap = { version = "4.5", features = ["derive"] }
