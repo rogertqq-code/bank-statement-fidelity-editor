@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     PythonPipeline,
@@ -83,7 +81,9 @@ impl CapabilityRegistry {
         match crate::ai::pyo3_bridge::PyEngine::init() {
             Ok(_) => registry.set(
                 Capability::PythonPipeline,
-                CapabilityStatus::ready("Python and the embedded PyMuPDF bridge imported successfully"),
+                CapabilityStatus::ready(
+                    "Python and the embedded PyMuPDF bridge imported successfully",
+                ),
             ),
             Err(error) => registry.set(
                 Capability::PythonPipeline,
@@ -122,10 +122,7 @@ impl CapabilityRegistry {
                 Capability::Pdfium,
                 CapabilityStatus::ready(format!("Pdfium found at {}", path.display())),
             ),
-            Err(error) => registry.set(
-                Capability::Pdfium,
-                CapabilityStatus::unavailable(error),
-            ),
+            Err(error) => registry.set(Capability::Pdfium, CapabilityStatus::unavailable(error)),
         }
 
         let detection_model = crate::app::paths::resolve_asset_path("models/text-detection.rten");
@@ -217,7 +214,8 @@ impl CapabilityRegistry {
     }
 
     pub fn is_ready(&self, capability: Capability) -> bool {
-        self.status(capability).is_some_and(CapabilityStatus::is_ready)
+        self.status(capability)
+            .is_some_and(CapabilityStatus::is_ready)
     }
 
     pub fn is_selectable(&self, capability: Capability) -> bool {

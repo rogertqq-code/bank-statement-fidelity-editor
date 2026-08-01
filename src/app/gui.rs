@@ -1730,11 +1730,10 @@ impl MyApp {
                     let fresh_avail = new_cfg.detect_availability();
                     fresh_avail.log_summary();
                     self.api_availability = fresh_avail;
-                    self.capability_registry =
-                        crate::app::capabilities::CapabilityRegistry::probe(
-                            &new_cfg,
-                            &self.app_paths,
-                        );
+                    self.capability_registry = crate::app::capabilities::CapabilityRegistry::probe(
+                        &new_cfg,
+                        &self.app_paths,
+                    );
                     self.config = std::sync::Arc::new(new_cfg);
                 } else {
                     let fresh_avail = crate::app::config::AppConfig::from_env()
