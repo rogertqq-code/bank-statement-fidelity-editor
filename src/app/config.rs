@@ -1186,6 +1186,8 @@ mod tests {
             assert_eq!(snapshot.generation(), generation);
         }
 
-        reader.join().expect("configuration reader should not panic");
+        reader
+            .join()
+            .expect("configuration reader should not panic");
     }
 }

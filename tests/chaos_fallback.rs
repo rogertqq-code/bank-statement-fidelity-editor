@@ -72,7 +72,7 @@ impl PdfEngine for MockFailingEngine {
 async fn test_chaos_fallback_selector_returns_encrypted_error() {
     let mut cfg_val = AppConfig::default();
     cfg_val.engine_mode = PdfEngineMode::PyMuPdfProPrimary;
-    let config = Arc::new(std::sync::Mutex::new(Arc::new(cfg_val)));
+    let config = crate::app::config::ConfigManager::new(Arc::new(cfg_val));
 
     let mock_primary = Arc::new(MockFailingEngine);
     let mock_fallback = Arc::new(MockFailingEngine);
