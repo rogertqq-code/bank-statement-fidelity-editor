@@ -1,11 +1,11 @@
-use dual_core_pdf_pipeline::app::config::AppConfig;
+use dual_core_pdf_pipeline::app::config::{AppConfig, ConfigManager};
 use dual_core_pdf_pipeline::pdf::engine::{EngineError, PdfEngine};
 use dual_core_pdf_pipeline::pdf::native_engine::OxidizePdfEngine;
 use dual_core_pdf_pipeline::pdf::selector::PdfEngineSelector;
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Helper to generate a simple PDF with specific text elements at exact coordinates.
 fn create_simple_pdf(path: &Path, strings: &[(&str, f32, f32)]) {
@@ -127,7 +127,7 @@ fn test_selector_rejects_non_overlapping_bbox() {
 
     let primary = Arc::new(OxidizePdfEngine::new());
     let fallback = Arc::new(OxidizePdfEngine::new());
-    let config = Arc::new(Mutex::new(Arc::new(AppConfig::default())));
+    let config = ConfigManager::new(Arc::new(AppConfig::default()));
     let selector = PdfEngineSelector::new(primary, fallback, config);
 
     // Provide a bbox completely outside the bounds of the "Target" text (e.g. y=100.0)
