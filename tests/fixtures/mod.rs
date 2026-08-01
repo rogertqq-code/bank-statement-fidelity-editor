@@ -42,7 +42,7 @@ pub fn generate_test_pdf(pages: usize, path: &Path) {
     for page_num in 1..=pages {
         // Build a minimal content stream: position cursor and show text
         let content =
-            format!("BT /F1 12 Tf 72 720 Td (Page {page_num} — synthetic test fixture) Tj ET");
+            format!("BT /F1 12 Tf 72 720 Td (Page {page_num} - synthetic test fixture) Tj ET");
         let content_stream = Stream::new(dictionary! {}, content.into_bytes());
         let content_id = doc.add_object(content_stream);
 

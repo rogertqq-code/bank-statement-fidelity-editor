@@ -45,6 +45,7 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
 
 import pymupdf
 import json
+import math
 import gc
 
 # PyMuPDF Pro lives in the separate `pymupdfpro` package and exposes the
@@ -578,6 +579,35 @@ def _find_dominant_span(page, rect_obj):
                     best_area = area
                     best = span
     return best
+
+
+def _normalized_text_identity(value: str) -> str:
+    return " ".join(str(value).split())
+
+
+def _find_exact_target_spans(page, rect_obj, old_text: str) -> list:
+    """Return every span matching both stable text identity and >=50% rect overlap."""
+    rect = pymupdf.Rect(rect_obj)
+    rect_area = max(float(rect.width * rect.height), 0.0)
+    if rect_area <= 0.0:
+        return []
+    identity = _normalized_text_identity(old_text)
+    matches = []
+    for block in page.get_text("dict").get("blocks", []):
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line.get("spans", []):
+                if _normalized_text_identity(span.get("text", "")) != identity:
+                    continue
+                span_rect = pymupdf.Rect(span.get("bbox") or (0, 0, 0, 0))
+                intersection = span_rect & rect
+                if intersection.is_empty:
+                    continue
+                overlap = float(intersection.width * intersection.height) / rect_area
+                if overlap >= 0.5:
+                    matches.append(span)
+    return matches
 
 
 _STANDARD_14_FONTS = {
@@ -2620,6 +2650,7 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
         {
             "page": int,
             "rect": [x0, y0, x1, y1],
+            "old_text": str,
             "new_text": str,
             "fill_color": [r, g, b]   (optional, defaults to white)
         }
@@ -2638,6 +2669,54 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
     """
     if not isinstance(edits, list) or not edits:
         raise ValueError(json.dumps({"error": "EMPTY_EDIT_BATCH"}))
+    required_edit_keys = {"page", "rect", "old_text", "new_text"}
+    allowed_edit_keys = required_edit_keys | {"fill_color"}
+    for index, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            raise ValueError(json.dumps({
+                "error": "INVALID_EDIT_SCHEMA",
+                "edit_index": index,
+                "reason": "edit must be an object",
+            }))
+        keys = set(edit)
+        if keys - allowed_edit_keys or not required_edit_keys.issubset(keys):
+            raise ValueError(json.dumps({
+                "error": "INVALID_EDIT_SCHEMA",
+                "edit_index": index,
+                "missing": sorted(required_edit_keys - keys),
+                "unknown": sorted(keys - allowed_edit_keys),
+            }))
+        if not isinstance(edit["page"], int) or edit["page"] < 0:
+            raise ValueError(json.dumps({
+                "error": "INVALID_EDIT_SCHEMA",
+                "edit_index": index,
+                "reason": "page must be a non-negative integer",
+            }))
+        rect = edit["rect"]
+        if (
+            not isinstance(rect, (list, tuple))
+            or len(rect) != 4
+            or not all(isinstance(value, (int, float)) for value in rect)
+            or not all(math.isfinite(float(value)) for value in rect)
+            or float(rect[2]) <= float(rect[0])
+            or float(rect[3]) <= float(rect[1])
+        ):
+            raise ValueError(json.dumps({
+                "error": "INVALID_EDIT_SCHEMA",
+                "edit_index": index,
+                "reason": "rect must contain four finite ordered numbers",
+            }))
+        if not isinstance(edit["old_text"], str) or not edit["old_text"].strip():
+            raise ValueError(json.dumps({
+                "error": "MISSING_STABLE_IDENTITY",
+                "edit_index": index,
+            }))
+        if not isinstance(edit["new_text"], str):
+            raise ValueError(json.dumps({
+                "error": "INVALID_EDIT_SCHEMA",
+                "edit_index": index,
+                "reason": "new_text must be a string",
+            }))
 
     source_sha256 = _sha256_file(pdf_path)
     # Pro 3-page guard (Req 5): verify the target segment has <=3 pages BEFORE
@@ -2662,25 +2741,59 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
     # builtin because embedded font coverage was insufficient. Deduped here
     # and emitted as a sorted list so the bridge can map locals to globals.
     review_flag_pages = set()
+    used_target_keys = set()
 
     # Process edits in order. For each edit we run the same coverage check as
     # `replace_text_in_rect` but against the (potentially) already-modified
     # page from prior edits in this batch.
     for idx, edit in enumerate(edits):
-        page_num = int(edit["page"])
+        page_num = edit["page"]
         rect = list(edit["rect"])
-        new_text = str(edit["new_text"])
+        old_text = edit["old_text"]
+        new_text = edit["new_text"]
         fill_color = tuple(edit.get("fill_color", (1.0, 1.0, 1.0)))
 
+        if page_num >= doc.page_count:
+            doc.close()
+            raise ValueError(json.dumps({
+                "error": "PAGE_OUT_OF_RANGE",
+                "edit_index": idx,
+                "page": page_num,
+            }))
         page = doc[page_num]
         rect_obj = pymupdf.Rect(rect)
-
-        span = _find_dominant_span(page, rect_obj)
-        if span is None:
+        candidates = _find_exact_target_spans(page, rect_obj, old_text)
+        failure_method = None
+        if not candidates:
+            failure_method = "identity-no-match"
             warning = (
-                f"edit {idx}: target rect {rect} overlaps no text on page "
-                f"{page_num}; source preserved and no output published"
+                f"edit {idx}: no span matches old_text={old_text!r} and rect {rect} "
+                f"on page {page_num}; source preserved and no output published"
             )
+        elif len(candidates) > 1:
+            failure_method = "ambiguous-target"
+            warning = (
+                f"edit {idx}: {len(candidates)} spans match old_text={old_text!r} "
+                f"and rect {rect} on page {page_num}; source preserved and no output published"
+            )
+        else:
+            span = candidates[0]
+            target_key = (
+                page_num,
+                tuple(float(value) for value in span.get("bbox", ())),
+                tuple(float(value) for value in (span.get("origin") or ())),
+                _normalized_text_identity(span.get("text", "")),
+            )
+            if target_key in used_target_keys:
+                failure_method = "duplicate-target"
+                warning = (
+                    f"edit {idx}: target span was already selected by another edit; "
+                    "source preserved and no output published"
+                )
+            else:
+                used_target_keys.add(target_key)
+
+        if failure_method is not None:
             warnings.append(warning)
             review_flag_pages.add(page_num)
             evidence.append(
@@ -2690,7 +2803,7 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
                     "rect": [float(value) for value in rect],
                     "matched": False,
                     "placed": False,
-                    "method": "no-match",
+                    "method": failure_method,
                     "warning": warning,
                 }
             )

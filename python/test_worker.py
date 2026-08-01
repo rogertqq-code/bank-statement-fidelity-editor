@@ -175,6 +175,7 @@ class WorkerTests(unittest.TestCase):
                         {
                             "page": 0,
                             "rect": [60.0, 50.0, 160.0, 85.0],
+                            "old_text": "PAGE 1",
                             "new_text": "REPLACED",
                         }
                     ],
@@ -236,6 +237,7 @@ class WorkerTests(unittest.TestCase):
                     {
                         "page": page_number,
                         "rect": list(source[page_number].search_for(text)[0]),
+                        "old_text": text,
                         "new_text": replacement,
                     }
                     for page_number, (text, replacement) in enumerate(

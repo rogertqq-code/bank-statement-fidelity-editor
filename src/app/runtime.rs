@@ -5577,6 +5577,7 @@ async fn process_job_inner(
                         serde_json::json!({
                             "page": change.page,
                             "rect": [bbox[0], bbox[1], bbox[2], bbox[3]],
+                            "old_text": change.old_text,
                             "new_text": change.new_text,
                         })
                     })
@@ -7300,6 +7301,7 @@ async fn process_job_inner(
                                 serde_json::json!({
                                     "page": e.page,
                                     "rect": e.bbox,
+                                    "old_text": e.old_text,
                                     "new_text": formatted,
                                 })
                             })
@@ -7441,6 +7443,7 @@ async fn process_job_inner(
                                             serde_json::json!({
                                                 "page": e.local_page,
                                                 "rect": e.bbox,
+                                                "old_text": e.old_text,
                                                 "new_text": formatted,
                                             })
                                         })

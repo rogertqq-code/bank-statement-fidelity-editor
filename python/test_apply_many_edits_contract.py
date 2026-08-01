@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pymupdf
 
@@ -94,6 +95,7 @@ class ApplyManyEditsContractTests(unittest.TestCase):
                     {
                         "page": 0,
                         "rect": [300.0, 300.0, 360.0, 330.0],
+                        "old_text": "KEEP",
                         "new_text": "REPLACEMENT",
                     }
                 ],
@@ -108,7 +110,7 @@ class ApplyManyEditsContractTests(unittest.TestCase):
             self.assertFalse(report["output_published"])
             self.assertIsNone(report["output_sha256"])
             self.assertEqual(report["source_sha256"], source_before)
-            self.assertEqual(report["method_per_edit"], ["no-match"])
+            self.assertEqual(report["method_per_edit"], ["identity-no-match"])
             self.assertEqual(len(report["edits"]), 1)
             self.assertFalse(report["edits"][0]["matched"])
             self.assertFalse(report["edits"][0]["placed"])
@@ -131,7 +133,7 @@ class ApplyManyEditsContractTests(unittest.TestCase):
             report = BRIDGE.apply_many_edits(
                 str(source),
                 str(output),
-                [{"page": 0, "rect": bbox, "new_text": "NEW"}],
+                [{"page": 0, "rect": bbox, "old_text": "OLD", "new_text": "NEW"}],
             )
 
             self.assertTrue(report["success"], json.dumps(report, indent=2))
@@ -153,6 +155,69 @@ class ApplyManyEditsContractTests(unittest.TestCase):
             self.assertIn("NEW", observed)
             self.assertNotIn("OLD", observed)
 
+    def test_missing_stable_identity_is_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory(prefix="apply-report-missing-identity-") as temp:
+            root = Path(temp)
+            source = root / "source.pdf"
+            output = root / "existing-output.pdf"
+            bbox = create_text_pdf(source, "OLD")
+            shutil.copy2(source, output)
+            output_before = sha256(output)
+
+            with self.assertRaises(ValueError) as captured:
+                BRIDGE.apply_many_edits(
+                    str(source),
+                    str(output),
+                    [{"page": 0, "rect": bbox, "new_text": "NEW"}],
+                )
+            payload = json.loads(str(captured.exception))
+            self.assertEqual(payload["error"], "INVALID_EDIT_SCHEMA")
+            self.assertEqual(payload["missing"], ["old_text"])
+            self.assertEqual(sha256(output), output_before)
+
+    def test_old_text_mismatch_is_non_destructive(self):
+        with tempfile.TemporaryDirectory(prefix="apply-report-identity-mismatch-") as temp:
+            root = Path(temp)
+            source = root / "source.pdf"
+            output = root / "existing-output.pdf"
+            bbox = create_text_pdf(source, "OLD")
+            shutil.copy2(source, output)
+            output_before = sha256(output)
+
+            report = BRIDGE.apply_many_edits(
+                str(source),
+                str(output),
+                [{"page": 0, "rect": bbox, "old_text": "WRONG", "new_text": "NEW"}],
+            )
+            self.assertFalse(report["success"])
+            self.assertEqual(report["method_per_edit"], ["identity-no-match"])
+            self.assertFalse(report["output_published"])
+            self.assertEqual(sha256(output), output_before)
+
+    def test_ambiguous_identity_is_non_destructive(self):
+        with tempfile.TemporaryDirectory(prefix="apply-report-ambiguous-") as temp:
+            root = Path(temp)
+            source = root / "source.pdf"
+            output = root / "existing-output.pdf"
+            bbox = create_text_pdf(source, "OLD")
+            shutil.copy2(source, output)
+            output_before = sha256(output)
+
+            with mock.patch.object(
+                BRIDGE,
+                "_find_exact_target_spans",
+                return_value=[{"text": "OLD"}, {"text": "OLD"}],
+            ):
+                report = BRIDGE.apply_many_edits(
+                    str(source),
+                    str(output),
+                    [{"page": 0, "rect": bbox, "old_text": "OLD", "new_text": "NEW"}],
+                )
+            self.assertFalse(report["success"])
+            self.assertEqual(report["method_per_edit"], ["ambiguous-target"])
+            self.assertFalse(report["output_published"])
+            self.assertEqual(sha256(output), output_before)
+
     def test_twenty_edit_transaction_is_exact_and_repeatable(self):
         with tempfile.TemporaryDirectory(prefix="apply-report-twenty-") as temp:
             root = Path(temp)
@@ -164,9 +229,10 @@ class ApplyManyEditsContractTests(unittest.TestCase):
                 {
                     "page": 0,
                     "rect": bbox,
+                    "old_text": old_text,
                     "new_text": f"NEW_{index:02d}",
                 }
-                for index, (_old_text, bbox) in enumerate(spans)
+                for index, (old_text, bbox) in enumerate(spans)
             ]
 
             first = BRIDGE.apply_many_edits(str(source), str(output_one), edits)
