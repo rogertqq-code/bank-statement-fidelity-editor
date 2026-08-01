@@ -2128,19 +2128,11 @@ async fn process_job_inner(
                 let started_at = std::time::Instant::now();
                 let _corrections_applied = 0usize;
 
-                // Construct AI mapping client — Transfer requires an AI provider
-                // for format mapping (this is an intentional AI-required exception;
-                // see AGENTS.md "Fallback chain rules").
-                let mut gemini = match crate::ai::backend::AiBackend::from_app_config(&cfg) {
-                    Ok(c) => std::sync::Arc::new(c),
-                    Err(_) => {
-                        let _ = res_tx.send(JobResult::TransferFailed {
-                                        stage: "Init".into(),
-                                        message: "Transfer requires an AI provider for format mapping — set GEMINI_API_KEY (or GROQ_API_KEY / OPENROUTER_API_KEY) and select a provider in Backend Preferences.".into(),
-                                    });
-                        return;
-                    }
-                };
+                // AI mapping is an optional enhancement. The supported exact-capacity
+                // path uses the deterministic local planner when no provider is ready.
+                let mut gemini = crate::ai::backend::AiBackend::from_app_config(&cfg)
+                    .ok()
+                    .map(std::sync::Arc::new);
 
                 // Helper: parse a statement via DocAI with offline fallback.
                 let doc_ai_opt = crate::ai::document_ai::DocumentAiClient::from_app_config(&cfg)
@@ -2393,99 +2385,136 @@ async fn process_job_inner(
                     attempt += 1;
                     tracing::info!("[TRANSFER] --- Starting Attempt {} ---", attempt);
 
-                    // ======= STAGE 3: AI Format Mapping ========
+                    // ======= STAGE 3: Deterministic Format Mapping ========
                     send_progress(&res_tx, TransferStage::AiFormatMapping);
-                    tracing::info!("[TRANSFER] Stage 3: AI format mapping via Gemini");
+                    tracing::info!("[TRANSFER] Stage 3: deterministic mapping with optional provider enhancement");
 
-                    let transfer_plan = match gemini
-                        .plan_transaction_transfer(
+                    let local_plan = || {
+                        crate::engine::transfer::plan_transaction_transfer_deterministic(
                             &source_transactions,
                             &target_transactions,
-                            correction_hint.as_deref(),
+                            target_stmt.total_pages,
                         )
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!("[TRANSFER] Gemini format mapping failed: {e}");
-                            if !cfg.interactive_fallbacks || !res_tx.is_interactive() {
-                                let _ = res_tx.send(JobResult::TransferFailed {
-                                    stage: "AiFormatMapping".into(),
-                                    message: format!("Gemini format mapping failed: {e}"),
-                                });
-                                return;
-                            }
-
-                            let mut req = crate::engine::interactive_fallback::InteractiveFallbackRequest::new(
-                                            "Transfer Transactions Mapping",
-                                            format!("Gemini mapping failed: {e}"),
-                                        );
-                            if cfg.openrouter_api_key.is_some() {
-                                req = req.add_alternative(
-                                    "openrouter",
-                                    "Try OpenRouter (Multi-Model)",
-                                    None,
-                                );
-                            }
-                            if cfg.groq_api_key.is_some() {
-                                req = req.add_alternative("groq", "Try Groq", None);
-                            }
-                            req = req.add_alternative("cancel", "Cancel Transfer", None);
-
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let request_id = req.id;
-                            {
-                                let mut map = router.lock().await;
-                                map.insert(request_id, tx);
-                            }
-                            let _ = res_tx.send(JobResult::InteractiveFallbackRequired(req));
-
-                            let choice = match wait_for_interactive_choice(
-                                &router,
-                                request_id,
-                                rx,
-                                std::time::Duration::from_secs(300),
+                    };
+                    let configured_mapper = gemini.clone();
+                    let transfer_plan = if let Some(mapper) = configured_mapper {
+                        match mapper
+                            .plan_transaction_transfer(
+                                &source_transactions,
+                                &target_transactions,
+                                correction_hint.as_deref(),
                             )
                             .await
-                            {
-                                Ok(choice) => choice,
-                                Err(reason) => {
-                                    let _ = res_tx.send(JobResult::TransferFailed {
-                                        stage: "AiFormatMapping".into(),
-                                        message: format!("Interactive fallback {reason}"),
-                                    });
-                                    return;
+                        {
+                            Ok(plan) => plan,
+                            Err(provider_error) => match local_plan() {
+                                Ok(plan) => {
+                                    tracing::warn!(
+                                        "[TRANSFER] Provider mapping failed ({provider_error}); using deterministic local plan"
+                                    );
+                                    plan
                                 }
-                            };
-                            if choice == "cancel" {
+                                Err(local_error) => {
+                                    if !cfg.interactive_fallbacks || !res_tx.is_interactive() {
+                                        let _ = res_tx.send(JobResult::TransferFailed {
+                                            stage: "FormatMapping".into(),
+                                            message: format!(
+                                                "Provider mapping failed ({provider_error}); deterministic mapping unsupported: {local_error}"
+                                            ),
+                                        });
+                                        return;
+                                    }
+
+                                    let mut request = crate::engine::interactive_fallback::InteractiveFallbackRequest::new(
+                                        "Transfer Transactions Mapping",
+                                        format!(
+                                            "Provider mapping failed ({provider_error}); deterministic mapping unsupported: {local_error}"
+                                        ),
+                                    );
+                                    if cfg.openrouter_api_key.is_some() {
+                                        request = request.add_alternative(
+                                            "openrouter",
+                                            "Try OpenRouter (Multi-Model)",
+                                            None,
+                                        );
+                                    }
+                                    if cfg.groq_api_key.is_some() {
+                                        request = request.add_alternative("groq", "Try Groq", None);
+                                    }
+                                    request =
+                                        request.add_alternative("cancel", "Cancel Transfer", None);
+
+                                    let (choice_tx, choice_rx) = tokio::sync::oneshot::channel();
+                                    let request_id = request.id;
+                                    {
+                                        let mut map = router.lock().await;
+                                        map.insert(request_id, choice_tx);
+                                    }
+                                    let _ = res_tx
+                                        .send(JobResult::InteractiveFallbackRequired(request));
+
+                                    let choice = match wait_for_interactive_choice(
+                                        &router,
+                                        request_id,
+                                        choice_rx,
+                                        std::time::Duration::from_secs(300),
+                                    )
+                                    .await
+                                    {
+                                        Ok(choice) => choice,
+                                        Err(reason) => {
+                                            let _ = res_tx.send(JobResult::TransferFailed {
+                                                stage: "FormatMapping".into(),
+                                                message: format!("Interactive fallback {reason}"),
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    if choice == "cancel" {
+                                        let _ = res_tx.send(JobResult::TransferFailed {
+                                            stage: "FormatMapping".into(),
+                                            message: "User cancelled after mapping failure.".into(),
+                                        });
+                                        return;
+                                    }
+
+                                    let mut new_cfg = (*cfg).clone();
+                                    if choice == "openrouter" {
+                                        new_cfg.ai_provider =
+                                            crate::app::config::AiProviderMode::OpenRouterApiKey;
+                                    } else if choice == "groq" {
+                                        new_cfg.ai_provider =
+                                            crate::app::config::AiProviderMode::GroqApiKey;
+                                    }
+                                    match crate::ai::backend::AiBackend::from_app_config(&new_cfg) {
+                                        Ok(client) => {
+                                            gemini = Some(std::sync::Arc::new(client));
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            let _ = res_tx.send(JobResult::TransferFailed {
+                                                stage: "FormatMapping".into(),
+                                                message: format!(
+                                                    "Failed to initialize fallback provider: {error}"
+                                                ),
+                                            });
+                                            return;
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    } else {
+                        match local_plan() {
+                            Ok(plan) => plan,
+                            Err(error) => {
                                 let _ = res_tx.send(JobResult::TransferFailed {
-                                    stage: "AiFormatMapping".into(),
-                                    message: "User cancelled after failure.".into(),
+                                    stage: "FormatMapping".into(),
+                                    message: format!(
+                                        "Deterministic mapping unsupported: {error}. Configure a mapping provider or review the ledgers."
+                                    ),
                                 });
                                 return;
-                            }
-                            // Update AI backend based on choice
-                            let mut new_cfg = (*cfg).clone();
-                            if choice == "openrouter" {
-                                new_cfg.ai_provider =
-                                    crate::app::config::AiProviderMode::OpenRouterApiKey;
-                            } else if choice == "groq" {
-                                new_cfg.ai_provider =
-                                    crate::app::config::AiProviderMode::GroqApiKey;
-                            }
-
-                            match crate::ai::backend::AiBackend::from_app_config(&new_cfg) {
-                                Ok(c) => {
-                                    gemini = std::sync::Arc::new(c);
-                                    continue; // Retry loop with new provider
-                                }
-                                Err(e) => {
-                                    let _ = res_tx.send(JobResult::TransferFailed {
-                                        stage: "AiFormatMapping".into(),
-                                        message: format!("Failed to init fallback provider: {e}"),
-                                    });
-                                    return;
-                                }
                             }
                         }
                     };
@@ -3119,9 +3148,10 @@ async fn process_job_inner(
 
                     // STAGE 6.5: Gemini Vision Check
                     let mut vision_anomaly = false;
-                    if let Some(edit_png_path) =
-                        report_files.iter().find(|p| p.contains("edited_p1"))
-                    {
+                    if let (Some(vision_provider), Some(edit_png_path)) = (
+                        gemini.as_ref(),
+                        report_files.iter().find(|p| p.contains("edited_p1")),
+                    ) {
                         if let Ok(png_data) = std::fs::read(edit_png_path) {
                             // only check the first page for anomalies right now
                             let page_intended: Vec<[f32; 4]> = intended_bboxes
@@ -3129,7 +3159,7 @@ async fn process_job_inner(
                                 .filter(|(p, _)| *p == 0)
                                 .map(|(_, b)| *b)
                                 .collect();
-                            if let Ok(vision_report) = gemini
+                            if let Ok(vision_report) = vision_provider
                                 .validate_render_visually(&png_data, &page_intended)
                                 .await
                             {
@@ -3260,25 +3290,38 @@ async fn process_job_inner(
                         fraction: 0.85,
                     });
 
-                    // ======= STAGE 8: Math Verification (Gemini) ========
+                    // ======= STAGE 8: Optional Provider Math Review ========
                     send_progress(&res_tx, TransferStage::MathVerificationGemini);
-                    tracing::info!("[TRANSFER] Stage 8: Math verification (Gemini)");
-
-                    let gemini_math_ok =
-                        match gemini.verify_transfer_math(&mapped, opening_balance).await {
+                    let provider_math_ok = if let Some(math_provider) = gemini.as_ref() {
+                        tracing::info!("[TRANSFER] Stage 8: optional provider math review");
+                        match math_provider
+                            .verify_transfer_math(&mapped, opening_balance)
+                            .await
+                        {
                             Ok(ok) => ok,
-                            Err(e) => {
-                                tracing::warn!("[TRANSFER] Gemini math verification error: {}", e);
+                            Err(error) => {
+                                tracing::warn!(
+                                    "[TRANSFER] Optional provider math review unavailable: {error}"
+                                );
                                 true
                             }
-                        };
+                        }
+                    } else {
+                        tracing::info!(
+                            "[TRANSFER] Stage 8: no provider configured; deterministic engine remains authoritative"
+                        );
+                        true
+                    };
 
                     let _ = res_tx.send(JobResult::Progress {
-                        label: format!("Math (Gemini) {} ", if gemini_math_ok { "✓" } else { "⚠" }),
+                        label: format!(
+                            "Optional math review {} ",
+                            if provider_math_ok { "✓" } else { "⚠" }
+                        ),
                         fraction: 0.95,
                     });
 
-                    let all_math_ok = math_verified && gemini_math_ok;
+                    let all_math_ok = math_verified && provider_math_ok;
                     let current_quality_score =
                         visual_score * (if all_math_ok { 1.0 } else { 0.5 });
                     let best_quality_score =
@@ -3382,7 +3425,7 @@ async fn process_job_inner(
                                 if let Ok(c) =
                                     crate::ai::backend::AiBackend::from_app_config(&new_cfg)
                                 {
-                                    gemini = std::sync::Arc::new(c);
+                                    gemini = Some(std::sync::Arc::new(c));
                                 }
                             }
                         } else {
