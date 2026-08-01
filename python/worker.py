@@ -13,6 +13,7 @@ import platform
 import sys
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -57,6 +58,77 @@ def _gc_collections() -> int:
         return sum(int(item.get("collections", 0)) for item in gc.get_stats())
     except (AttributeError, TypeError, ValueError):
         return 0
+
+
+MUTATING_OPERATIONS = frozenset(
+    {"replace_text_in_rect", "apply_many_edits", "clone_pages", "remove_pages"}
+)
+
+
+class MutationTransaction:
+    """Publish one worker-produced PDF atomically or leave prior bytes untouched."""
+
+    def __init__(self, final_path: Path) -> None:
+        self.final_path = final_path
+        self.final_path.parent.mkdir(parents=True, exist_ok=True)
+        self.stage_path = self.final_path.with_name(
+            f".{self.final_path.stem}.{uuid.uuid4().hex}.worker-stage"
+            f"{self.final_path.suffix or '.pdf'}"
+        )
+
+    @classmethod
+    def prepare(
+        cls, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], "MutationTransaction | None"]:
+        if request["operation"] not in MUTATING_OPERATIONS:
+            return dict(request), None
+        payload = dict(request["payload"])
+        output_path = payload.get("output_path")
+        if not isinstance(output_path, str) or not output_path:
+            raise ProtocolError("OUTPUT_PATH_REQUIRED", "mutation requires output_path")
+        transaction = cls(Path(output_path))
+        payload["output_path"] = str(transaction.stage_path)
+        staged_request = dict(request)
+        staged_request["payload"] = payload
+        return staged_request, transaction
+
+    def commit(self, operation: str, requested: int, applied: int) -> dict[str, Any]:
+        if not self.stage_path.is_file():
+            raise ProtocolError(
+                "OUTPUT_ARTIFACT_MISSING",
+                f"{operation} did not create the staged output artifact",
+            )
+        with self.stage_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        size_bytes = self.stage_path.stat().st_size
+        if size_bytes <= 0:
+            raise ProtocolError("OUTPUT_ARTIFACT_EMPTY", "staged output is empty")
+        sha256 = _sha256_file(self.stage_path)
+        os.replace(self.stage_path, self.final_path)
+        try:
+            directory_fd = os.open(self.final_path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        return {
+            "path": str(self.final_path),
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "operation": operation,
+            "requested_count": requested,
+            "applied_count": applied,
+            "committed": True,
+        }
+
+    def cleanup(self) -> None:
+        try:
+            self.stage_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class WorkerRuntime:
@@ -121,8 +193,26 @@ class WorkerRuntime:
         rss_before = _rss_bytes()
         handles_before = _open_handles()
         gc_before = _gc_collections()
+        transaction: MutationTransaction | None = None
         try:
-            outcome = self._dispatch(request)
+            self._verify_input_hash(request)
+            staged_request, transaction = MutationTransaction.prepare(request)
+            outcome = self._dispatch(staged_request)
+            if transaction is not None:
+                if (
+                    outcome["disposition"] == "succeeded"
+                    and outcome.get("requested_count") == outcome.get("applied_count")
+                ):
+                    artifact = transaction.commit(
+                        request["operation"],
+                        int(outcome["requested_count"]),
+                        int(outcome["applied_count"]),
+                    )
+                    outcome["output_sha256"] = artifact["sha256"]
+                    outcome.setdefault("payload", {})["artifact"] = artifact
+                else:
+                    transaction.cleanup()
+                    outcome["output_sha256"] = None
             response = build_response(
                 request,
                 disposition=outcome["disposition"],
@@ -136,6 +226,8 @@ class WorkerRuntime:
                 failure=outcome.get("failure"),
             )
         except BaseException as error:
+            if transaction is not None:
+                transaction.cleanup()
             response = build_response(
                 request,
                 disposition="failed",
@@ -144,6 +236,22 @@ class WorkerRuntime:
                 failure=classify_error(error, request["operation"]),
             )
         return response
+
+    @staticmethod
+    def _verify_input_hash(request: Mapping[str, Any]) -> None:
+        expected_hash = request.get("input_sha256")
+        pdf_path = request["payload"].get("pdf_path")
+        if expected_hash is None or not isinstance(pdf_path, str):
+            return
+        path = Path(pdf_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"input PDF not found: {path.name}")
+        actual_hash = _sha256_file(path)
+        if actual_hash != expected_hash:
+            raise ProtocolError(
+                "INPUT_HASH_MISMATCH",
+                f"input changed before {request['operation']} could run",
+            )
 
     def _metrics(
         self,

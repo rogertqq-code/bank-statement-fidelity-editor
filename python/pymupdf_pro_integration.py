@@ -3573,23 +3573,25 @@ def clone_pages(pdf_path: str, output_path: str, page_indices: list):
 
     Returns ``{"success": True, "cloned": N, "new_page_count": M}``.
     """
-    doc = pymupdf.open(pdf_path)
-    offset = 0
-    for orig_idx in page_indices:
-        target = orig_idx + offset
-        if target < 0 or target >= doc.page_count:
-            # Clamp silently — Gemini may occasionally produce an OOB index.
-            continue
-        # insert_pdf copies a page range from the *same* document.  The copy
-        # is inserted at `start_at` (0-based insert-before position); placing
-        # it at ``target + 1`` puts it right after the source page.
-        doc.insert_pdf(doc, from_page=target, to_page=target, start_at=target + 1)
-        offset += 1
-
-    doc.save(output_path, garbage=4, deflate=True)
-    new_count = doc.page_count
-    doc.close()
-    return {"success": True, "cloned": offset, "new_page_count": new_count}
+    source = pymupdf.open(pdf_path)
+    output = pymupdf.open()
+    cloned = 0
+    requested_by_page = {}
+    for raw_index in page_indices:
+        index = int(raw_index)
+        requested_by_page[index] = requested_by_page.get(index, 0) + 1
+    try:
+        for page_index in range(source.page_count):
+            output.insert_pdf(source, from_page=page_index, to_page=page_index)
+            for _ in range(requested_by_page.get(page_index, 0)):
+                output.insert_pdf(source, from_page=page_index, to_page=page_index)
+                cloned += 1
+        output.save(output_path, garbage=4, deflate=True)
+        new_count = output.page_count
+    finally:
+        output.close()
+        source.close()
+    return {"success": True, "cloned": cloned, "new_page_count": new_count}
 
 
 def remove_pages(pdf_path: str, output_path: str, page_indices: list):

@@ -159,6 +159,66 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(source_path.read_bytes()).hexdigest(), before_hash)
             self.assertFalse(output_path.exists())
 
+    def test_input_hash_mismatch_preserves_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.pdf"
+            output_path = Path(directory) / "existing.pdf"
+            document = pymupdf.open()
+            try:
+                page = document.new_page()
+                page.insert_text((72, 72), "ORIGINAL")
+                document.save(source_path)
+            finally:
+                document.close()
+            sentinel = b"existing-output-must-survive"
+            output_path.write_bytes(sentinel)
+            operation = request(
+                "clone_pages",
+                {
+                    "pdf_path": str(source_path),
+                    "output_path": str(output_path),
+                    "page_indices": [0],
+                },
+            )
+            operation["input_sha256"] = "0" * 64
+            response = parse_response(self.worker.send(operation))
+            self.assertEqual(response["disposition"], "failed")
+            self.assertEqual(response["failure"]["code"], "INPUT_HASH_MISMATCH")
+            self.assertEqual(output_path.read_bytes(), sentinel)
+            self.assertEqual(list(output_path.parent.glob("*.worker-stage.pdf")), [])
+
+    def test_successful_mutation_publishes_exact_artifact_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.pdf"
+            output_path = Path(directory) / "cloned.pdf"
+            document = pymupdf.open()
+            try:
+                page = document.new_page()
+                page.insert_text((72, 72), "PAGE ONE")
+                document.save(source_path)
+            finally:
+                document.close()
+            operation = request(
+                "clone_pages",
+                {
+                    "pdf_path": str(source_path),
+                    "output_path": str(output_path),
+                    "page_indices": [0],
+                },
+            )
+            operation["input_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            response = parse_response(self.worker.send(operation))
+            self.assertEqual(response["disposition"], "succeeded", response)
+            self.assertEqual(response["requested_count"], 1)
+            self.assertEqual(response["applied_count"], 1)
+            artifact = response["payload"]["artifact"]
+            self.assertTrue(artifact["committed"])
+            self.assertEqual(artifact["path"], str(output_path))
+            self.assertEqual(artifact["sha256"], hashlib.sha256(output_path.read_bytes()).hexdigest())
+            self.assertEqual(artifact["sha256"], response["output_sha256"])
+            self.assertEqual(artifact["size_bytes"], output_path.stat().st_size)
+            self.assertEqual(list(output_path.parent.glob("*.worker-stage.pdf")), [])
+
     def test_exception_taxonomy_is_stable_and_retry_aware(self) -> None:
         cases = [
             (FileNotFoundError("missing"), "INPUT_NOT_FOUND", False),
