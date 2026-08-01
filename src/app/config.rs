@@ -154,8 +154,15 @@ pub enum PdfEngineMode {
     NativeOnly,
     /// Force PyMuPDF (highest fidelity edit-in-place).
     PyMuPdfOnly,
-    /// Completely rebuild the PDF from scratch using Typst and font subsetting.
+    /// Legacy persisted value. Reconstruction is not an edit-in-place fidelity engine
+    /// and cannot be selected for the v1 editing workflow.
     TypstReconstruct,
+}
+
+impl PdfEngineMode {
+    pub const fn is_fidelity_selectable(self) -> bool {
+        !matches!(self, Self::TypstReconstruct)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +615,8 @@ impl AppConfig {
                 "native" => PdfEngineMode::NativeOnly,
                 "pymupdf" => PdfEngineMode::PyMuPdfOnly,
                 "auto" => PdfEngineMode::PyMuPdfProPrimary,
-                "typst" => PdfEngineMode::TypstReconstruct,
+                // Typst is a non-fidelity reconstruction export, never an edit engine.
+                "typst" => PdfEngineMode::PyMuPdfProPrimary,
                 "dual" | "dual_concurrent" => PdfEngineMode::DualConcurrent,
                 _ => PdfEngineMode::PyMuPdfProPrimary,
             },
@@ -914,6 +922,16 @@ mod tests {
     fn detect_adc_path_returns_string_or_none_without_panicking() {
         // Whatever the platform, this must not crash.
         let _ = detect_adc_path();
+    }
+
+    #[test]
+    fn typst_reconstruction_is_legacy_only_and_not_fidelity_selectable() -> anyhow::Result<()> {
+        let parsed: PdfEngineMode = serde_json::from_str("\"typst_reconstruct\"")?;
+        assert_eq!(parsed, PdfEngineMode::TypstReconstruct);
+        assert!(!parsed.is_fidelity_selectable());
+        assert!(PdfEngineMode::PyMuPdfProPrimary.is_fidelity_selectable());
+        assert!(PdfEngineMode::NativeOnly.is_fidelity_selectable());
+        Ok(())
     }
 
     #[test]

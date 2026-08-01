@@ -5662,7 +5662,7 @@ async fn process_job_inner(
             let eng_clone = engine_for_tokio.clone();
 
             tokio::spawn(async move {
-                // 1. Render all 4 alternatives
+                // Produce only alternatives implemented by their named engines.
                 let (rtx, rrx) = oneshot::channel();
 
                 // A) PyMuPDF Pro (via Python Bridge)
@@ -5671,7 +5671,7 @@ async fn process_job_inner(
                     .iter()
                     .map(|e| {
                         serde_json::json!({
-                            "page": 0, // local page 0 since we extract or pass full pdf but usually PyMuPDF edit is per page or we pass the document page
+                            "page": e.page,
                             "rect": [e.bbox[0], e.bbox[1], e.bbox[2], e.bbox[3]],
                             "new_text": e.new_text,
                         })
@@ -5688,60 +5688,56 @@ async fn process_job_inner(
                     },
                     rtx,
                 ));
-                let _ = rrx.await;
+                let mut candidate_outputs: Vec<(&str, std::path::PathBuf)> = Vec::new();
+                let mut candidate_failures = Vec::new();
+                match rrx.await {
+                    Ok(PythonJobResult::ApplyReport(report)) => {
+                        let exact = report.validate_exact(edits.len());
+                        let files = report.verify_files(&input, &py_out);
+                        if exact.is_ok() && files.is_ok() && report.success {
+                            candidate_outputs.push(("PyMuPDF Pro", py_out.clone()));
+                        } else {
+                            candidate_failures.push(format!(
+                                "PyMuPDF Pro rejected: exact={exact:?}, files={files:?}, success={}",
+                                report.success
+                            ));
+                        }
+                    }
+                    Ok(other) => candidate_failures
+                        .push(format!("PyMuPDF Pro returned non-apply result: {other:?}")),
+                    Err(error) => candidate_failures
+                        .push(format!("PyMuPDF Pro response channel failed: {error}")),
+                }
 
                 // B) Native Rust
                 let native_out = out_dir.join(format!("page_{}_native.pdf", page));
                 let native_in = input.clone();
                 let native_json = json_str.clone();
                 let native_out_clone = native_out.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || {
                     let native_eng = crate::pdf::native_engine::OxidizePdfEngine::new();
-                    let _ = native_eng.apply_many_edits(
-                        &native_in,
-                        &native_out_clone,
-                        &native_json,
-                        None,
-                    );
+                    native_eng.apply_many_edits(&native_in, &native_out_clone, &native_json, None)
                 })
-                .await;
+                .await
+                {
+                    Ok(Ok(applied)) if applied == edits.len() && native_out.is_file() => {
+                        candidate_outputs.push(("Native Rust", native_out.clone()));
+                    }
+                    Ok(Ok(applied)) => candidate_failures.push(format!(
+                        "Native Rust applied {applied} of {} edits",
+                        edits.len()
+                    )),
+                    Ok(Err(error)) => {
+                        candidate_failures.push(format!("Native Rust failed: {error}"))
+                    }
+                    Err(error) => {
+                        candidate_failures.push(format!("Native Rust worker panicked: {error}"))
+                    }
+                }
 
-                // C) Pdfium placeholder (using native rust)
-                let pdfium_out = out_dir.join(format!("page_{}_pdfium.pdf", page));
-                let pdfium_in = input.clone();
-                let pdfium_json = json_str.clone();
-                let pdfium_out_clone = pdfium_out.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let pdfium_eng = crate::pdf::native_engine::OxidizePdfEngine::new();
-                    let _ = pdfium_eng.apply_many_edits(
-                        &pdfium_in,
-                        &pdfium_out_clone,
-                        &pdfium_json,
-                        None,
-                    );
-                })
-                .await;
-
-                // D) Typst placeholder (using native rust)
-                let typst_out = out_dir.join(format!("page_{}_typst.pdf", page));
-                let typst_in = input.clone();
-                let typst_json = json_str.clone();
-                let typst_out_clone = typst_out.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let typst_eng = crate::pdf::native_engine::OxidizePdfEngine::new();
-                    let _ =
-                        typst_eng.apply_many_edits(&typst_in, &typst_out_clone, &typst_json, None);
-                })
-                .await;
-
-                // 2. Render each output to PNG and crop to bbox + 50px padding
+                // Render each successful named output to PNG and crop to bbox + 50px padding.
                 let mut images = Vec::new();
-                let targets = vec![
-                    ("PyMuPDF Pro", py_out),
-                    ("Pdfium", pdfium_out),
-                    ("Typst Reconstruct", typst_out),
-                    ("Native Rust", native_out),
-                ];
+                let targets = candidate_outputs;
 
                 for (label, out_path) in targets {
                     let render = tokio::task::spawn_blocking({
@@ -5783,7 +5779,17 @@ async fn process_job_inner(
                     }
                 }
 
-                let _ = res_tx.send(JobResult::VisualAlternativesReady(images));
+                if images.is_empty() {
+                    let _ = res_tx.send(JobResult::Error {
+                        job_label: "generate_visual_alternatives".into(),
+                        message: format!(
+                            "No named edit engine produced a verified visual alternative: {}",
+                            candidate_failures.join("; ")
+                        ),
+                    });
+                } else {
+                    let _ = res_tx.send(JobResult::VisualAlternativesReady(images));
+                }
             });
         }
         Job::ExportChangeHistory { output } => {
@@ -5835,59 +5841,13 @@ async fn process_job_inner(
                 tracing::debug!(job.id = id, "[runtime] cancel for unknown job");
             }
         }
-        Job::TypstReconstruct { input, output } => {
-            let _ = result_tx_clone.send(JobResult::Progress {
-                label: "Parsing for Typst reconstruct...".into(),
-                fraction: 0.1,
-            });
-            let eng = engine_for_tokio.clone();
-            let res_tx = result_tx_clone.clone();
-            tokio::spawn(async move {
-                match tokio::task::spawn_blocking(move || {
-                    crate::engine::offline_parser::parse_statement_offline(&input, eng)
-                })
-                .await
-                {
-                    Ok(Ok(stmt)) => {
-                        if stmt.transactions.is_empty() {
-                            tracing::warn!("Statement parsed for Typst is empty or near-empty.");
-                        }
-                        let _ = res_tx.send(JobResult::Progress {
-                            label: "Compiling Typst PDF...".into(),
-                            fraction: 0.5,
-                        });
-                        let typst_engine = crate::engine::typst_engine::TypstEngine::new();
-                        match typst_engine.reconstruct_pdf(&stmt, &output).await {
-                            Ok(_) => {
-                                let _ = res_tx.send(JobResult::ReconstructComplete {
-                                    output_path: output,
-                                });
-                                let _ = res_tx.send(JobResult::Progress {
-                                    label: "Done".into(),
-                                    fraction: 1.0,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = res_tx.send(JobResult::Error {
-                                    job_label: "typst_reconstruct".into(),
-                                    message: e.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        let _ = res_tx.send(JobResult::Error {
-                            job_label: "typst_parse".into(),
-                            message: e.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = res_tx.send(JobResult::Error {
-                            job_label: "typst_parse_panic".into(),
-                            message: e.to_string(),
-                        });
-                    }
-                }
+        Job::TypstReconstruct {
+            input: _,
+            output: _,
+        } => {
+            let _ = result_tx_clone.send(JobResult::Error {
+                job_label: "typst_reconstruct_disabled".into(),
+                message: "Typst reconstruction is disabled because it cannot preserve edit-in-place fidelity, page structure, or complete source content. No output was created.".into(),
             });
         }
         Job::ReloadConfig => {
@@ -7373,99 +7333,13 @@ async fn process_job_inner(
                     >;
 
                     if cfg.engine_mode == crate::app::config::PdfEngineMode::TypstReconstruct {
-                        tracing::info!("[workflow] Reconstructing PDF using TypstEngine...");
-                        let mut working_transactions = original_transactions.clone();
-                        for e in &edits {
-                            if let Some(row) = working_transactions
-                                .iter_mut()
-                                .find(|t| t.page == e.page && t.line_on_page == e.line_on_page)
-                            {
-                                match e.field {
-                                    crate::engine::workflow::EditField::Date => {
-                                        row.date = e.new_text.clone()
-                                    }
-                                    crate::engine::workflow::EditField::Description => {
-                                        row.raw_text = e.new_text.clone()
-                                    }
-                                    crate::engine::workflow::EditField::Debit => {
-                                        let cleaned: String = e
-                                            .new_text
-                                            .chars()
-                                            .filter(|c| {
-                                                c.is_ascii_digit() || *c == '-' || *c == '.'
-                                            })
-                                            .collect();
-                                        if let Ok(v) = std::str::FromStr::from_str(&cleaned) {
-                                            row.debit = Some(v);
-                                            row.credit = None;
-                                        } else {
-                                            row.debit = None;
-                                        }
-                                    }
-                                    crate::engine::workflow::EditField::Credit => {
-                                        let cleaned: String = e
-                                            .new_text
-                                            .chars()
-                                            .filter(|c| {
-                                                c.is_ascii_digit() || *c == '-' || *c == '.'
-                                            })
-                                            .collect();
-                                        if let Ok(v) = std::str::FromStr::from_str(&cleaned) {
-                                            row.credit = Some(v);
-                                            row.debit = None;
-                                        } else {
-                                            row.credit = None;
-                                        }
-                                    }
-                                    crate::engine::workflow::EditField::RunningBalance => {
-                                        let cleaned: String = e
-                                            .new_text
-                                            .chars()
-                                            .filter(|c| {
-                                                c.is_ascii_digit() || *c == '-' || *c == '.'
-                                            })
-                                            .collect();
-                                        if let Ok(v) = std::str::FromStr::from_str(&cleaned) {
-                                            row.running_balance = Some(v);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 2. Recompute running balances using the same logic as preview
-                        if let Ok(recomputed) = crate::engine::balance::process_and_reconcile(
-                            working_transactions.clone(),
-                            opening_balance,
-                            Some(expected_closing),
-                        )
-                        .map(|(r, _)| r)
-                        {
-                            working_transactions = recomputed;
-                        }
-
-                        let reconstructed_statement = crate::ai::document_ai::BankStatement {
-                            transactions: working_transactions,
-                            opening_balance,
-                            closing_balance: expected_closing,
-                            account_number: None,
-                            total_pages: 1,
-                            bank_name: None,
-                        };
-                        let typst_engine = crate::engine::typst_engine::TypstEngine::new();
-                        match typst_engine
-                            .reconstruct_pdf(&reconstructed_statement, &scratch)
-                            .await
-                        {
-                            Ok(_) => {
-                                apply_result =
-                                    Ok(PythonJobResult::Json("{\"success\":true}".into()))
-                            }
-                            Err(e) => {
-                                apply_result =
-                                    Ok(PythonJobResult::Error(format!("Typst failed: {e}")))
-                            }
-                        }
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(
+                                "Typst reconstruction is a non-fidelity export and cannot be used to finalize an edit-in-place workflow. Select PyMuPDF Pro Primary, PyMuPDF Only, Native Only, or Dual Concurrent."
+                                    .into(),
+                            ),
+                        ));
+                        return;
                     } else if let Some(ref map) = map_opt {
                         // 3-page mode: segmented batch apply.
                         // Caching is bypassed in this mode for simplicity.

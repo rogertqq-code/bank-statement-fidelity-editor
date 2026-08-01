@@ -89,7 +89,7 @@ pub enum Commands {
         retries: usize,
     },
 
-    /// Reconstruct a bank statement via Typst (fallback mechanism)
+    /// Legacy non-fidelity Typst reconstruction command (disabled; returns non-success)
     TypstReconstruct {
         #[arg(short, long)]
         input: PathBuf,
@@ -1059,7 +1059,7 @@ pub fn run_inner(
 
     match cli.command {
         Commands::TypstReconstruct { input, output } => {
-            tracing::info!("Triggering Typst Reconstruction...");
+            tracing::warn!("Typst reconstruction is disabled because it is not a fidelity-preserving edit path.");
             let _ = job_tx.send_headless(Job::TypstReconstruct {
                 input: input.clone(),
                 output: output.clone(),

@@ -1534,16 +1534,6 @@ impl MyApp {
         if let Some(action_id) = self.draw_toasts(ctx) {
             if action_id == "open_audit_explorer" {
                 self.current_view = AppView::AuditExplorer;
-            } else if action_id == "action_typst_reconstruct" {
-                let input = std::path::PathBuf::from(&self.input_path);
-                let output = input.with_extension("reconstructed.pdf");
-                self.in_flight += 1;
-                if let Err(e) = self
-                    .job_tx
-                    .send(crate::app::runtime::Job::TypstReconstruct { input, output })
-                {
-                    tracing::error!("Failed to send TypstReconstruct job: {}", e);
-                }
             }
         }
 
@@ -2242,14 +2232,12 @@ impl MyApp {
             }
             JobResult::NuclearFallbackRequired(msg) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                self.status = format!("Nuclear Fallback Required: {}", msg);
-                let toast_msg = self.status.clone();
-                self.toast_with_action(
-                    ToastKind::Error,
-                    toast_msg,
-                    "Reconstruct Now",
-                    "action_typst_reconstruct",
+                self.status = format!(
+                    "Fidelity workflow stopped without replacing the document: {}",
+                    msg
                 );
+                let toast_msg = self.status.clone();
+                self.toast(ToastKind::Error, toast_msg);
             }
         }
     }

@@ -381,6 +381,10 @@ impl AppModals for MyApp {
         if legacy_local_ocr {
             self.settings.document_parser = DocumentParserMode::OfflineHeuristic;
         }
+        let legacy_typst_edit = self.edit_engine_mode == PdfEngineMode::TypstReconstruct;
+        if legacy_typst_edit {
+            self.edit_engine_mode = PdfEngineMode::PyMuPdfProPrimary;
+        }
 
         let id = ui.make_persistent_id("backend_prefs_collapsing");
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
@@ -394,6 +398,12 @@ impl AppModals for MyApp {
                     ui.colored_label(
                         self.settings.theme.palette().warn,
                         "Local OCR PDF parsing is not part of v1; Offline Heuristic was selected instead.",
+                    );
+                }
+                if legacy_typst_edit {
+                    ui.colored_label(
+                        self.settings.theme.palette().warn,
+                        "Typst reconstruction is a non-fidelity export, not an edit engine; PyMuPDF Pro Primary was selected instead.",
                     );
                 }
                 ui.add_space(6.0);
@@ -480,11 +490,6 @@ impl AppModals for MyApp {
                                     PdfEngineMode::PyMuPdfOnly,
                                     "PyMuPDF Only",
                                     capabilities.status(Capability::PythonPipeline),
-                                );
-                                ui.selectable_value(
-                                    &mut self.edit_engine_mode,
-                                    PdfEngineMode::TypstReconstruct,
-                                    "Typst Reconstruct",
                                 );
                             });
                         ui.end_row();

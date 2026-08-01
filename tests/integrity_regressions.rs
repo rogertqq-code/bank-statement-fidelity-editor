@@ -10,6 +10,42 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
+fn typst_reconstruction_is_disabled_and_preserves_destination() {
+    let workspace = tempfile::tempdir().unwrap();
+    let input = workspace.path().join("input.pdf");
+    let output = workspace.path().join("existing-output.pdf");
+    fixtures::generate_test_pdf(2, &input);
+    std::fs::write(&output, b"prior-valid-output").unwrap();
+
+    let config = Arc::new(dual_core_pdf_pipeline::app::config::AppConfig::default());
+    let audit_log = dual_core_pdf_pipeline::app::audit::AuditLog::open(workspace.path()).unwrap();
+    let (_runtime, job_tx, result_rx) =
+        dual_core_pdf_pipeline::app::runtime::Runtime::start(audit_log, config);
+    job_tx
+        .send(Job::TypstReconstruct {
+            input,
+            output: output.clone(),
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match result_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(JobResult::Error { job_label, message }) => {
+                assert_eq!(job_label, "typst_reconstruct_disabled");
+                assert!(message.contains("cannot preserve edit-in-place fidelity"));
+                assert_eq!(std::fs::read(&output).unwrap(), b"prior-valid-output");
+                return;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("result channel failed: {error}"),
+        }
+    }
+    panic!("disabled Typst job did not emit a terminal error");
+}
+
+#[test]
 fn short_document_batch_commits_every_edit_before_success() {
     let workspace = tempfile::tempdir().unwrap();
     let input = workspace.path().join("input.pdf");
