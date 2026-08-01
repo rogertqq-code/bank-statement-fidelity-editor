@@ -148,7 +148,7 @@ async fn test_calculate_global_imbalance_with_transactions() {
 }
 
 #[tokio::test]
-async fn test_balance_entire_statement_perfect_balance() {
+async fn test_balance_entire_statement_rejects_empty_ledger() {
     let mut config = AppConfig::default();
     config.passphrase = "test-passphrase-1234567890".into();
     let config_arc = Arc::new(config);
@@ -189,9 +189,12 @@ async fn test_balance_entire_statement_perfect_balance() {
     doc.trailer.set("Root", catalog_id);
     doc.save(&pdf_path).unwrap();
 
-    let changes = engine.balance_entire_statement(&pdf_path).await.unwrap();
-    assert!(changes.is_empty());
-    assert!(engine.is_balanced);
+    let error = engine
+        .balance_entire_statement(&pdf_path)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no transaction rows were found"));
+    assert!(!engine.is_balanced);
 }
 
 #[tokio::test]

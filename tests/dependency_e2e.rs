@@ -1,15 +1,33 @@
+use dual_core_pdf_pipeline::pdf::native_engine::pdfium_resolver;
 use pdfium_render::prelude::Pdfium;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 #[test]
 fn test_pdfium_library_loads() {
-    let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-        .or_else(|_| Pdfium::bind_to_system_library());
+    let directory = pdfium_resolver::probe_local().unwrap_or_else(|error| {
+        panic!(
+            "FATAL: no checksum-verified bundled or loadable system Pdfium is available: {error}"
+        )
+    });
+
+    let bindings = if directory.as_os_str().is_empty() {
+        Pdfium::bind_to_system_library()
+    } else {
+        #[cfg(target_os = "windows")]
+        let library_name = "pdfium.dll";
+        #[cfg(target_os = "macos")]
+        let library_name = "libpdfium.dylib";
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let library_name = "libpdfium.so";
+
+        Pdfium::bind_to_library(directory.join(library_name))
+    };
 
     assert!(
         bindings.is_ok(),
-        "FATAL: libpdfium.dylib (or platform equivalent) is missing or cannot be loaded! Dependency check failed. Error: {:?}", bindings.err().unwrap()
+        "FATAL: the checksum-verified Pdfium library could not be loaded: {:?}",
+        bindings.err()
     );
 }
 

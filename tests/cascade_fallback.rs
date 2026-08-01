@@ -52,6 +52,7 @@ fn create_four_page_pdf(path: &Path) {
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
             "Contents" => content_id,
             "Resources" => resources_id,
         });
@@ -92,11 +93,15 @@ fn test_cascade_fallback_with_downed_actor() {
 
     let (_runtime, job_tx, res_rx) =
         dual_core_pdf_pipeline::app::runtime::Runtime::start(audit_log, config);
+    std::env::remove_var("TEST_CRASH_PYTHON_ACTOR");
 
+    let geometry_engine = OxidizePdfEngine::new();
+    let page_0_bbox = geometry_engine.get_text_blocks(&input, 0).unwrap()[0].bbox;
+    let page_3_bbox = geometry_engine.get_text_blocks(&input, 3).unwrap()[0].bbox;
     let changes = vec![
         ProposedChange {
             page: 0,
-            bbox: Some([49.0, 699.0, 101.0, 715.0]),
+            bbox: Some(page_0_bbox),
             old_text: "Page 0".into(),
             new_text: "Modified 0".into(),
             reason: "test".into(),
@@ -105,7 +110,7 @@ fn test_cascade_fallback_with_downed_actor() {
         },
         ProposedChange {
             page: 3,
-            bbox: Some([49.0, 699.0, 101.0, 715.0]),
+            bbox: Some(page_3_bbox),
             old_text: "Page 3".into(),
             new_text: "Modified 3".into(),
             reason: "test".into(),

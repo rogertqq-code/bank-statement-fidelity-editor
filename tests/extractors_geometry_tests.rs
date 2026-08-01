@@ -100,6 +100,7 @@ async fn test_native_text_layer_provider() {
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         "Contents" => content_id,
         "Resources" => resources_id,
     });

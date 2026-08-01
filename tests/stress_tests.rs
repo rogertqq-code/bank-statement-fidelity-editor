@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 #[test]
 fn test_runtime_stress_load() {
-    let _ = dotenvy::dotenv();
-    let config = Arc::new(AppConfig::from_env().unwrap());
-    let audit_log = AuditLog::open(PathBuf::from("audit")).unwrap();
+    let mut config = AppConfig::default();
+    config.passphrase = "phase06-stress-test-passphrase-1234".into();
+    let config = Arc::new(config);
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_log = AuditLog::open(audit_dir.path()).unwrap();
 
     // Spawn the runtime server
     let (_runtime, job_tx, _job_rx) = Runtime::start(audit_log, config.clone());

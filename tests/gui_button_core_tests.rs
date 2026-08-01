@@ -16,6 +16,7 @@ use dual_core_pdf_pipeline::engine::workflow::WorkflowStage;
 use lopdf::dictionary;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -38,6 +39,27 @@ fn pump(app: &mut MyApp) {
             app.headless_update(ctx);
         });
     harness.step();
+}
+
+fn recv_matching_job(
+    receiver: &mpsc::Receiver<Job>,
+    timeout: Duration,
+    predicate: impl Fn(&Job) -> bool,
+) -> Option<Job> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(job) if predicate(&job) => return Some(job),
+            Ok(_) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                return None;
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -155,13 +177,13 @@ fn test_open_pdf_valid_file() {
 
     assert_eq!(app.current_pdf_path, pdf_path);
     assert_eq!(app.in_flight, 1);
-    let mut found = false;
-    while let Ok(job) = job_rx.try_recv() {
-        if matches!(job, Job::LoadDocument { .. }) {
-            found = true;
-        }
-    }
-    assert!(found, "LoadDocument job was not found in the channel");
+    let job = recv_matching_job(&job_rx, Duration::from_secs(1), |job| {
+        matches!(job, Job::LoadDocument { .. })
+    });
+    assert!(
+        job.is_some(),
+        "LoadDocument job was not forwarded within one second"
+    );
 }
 
 // ===========================================================================
@@ -736,31 +758,20 @@ fn test_request_render_deduplication() {
     app.current_page_dpi = 300.0;
 
     app.request_render("current");
-    let render_count_1 = {
-        let mut count = 0;
-        while let Ok(job) = job_rx.try_recv() {
-            if matches!(job, Job::RenderPage { .. }) {
-                count += 1;
-            }
-        }
-        count
-    };
-    assert_eq!(render_count_1, 1, "First render request should dispatch");
+    let first = recv_matching_job(&job_rx, Duration::from_secs(1), |job| {
+        matches!(job, Job::RenderPage { .. })
+    });
+    assert!(first.is_some(), "First render request was not forwarded");
 
-    // Same request again — should be deduplicated
+    // Same request again — no second render may be forwarded, although unrelated
+    // lifecycle work is allowed to share the channel.
     app.request_render("current");
-    let render_count_2 = {
-        let mut count = 0;
-        while let Ok(job) = job_rx.try_recv() {
-            if matches!(job, Job::RenderPage { .. }) {
-                count += 1;
-            }
-        }
-        count
-    };
-    assert_eq!(
-        render_count_2, 0,
-        "Duplicate render request should be skipped"
+    let duplicate = recv_matching_job(&job_rx, Duration::from_millis(100), |job| {
+        matches!(job, Job::RenderPage { .. })
+    });
+    assert!(
+        duplicate.is_none(),
+        "Duplicate render request was dispatched"
     );
 }
 
