@@ -687,6 +687,7 @@ mod tests {
             field_bboxes: FieldBboxes::default(),
             provenance: crate::engine::model::Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         }
     }
 

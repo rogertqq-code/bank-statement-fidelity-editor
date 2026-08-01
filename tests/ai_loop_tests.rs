@@ -55,6 +55,7 @@ async fn test_verify_and_repair_extraction_loop() {
             field_bboxes: Default::default(),
             provenance: Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         }],
         total_pages: 1,
         account_number: None,

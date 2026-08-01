@@ -167,6 +167,7 @@ mod tests {
             field_bboxes: Default::default(),
             provenance: Provenance::Manual,
             category: None,
+            canonical: Default::default(),
         }
     }
 

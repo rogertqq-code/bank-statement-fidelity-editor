@@ -60,6 +60,54 @@ pub struct Transaction {
     /// Auto-categorization label (e.g. "Food", "Travel").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+
+    /// Canonical extraction metadata shared by every parser and workflow.
+    #[serde(default, skip_serializing_if = "CanonicalMetadata::is_empty")]
+    pub canonical: CanonicalMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CanonicalMetadata {
+    /// Stable identity inside the source document, normally `p{page}:r{line}`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stable_row_id: String,
+    /// ISO 4217 currency code when known (for example `AUD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// BCP 47 locale tag when known (for example `en-AU`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// Parser confidence in the semantic row, constrained to 0..=1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// True when this row must be reviewed before automatic editing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub review_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_reason: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl CanonicalMetadata {
+    pub fn for_row(page: usize, line_on_page: usize, confidence: Option<f32>) -> Self {
+        Self {
+            stable_row_id: format!("p{page}:r{line_on_page}"),
+            confidence: confidence.map(|value| value.clamp(0.0, 1.0)),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stable_row_id.is_empty()
+            && self.currency.is_none()
+            && self.locale.is_none()
+            && self.confidence.is_none()
+            && !self.review_required
+            && self.review_reason.is_none()
+    }
 }
 
 /// Per-field bounding boxes for a single transaction row. All bboxes are
@@ -105,6 +153,31 @@ impl Transaction {
     #[inline]
     pub fn net_delta(&self) -> Decimal {
         self.delta_in() - self.delta_out()
+    }
+
+    /// Fill canonical metadata deterministically for legacy/parser rows while
+    /// preserving any explicit currency, locale, confidence, or review flag.
+    pub fn ensure_canonical_metadata(&mut self) {
+        if self.canonical.stable_row_id.is_empty() {
+            self.canonical.stable_row_id = format!("p{}:r{}", self.page, self.line_on_page);
+        }
+        if self.canonical.confidence.is_none() {
+            self.canonical.confidence = Some(match self.provenance {
+                Provenance::DocumentAI { confidence } => confidence.clamp(0.0, 1.0),
+                Provenance::Manual => 1.0,
+                Provenance::Computed => 0.8,
+            });
+        }
+        if self
+            .canonical
+            .confidence
+            .is_some_and(|confidence| confidence < 0.85)
+        {
+            self.canonical.review_required = true;
+            if self.canonical.review_reason.is_none() {
+                self.canonical.review_reason = Some("parser confidence below 0.85".into());
+            }
+        }
     }
 }
 
@@ -176,6 +249,7 @@ mod tests {
             field_bboxes: Default::default(),
             provenance: Provenance::Manual,
             category: None,
+            canonical: Default::default(),
         }
     }
 
@@ -206,6 +280,48 @@ mod tests {
         let json = serde_json::to_string(&change_no_bbox)?;
         let decoded: ProposedChange = serde_json::from_str(&json)?;
         assert_eq!(decoded.bbox, None);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_metadata_roundtrips_and_preserves_review_state() -> anyhow::Result<()> {
+        let mut transaction = tx(Some(dec!(10.25)), None);
+        transaction.ensure_canonical_metadata();
+        transaction.canonical.currency = Some("AUD".into());
+        transaction.canonical.locale = Some("en-AU".into());
+        transaction.canonical.review_required = true;
+        transaction.canonical.review_reason = Some("manual confirmation requested".into());
+
+        let encoded = serde_json::to_string(&transaction)?;
+        let decoded: Transaction = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded, transaction);
+        assert_eq!(decoded.canonical.stable_row_id, "p0:r0");
+        assert_eq!(decoded.canonical.currency.as_deref(), Some("AUD"));
+        assert_eq!(decoded.canonical.locale.as_deref(), Some("en-AU"));
+        assert_eq!(decoded.canonical.confidence, Some(1.0));
+        assert!(decoded.canonical.review_required);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_transaction_json_deserializes_then_normalizes() -> anyhow::Result<()> {
+        let legacy = serde_json::json!({
+            "page": 2,
+            "line_on_page": 7,
+            "date": "2026-01-01",
+            "raw_text": "Legacy row",
+            "debit": "5.00",
+            "credit": null,
+            "running_balance": "15.00",
+            "bbox": [10.0, 20.0, 100.0, 30.0],
+            "provenance": "Computed"
+        });
+        let mut transaction: Transaction = serde_json::from_value(legacy)?;
+        assert!(transaction.canonical.is_empty());
+        transaction.ensure_canonical_metadata();
+        assert_eq!(transaction.canonical.stable_row_id, "p2:r7");
+        assert_eq!(transaction.canonical.confidence, Some(0.8));
+        assert!(transaction.canonical.review_required);
         Ok(())
     }
 
@@ -351,6 +467,7 @@ pub fn dataframe_to_transactions(df: &DataFrame) -> Result<Vec<Transaction>, Dat
             field_bboxes: Default::default(),
             provenance: Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         });
     }
 
@@ -376,6 +493,7 @@ mod dataframe_tests {
                 field_bboxes: Default::default(),
                 provenance: Provenance::Manual,
                 category: None,
+                canonical: Default::default(),
             },
             Transaction {
                 page: 1,
@@ -389,6 +507,7 @@ mod dataframe_tests {
                 field_bboxes: Default::default(),
                 provenance: Provenance::Manual,
                 category: None,
+                canonical: Default::default(),
             },
         ]
     }

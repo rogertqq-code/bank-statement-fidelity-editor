@@ -419,6 +419,30 @@ pub fn deterministic_parse_issues(
         }
         previous_identity = Some(identity);
 
+        let expected_row_id = format!("p{}:r{}", transaction.page, transaction.line_on_page);
+        if transaction.canonical.stable_row_id != expected_row_id {
+            issues.push(format!(
+                "row {index} has unstable identity {:?}; expected {expected_row_id}",
+                transaction.canonical.stable_row_id
+            ));
+        }
+        if transaction
+            .canonical
+            .confidence
+            .is_none_or(|confidence| !(0.0..=1.0).contains(&confidence))
+        {
+            issues.push(format!("row {index} has no valid parser confidence"));
+        }
+        if transaction.canonical.review_required {
+            issues.push(format!(
+                "row {index} requires review: {}",
+                transaction
+                    .canonical
+                    .review_reason
+                    .as_deref()
+                    .unwrap_or("unspecified parser concern")
+            ));
+        }
         if transaction.date.trim().is_empty() {
             issues.push(format!("row {index} has no date"));
         }
@@ -1174,6 +1198,7 @@ mod tests {
             field_bboxes: Default::default(),
             provenance: Provenance::Manual,
             category: None,
+            canonical: crate::engine::model::CanonicalMetadata::for_row(page, line, Some(1.0)),
         }
     }
 

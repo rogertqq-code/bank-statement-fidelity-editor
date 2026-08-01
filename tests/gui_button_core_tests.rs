@@ -786,6 +786,7 @@ fn test_workflow_transactions_populated() {
             field_bboxes: Default::default(),
             provenance: Provenance::Manual,
             category: None,
+            canonical: Default::default(),
         },
         Transaction {
             page: 0,
@@ -799,6 +800,7 @@ fn test_workflow_transactions_populated() {
             field_bboxes: Default::default(),
             provenance: Provenance::Manual,
             category: None,
+            canonical: Default::default(),
         },
     ];
 

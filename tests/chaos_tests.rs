@@ -53,6 +53,7 @@ async fn test_chaos_malformed_json_repair() {
         field_bboxes: Default::default(),
         provenance: Provenance::Computed,
         category: None,
+        canonical: Default::default(),
     };
 
     let result = backend

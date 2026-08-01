@@ -131,6 +131,7 @@ fn confirm_and_render_rejects_unbalanced_ledger_before_output_mutation() {
         field_bboxes: Default::default(),
         provenance: Provenance::Manual,
         category: None,
+        canonical: Default::default(),
     }];
     let edits = vec![UserEdit {
         page: 0,

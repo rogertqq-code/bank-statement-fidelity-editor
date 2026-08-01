@@ -213,6 +213,7 @@ mod tests {
                 field_bboxes: Default::default(),
                 provenance: crate::engine::model::Provenance::Computed,
                 category: None,
+                canonical: Default::default(),
             }],
             opening_balance: dec!(0.0),
             closing_balance: dec!(100.0),

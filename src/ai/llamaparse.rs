@@ -103,8 +103,9 @@ impl LlamaParseClient {
             });
 
         if let (Some(c), Some(h)) = (cache.as_ref(), cache_key.as_ref()) {
-            if let Some(cached_stmt) = c.get(h) {
+            if let Some(mut cached_stmt) = c.get(h) {
                 tracing::info!("[llamaparse] Found cached parsed statement for this file");
+                cached_stmt.ensure_canonical_metadata();
                 return Ok(cached_stmt);
             }
         }
@@ -114,6 +115,7 @@ impl LlamaParseClient {
         let markdown = self.fetch_markdown(&job_id).await?;
 
         let mut stmt = self.parse_markdown_to_statement(&markdown)?;
+        stmt.ensure_canonical_metadata();
 
         let stmt_clone = stmt.clone();
 
@@ -140,6 +142,7 @@ impl LlamaParseClient {
                 });
         }
 
+        stmt.ensure_canonical_metadata();
         if let (Some(ref c), Some(ref h)) = (&cache, &cache_key) {
             if let Err(e) = c.put(h, &stmt) {
                 tracing::warn!("[llamaparse] Failed to cache statement: {}", e);
@@ -391,6 +394,7 @@ impl LlamaParseClient {
                                 field_bboxes: Default::default(),
                                 provenance: crate::engine::model::Provenance::Computed,
                                 category: None,
+                                canonical: Default::default(),
                             });
                         } else if date.is_empty()
                             && debit.is_none()

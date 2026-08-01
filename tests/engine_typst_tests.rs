@@ -49,6 +49,7 @@ async fn test_generate_chase_markup() {
             field_bboxes: FieldBboxes::default(),
             provenance: Provenance::Manual,
             category: None,
+            canonical: Default::default(),
         }],
         opening_balance: dec!(150.00),
         closing_balance: dec!(130.00),

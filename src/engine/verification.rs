@@ -789,6 +789,7 @@ mod stage_g_tests {
             field_bboxes: Default::default(),
             provenance: crate::engine::model::Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         }
     }
 

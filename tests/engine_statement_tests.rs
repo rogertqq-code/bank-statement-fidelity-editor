@@ -85,6 +85,7 @@ async fn test_calculate_global_imbalance_with_transactions() {
             field_bboxes: Default::default(),
             provenance: dual_core_pdf_pipeline::engine::model::Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         },
         Transaction {
             page: 1,
@@ -98,6 +99,7 @@ async fn test_calculate_global_imbalance_with_transactions() {
             field_bboxes: Default::default(),
             provenance: dual_core_pdf_pipeline::engine::model::Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         },
         Transaction {
             page: 1,
@@ -111,6 +113,7 @@ async fn test_calculate_global_imbalance_with_transactions() {
             field_bboxes: Default::default(),
             provenance: dual_core_pdf_pipeline::engine::model::Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         },
         Transaction {
             page: 1,
@@ -124,6 +127,7 @@ async fn test_calculate_global_imbalance_with_transactions() {
             field_bboxes: Default::default(),
             provenance: dual_core_pdf_pipeline::engine::model::Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         },
     ];
 

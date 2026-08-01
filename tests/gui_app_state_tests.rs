@@ -191,6 +191,7 @@ fn test_handle_job_result_transactions_extracted() {
         field_bboxes: Default::default(),
         provenance: dual_core_pdf_pipeline::engine::model::Provenance::Manual,
         category: None,
+        canonical: Default::default(),
     }];
 
     job_tx_dummy

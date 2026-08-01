@@ -93,14 +93,17 @@ pub fn parse_statement_offline(
         closing_balance,
     );
 
-    Ok(BankStatement {
+    let mut statement = BankStatement {
         total_pages,
         transactions,
         opening_balance,
         closing_balance,
         account_number: extract_account_number(&all_rows),
         bank_name: None,
-    })
+    };
+    statement.ensure_canonical_metadata();
+    calibrate_offline_confidence(&mut statement);
+    Ok(statement)
 }
 
 /// Parse a bank statement from pre-extracted `LineGeometry` entries.
@@ -121,14 +124,37 @@ pub fn parse_statement_from_geometry(
 
     let (transactions, opening_balance, closing_balance) = parse_rows_into_transactions(&rows);
 
-    Ok(BankStatement {
+    let mut statement = BankStatement {
         total_pages,
         transactions,
         opening_balance,
         closing_balance,
         account_number: extract_account_number(&rows),
         bank_name: None,
-    })
+    };
+    statement.ensure_canonical_metadata();
+    calibrate_offline_confidence(&mut statement);
+    Ok(statement)
+}
+
+fn calibrate_offline_confidence(statement: &mut BankStatement) {
+    for transaction in &mut statement.transactions {
+        let has_amount_geometry = if transaction.debit.is_some() {
+            transaction.field_bboxes.debit.is_some()
+        } else if transaction.credit.is_some() {
+            transaction.field_bboxes.credit.is_some()
+        } else {
+            false
+        };
+        let exact_geometry = transaction.field_bboxes.date.is_some()
+            && transaction.field_bboxes.description.is_some()
+            && transaction.field_bboxes.running_balance.is_some()
+            && has_amount_geometry;
+        transaction.canonical.confidence = Some(if exact_geometry { 0.95 } else { 0.75 });
+        transaction.canonical.review_required = !exact_geometry;
+        transaction.canonical.review_reason = (!exact_geometry)
+            .then(|| "offline row lacks complete field-level geometry".to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +392,7 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
             field_bboxes,
             provenance: Provenance::Computed,
             category: None,
+            canonical: Default::default(),
         });
     }
 

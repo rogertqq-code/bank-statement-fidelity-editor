@@ -19,6 +19,7 @@ fn test_ai_matrix_consensus() {
         field_bboxes: FieldBboxes::default(),
         provenance: dual_core_pdf_pipeline::engine::model::Provenance::Computed,
         category: None,
+        canonical: Default::default(),
     };
 
     let t2 = Transaction {
@@ -33,6 +34,7 @@ fn test_ai_matrix_consensus() {
         field_bboxes: FieldBboxes::default(),
         provenance: dual_core_pdf_pipeline::engine::model::Provenance::Computed,
         category: None,
+        canonical: Default::default(),
     };
 
     let stmt_gemini = BankStatement {

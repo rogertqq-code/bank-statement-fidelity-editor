@@ -24,6 +24,7 @@ async fn test_transfer_test_loop_retry() {
         field_bboxes: Default::default(),
         provenance: Provenance::Computed,
         category: None,
+        canonical: Default::default(),
     };
 
     let result = backend

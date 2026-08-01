@@ -59,6 +59,36 @@ pub struct BankStatement {
     pub bank_name: Option<String>,
 }
 
+impl BankStatement {
+    pub fn ensure_canonical_metadata(&mut self) {
+        for transaction in &mut self.transactions {
+            transaction.ensure_canonical_metadata();
+            if transaction.canonical.currency.is_none() {
+                let text = transaction.raw_text.to_uppercase();
+                transaction.canonical.currency = if text.contains("AUD") || text.contains("A$") {
+                    Some("AUD".into())
+                } else if text.contains("NZD") || text.contains("NZ$") {
+                    Some("NZD".into())
+                } else if text.contains('€') {
+                    Some("EUR".into())
+                } else if text.contains('£') {
+                    Some("GBP".into())
+                } else {
+                    None
+                };
+            }
+            if transaction.canonical.locale.is_none() {
+                transaction.canonical.locale = match transaction.canonical.currency.as_deref() {
+                    Some("AUD") => Some("en-AU".into()),
+                    Some("NZD") => Some("en-NZ".into()),
+                    Some("GBP") => Some("en-GB".into()),
+                    _ => None,
+                };
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct JwtClaims {
     iss: String,
@@ -1183,6 +1213,7 @@ impl DocumentAiClient {
                         field_bboxes,
                         provenance: Provenance::DocumentAI { confidence },
                         category: None,
+                        canonical: Default::default(),
                     });
                 }
                 "transaction" => {
@@ -1246,6 +1277,7 @@ impl DocumentAiClient {
                         field_bboxes,
                         provenance: Provenance::DocumentAI { confidence },
                         category: None,
+                        canonical: Default::default(),
                     });
                 }
                 "starting_balance" | "opening_balance" => {
@@ -1267,14 +1299,16 @@ impl DocumentAiClient {
             }
         }
 
-        Ok(BankStatement {
+        let mut statement = BankStatement {
             total_pages,
             transactions,
             opening_balance,
             closing_balance,
             account_number,
             bank_name: None,
-        })
+        };
+        statement.ensure_canonical_metadata();
+        Ok(statement)
     }
 
     // -----------------------------------------------------------------------
@@ -2151,6 +2185,7 @@ mod tests {
                     field_bboxes: Default::default(),
                     provenance: Provenance::DocumentAI { confidence: 0.9 },
                     category: None,
+                    canonical: Default::default(),
                 })
                 .collect(),
             opening_balance: f64_to_dec(opening),

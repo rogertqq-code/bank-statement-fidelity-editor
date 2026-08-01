@@ -50,6 +50,7 @@ fn test_categorize_transactions_coverage() {
         field_bboxes: FieldBboxes::default(),
         provenance: Provenance::Computed,
         category: None,
+        canonical: Default::default(),
     }];
     tx.send(Job::CategorizeTransactions { transactions: txs })
         .unwrap();

@@ -78,6 +78,7 @@ fn test_gui_headless_interactions() {
             field_bboxes: Default::default(),
             provenance: dual_core_pdf_pipeline::engine::model::Provenance::Manual,
             category: None,
+            canonical: Default::default(),
         });
 
     app.proposed_changes.push((

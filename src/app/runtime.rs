@@ -3111,6 +3111,7 @@ async fn process_job_inner(
                             field_bboxes: crate::engine::model::FieldBboxes::default(),
                             provenance: crate::engine::model::Provenance::Computed,
                             category: None,
+                            canonical: Default::default(),
                         })
                         .collect();
 
@@ -4055,6 +4056,7 @@ async fn process_job_inner(
                                 field_bboxes: Default::default(),
                                 provenance: crate::engine::model::Provenance::Computed,
                                 category: None,
+                                canonical: Default::default(),
                             })
                             .collect();
 
@@ -6238,6 +6240,7 @@ async fn process_job_inner(
                                 field_bboxes: Default::default(),
                                 provenance: crate::engine::model::Provenance::Computed,
                                 category: None,
+                                canonical: Default::default(),
                             })
                             .collect();
 
@@ -6479,7 +6482,7 @@ async fn process_job_inner(
                             }
 
                 let mut current_parser_mode = parser_mode;
-                let stmt = loop {
+                let mut stmt = loop {
                     match current_parser_mode {
                         DocumentParserMode::DocumentAi => {
                             let _ = res_tx.send(JobResult::Progress {
@@ -6708,6 +6711,7 @@ async fn process_job_inner(
                         }
                     }
                 };
+                stmt.ensure_canonical_metadata();
 
                 use crate::app::config::AiProviderMode;
 
