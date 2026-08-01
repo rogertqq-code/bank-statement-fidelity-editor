@@ -46,164 +46,41 @@ impl OxidizePdfEngine {
         path: &Path,
         page_num: usize,
     ) -> Result<Vec<TextBlock>, EngineError> {
-        let doc =
-            lopdf::Document::load(path).map_err(|e| EngineError::LoadFailed(format!("{e}")))?;
-
-        let pages = doc.get_pages();
-        let page_id = pages
-            .get(&(page_num as u32 + 1)) // lopdf uses 1-indexed pages
-            .ok_or_else(|| {
-                EngineError::ExtractFailed(format!(
-                    "Page {} not found (document has {} pages)",
-                    page_num,
-                    pages.len()
-                ))
-            })?;
-
-        let page_box = effective_page_box(&doc, *page_id)?;
-
-        let content = doc
-            .get_page_content(*page_id)
-            .map_err(|e| EngineError::ExtractFailed(format!("Failed to get page content: {e}")))?;
-
+        let document = lopdf::Document::load(path)
+            .map_err(|error| EngineError::LoadFailed(format!("{error}")))?;
+        let pages = document.get_pages();
+        let page_id = *pages.get(&(page_num as u32 + 1)).ok_or_else(|| {
+            EngineError::ExtractFailed(format!(
+                "Page {page_num} not found (document has {} pages)",
+                pages.len()
+            ))
+        })?;
+        let page_box = effective_page_box(&document, page_id)?;
+        let content = document.get_page_content(page_id).map_err(|error| {
+            EngineError::ExtractFailed(format!("Failed to get page content: {error}"))
+        })?;
         let operations = lopdf::content::Content::decode(&content)
-            .map_err(|e| {
-                EngineError::ExtractFailed(format!("Failed to decode content stream: {e}"))
+            .map_err(|error| {
+                EngineError::ExtractFailed(format!("Failed to decode content stream: {error}"))
             })?
             .operations;
-
-        let mut blocks: Vec<TextBlock> = Vec::new();
-        let mut current_font = String::from("Unknown");
-        let mut font_size: f32 = 12.0;
-        let mut text_leading: f32 = 0.0;
-        // Text matrix tracking: [a, b, c, d, tx, ty]
-        let mut tm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
-        // Text line matrix (set by Td/TD/T*)
-        let mut tlm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
-        let mut in_text = false;
-
-        for op in &operations {
-            match op.operator.as_str() {
-                "BT" => {
-                    in_text = true;
-                    tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                    tlm = tm;
-                }
-                "ET" => {
-                    in_text = false;
-                }
-                "Tf" if in_text => {
-                    // Set font: Tf <font-name> <size>
-                    if op.operands.len() >= 2 {
-                        if let lopdf::Object::Name(ref name) = op.operands[0] {
-                            current_font = String::from_utf8_lossy(name).to_string();
-                        }
-                        font_size = operand_to_f32(&op.operands[1]).unwrap_or(12.0);
-                    }
-                }
-                "Tm" if in_text => {
-                    // Set text matrix directly: Tm a b c d tx ty
-                    if op.operands.len() >= 6 {
-                        for (i, operand) in op.operands.iter().enumerate().take(6) {
-                            tm[i] = operand_to_f32(operand).unwrap_or(0.0);
-                        }
-                        tlm = tm;
-                    }
-                }
-                "Td" if in_text => {
-                    // Move text position: Td tx ty
-                    if op.operands.len() >= 2 {
-                        let tx = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                        let ty = operand_to_f32(&op.operands[1]).unwrap_or(0.0);
-                        tlm[4] += tx;
-                        tlm[5] += ty;
-                        tm = tlm;
-                    }
-                }
-                "TD" if in_text => {
-                    // Move text position and set leading: TD tx ty
-                    if op.operands.len() >= 2 {
-                        let tx = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                        let ty = operand_to_f32(&op.operands[1]).unwrap_or(0.0);
-                        text_leading = -ty;
-                        tlm[4] += tx;
-                        tlm[5] += ty;
-                        tm = tlm;
-                    }
-                }
-                "T*" if in_text => {
-                    // Move to start of next line (uses TL - leading)
-                    let shift = if text_leading == 0.0 {
-                        font_size
-                    } else {
-                        text_leading
-                    };
-                    tlm[5] -= shift;
-                    tm = tlm;
-                }
-                "Tj" if in_text => {
-                    // Show string: Tj <string>
-                    if let Some(text) = extract_string_operand(&op.operands) {
-                        if !text.trim().is_empty() {
-                            let x = tm[4];
-                            let y = tm[5];
-                            let estimated_width = text.len() as f32 * font_size * 0.5;
-                            blocks.push(TextBlock {
-                                page: page_num,
-                                text: text.clone(),
-                                bbox: page_box.content_span_to_top_left(
-                                    x,
-                                    y,
-                                    estimated_width,
-                                    font_size,
-                                ),
-                                font: current_font.clone(),
-                                size: font_size,
-                                obj_id: Some(format!("ObjId({}, {})", page_id.0, page_id.1)),
-                            });
-                        }
-                    }
-                }
-                "TJ" if in_text => {
-                    // Show array of strings with kerning adjustments
-                    if let Some(lopdf::Object::Array(ref arr)) = op.operands.first() {
-                        let mut combined_text = String::new();
-                        for item in arr {
-                            match item {
-                                lopdf::Object::String(bytes, _) => {
-                                    combined_text.push_str(&String::from_utf8_lossy(bytes));
-                                }
-                                lopdf::Object::Integer(_) | lopdf::Object::Real(_) => {
-                                    // Kerning adjustment - skip
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !combined_text.trim().is_empty() {
-                            let x = tm[4];
-                            let y = tm[5];
-                            let estimated_width = combined_text.len() as f32 * font_size * 0.5;
-                            blocks.push(TextBlock {
-                                page: page_num,
-                                text: combined_text,
-                                bbox: page_box.content_span_to_top_left(
-                                    x,
-                                    y,
-                                    estimated_width,
-                                    font_size,
-                                ),
-                                font: current_font.clone(),
-                                size: font_size,
-                                obj_id: Some(format!("ObjId({}, {})", page_id.0, page_id.1)),
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Ok(blocks)
+        let targets = collect_native_text_targets(&operations, page_box).map_err(|error| {
+            EngineError::ExtractFailed(format!("Failed to map positioned text: {error}"))
+        })?;
+        Ok(targets
+            .into_iter()
+            .map(|target| TextBlock {
+                page: page_num,
+                text: target.text,
+                bbox: target.bbox,
+                font: target.font,
+                size: target.size,
+                obj_id: Some(format!(
+                    "ObjId({}, {}):op{}",
+                    page_id.0, page_id.1, target.operation_index
+                )),
+            })
+            .collect())
     }
 }
 
@@ -317,6 +194,317 @@ fn extract_string_operand(operands: &[lopdf::Object]) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeBatchEdit {
+    page: usize,
+    rect: [f32; 4],
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct NativeTextTarget {
+    operation_index: usize,
+    text: String,
+    bbox: [f32; 4],
+    font: String,
+    size: f32,
+}
+
+type PdfMatrix = [f32; 6];
+
+fn matrix_multiply(left: PdfMatrix, right: PdfMatrix) -> PdfMatrix {
+    [
+        left[0] * right[0] + left[2] * right[1],
+        left[1] * right[0] + left[3] * right[1],
+        left[0] * right[2] + left[2] * right[3],
+        left[1] * right[2] + left[3] * right[3],
+        left[0] * right[4] + left[2] * right[5] + left[4],
+        left[1] * right[4] + left[3] * right[5] + left[5],
+    ]
+}
+
+fn transform_point(matrix: PdfMatrix, x: f32, y: f32) -> (f32, f32) {
+    (
+        matrix[0] * x + matrix[2] * y + matrix[4],
+        matrix[1] * x + matrix[3] * y + matrix[5],
+    )
+}
+
+fn operation_text_and_advance(
+    operation: &lopdf::content::Operation,
+    font_size: f32,
+) -> Option<(String, f32)> {
+    match operation.operator.as_str() {
+        "Tj" => {
+            let text = extract_string_operand(&operation.operands)?;
+            let advance = text.chars().count() as f32 * font_size * 0.5;
+            Some((text, advance))
+        }
+        "TJ" => {
+            let lopdf::Object::Array(items) = operation.operands.first()? else {
+                return None;
+            };
+            let mut text = String::new();
+            let mut advance = 0.0;
+            for item in items {
+                match item {
+                    lopdf::Object::String(bytes, _) => {
+                        let part = String::from_utf8_lossy(bytes);
+                        advance += part.chars().count() as f32 * font_size * 0.5;
+                        text.push_str(&part);
+                    }
+                    lopdf::Object::Integer(value) => {
+                        advance -= *value as f32 / 1000.0 * font_size;
+                    }
+                    lopdf::Object::Real(value) => {
+                        advance -= *value / 1000.0 * font_size;
+                    }
+                    _ => {}
+                }
+            }
+            Some((text, advance.max(0.0)))
+        }
+        _ => None,
+    }
+}
+
+fn canonical_text_bbox(
+    page_box: CanonicalPageBox,
+    ctm: PdfMatrix,
+    text_matrix: PdfMatrix,
+    advance: f32,
+    font_size: f32,
+) -> [f32; 4] {
+    let render = matrix_multiply(ctm, text_matrix);
+    let corners = [
+        transform_point(render, 0.0, 0.0),
+        transform_point(render, advance, 0.0),
+        transform_point(render, 0.0, font_size),
+        transform_point(render, advance, font_size),
+    ];
+    let min_x = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    page_box.content_span_to_top_left(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+fn collect_native_text_targets(
+    operations: &[lopdf::content::Operation],
+    page_box: CanonicalPageBox,
+) -> Result<Vec<NativeTextTarget>, EngineError> {
+    let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut ctm = identity;
+    let mut graphics_stack = Vec::new();
+    let mut tm = identity;
+    let mut tlm = identity;
+    let mut current_font = String::from("Unknown");
+    let mut font_size = 12.0;
+    let mut text_leading = 0.0;
+    let mut in_text = false;
+    let mut targets = Vec::new();
+
+    for (operation_index, operation) in operations.iter().enumerate() {
+        match operation.operator.as_str() {
+            "q" => graphics_stack.push(ctm),
+            "Q" => {
+                ctm = graphics_stack.pop().ok_or_else(|| {
+                    EngineError::ApplyFailed("unbalanced PDF graphics-state restore".into())
+                })?;
+            }
+            "cm" => {
+                if operation.operands.len() != 6 {
+                    return Err(EngineError::ApplyFailed(
+                        "malformed six-operand CTM transformation".into(),
+                    ));
+                }
+                let mut transform = identity;
+                for (index, operand) in operation.operands.iter().enumerate() {
+                    transform[index] = operand_to_f32(operand).ok_or_else(|| {
+                        EngineError::ApplyFailed("non-numeric CTM operand".into())
+                    })?;
+                }
+                ctm = matrix_multiply(ctm, transform);
+            }
+            "BT" => {
+                in_text = true;
+                tm = identity;
+                tlm = identity;
+            }
+            "ET" => in_text = false,
+            "Tf" if in_text => {
+                if operation.operands.len() >= 2 {
+                    if let lopdf::Object::Name(name) = &operation.operands[0] {
+                        current_font = String::from_utf8_lossy(name).to_string();
+                    }
+                    font_size = operand_to_f32(&operation.operands[1]).ok_or_else(|| {
+                        EngineError::ApplyFailed("non-numeric text font size".into())
+                    })?;
+                }
+            }
+            "Tl" if in_text => {
+                if let Some(operand) = operation.operands.first() {
+                    text_leading = operand_to_f32(operand).ok_or_else(|| {
+                        EngineError::ApplyFailed("non-numeric text leading".into())
+                    })?;
+                }
+            }
+            "Tm" if in_text => {
+                if operation.operands.len() != 6 {
+                    return Err(EngineError::ApplyFailed(
+                        "malformed six-operand text matrix".into(),
+                    ));
+                }
+                for (index, operand) in operation.operands.iter().enumerate() {
+                    tm[index] = operand_to_f32(operand).ok_or_else(|| {
+                        EngineError::ApplyFailed("non-numeric text-matrix operand".into())
+                    })?;
+                }
+                tlm = tm;
+            }
+            "Td" | "TD" if in_text => {
+                if operation.operands.len() < 2 {
+                    return Err(EngineError::ApplyFailed(
+                        "malformed text-line translation".into(),
+                    ));
+                }
+                let tx = operand_to_f32(&operation.operands[0]).ok_or_else(|| {
+                    EngineError::ApplyFailed("non-numeric text-line x translation".into())
+                })?;
+                let ty = operand_to_f32(&operation.operands[1]).ok_or_else(|| {
+                    EngineError::ApplyFailed("non-numeric text-line y translation".into())
+                })?;
+                if operation.operator == "TD" {
+                    text_leading = -ty;
+                }
+                tlm[4] += tlm[0] * tx + tlm[2] * ty;
+                tlm[5] += tlm[1] * tx + tlm[3] * ty;
+                tm = tlm;
+            }
+            "T*" if in_text => {
+                let shift = if text_leading == 0.0 {
+                    font_size
+                } else {
+                    text_leading
+                };
+                tlm[4] -= tlm[2] * shift;
+                tlm[5] -= tlm[3] * shift;
+                tm = tlm;
+            }
+            "Tj" | "TJ" if in_text => {
+                if let Some((text, advance)) = operation_text_and_advance(operation, font_size) {
+                    if !text.trim().is_empty() {
+                        targets.push(NativeTextTarget {
+                            operation_index,
+                            text,
+                            bbox: canonical_text_bbox(page_box, ctm, tm, advance, font_size),
+                            font: current_font.clone(),
+                            size: font_size,
+                        });
+                    }
+                    tm[4] += tm[0] * advance;
+                    tm[5] += tm[1] * advance;
+                }
+            }
+            "'" | "\"" if in_text => {
+                return Err(EngineError::ApplyFailed(
+                    "native exact editor does not support quote text-show operators".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !graphics_stack.is_empty() {
+        return Err(EngineError::ApplyFailed(
+            "unbalanced PDF graphics-state save".into(),
+        ));
+    }
+    Ok(targets)
+}
+
+fn normalized_text_identity(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn inherited_page_rotation(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> i32 {
+    let mut current = page_id;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) {
+        let Ok(dictionary) = doc.get_dictionary(current) else {
+            break;
+        };
+        if let Ok(value) = dictionary.get(b"Rotate") {
+            if let Ok(rotation) = value.as_i64() {
+                return rotation.rem_euclid(360) as i32;
+            }
+        }
+        let Ok(parent) = dictionary
+            .get(b"Parent")
+            .and_then(lopdf::Object::as_reference)
+        else {
+            break;
+        };
+        current = parent;
+    }
+    0
+}
+
+fn save_lopdf_atomically(
+    document: &mut lopdf::Document,
+    output: &Path,
+    expected_pages: usize,
+) -> Result<(), EngineError> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| {
+        EngineError::ApplyFailed(format!("Failed to create output directory: {error}"))
+    })?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| EngineError::ApplyFailed(format!("Failed to stage output: {error}")))?;
+    let temporary_path = temporary.into_temp_path();
+    let staged_path: &Path = temporary_path.as_ref();
+    document
+        .save(staged_path)
+        .map_err(|error| EngineError::ApplyFailed(format!("Failed to save staged PDF: {error}")))?;
+    let staged = lopdf::Document::load(staged_path)
+        .map_err(|error| EngineError::ApplyFailed(format!("Staged PDF is unreadable: {error}")))?;
+    if staged.get_pages().len() != expected_pages {
+        return Err(EngineError::ApplyFailed(format!(
+            "Staged PDF page count changed from {expected_pages} to {}",
+            staged.get_pages().len()
+        )));
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            EngineError::ApplyFailed(format!("Failed to flush staged PDF: {error}"))
+        })?;
+    temporary_path.persist(output).map_err(|error| {
+        EngineError::ApplyFailed(format!("Failed to atomically publish PDF: {error}"))
+    })?;
+    #[cfg(unix)]
+    {
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
 }
 
 /// Pdfium library resolver: finds or downloads the Pdfium shared library and
@@ -897,173 +1085,128 @@ impl PdfEngine for OxidizePdfEngine {
         edits_json: &str,
         _font_path: Option<&std::path::Path>,
     ) -> Result<usize, EngineError> {
-        let edits: Vec<serde_json::Value> = serde_json::from_str(edits_json)
-            .map_err(|e| EngineError::ApplyFailed(format!("Invalid edits JSON: {e}")))?;
-        tracing::debug!(
-            edits_count = edits.len(),
-            "native engine apply_many_edits called"
-        );
-
-        // Stage 1 Strict Font Guard for batch edits
-        for edit in &edits {
-            if let Some(new_text) = edit["new_text"].as_str() {
-                if !new_text.is_ascii() {
-                    return Err(EngineError::FontCoverageMissing(
-                        "Native engine requires ASCII for safe subset coverage; complex chars detected".into()
-                    ));
-                }
+        let edits: Vec<NativeBatchEdit> = serde_json::from_str(edits_json).map_err(|error| {
+            EngineError::ApplyFailed(format!("Invalid typed edits JSON: {error}"))
+        })?;
+        if edits.is_empty() {
+            return Err(EngineError::ApplyFailed("empty edit batch".into()));
+        }
+        for (index, edit) in edits.iter().enumerate() {
+            if edit.old_text.trim().is_empty() {
+                return Err(EngineError::ApplyFailed(format!(
+                    "edit {index} is missing stable old_text identity"
+                )));
+            }
+            if !edit.new_text.is_ascii() {
+                return Err(EngineError::FontCoverageMissing(
+                    "Native engine requires ASCII for safe subset coverage; complex chars detected"
+                        .into(),
+                ));
+            }
+            if !edit.rect.iter().all(|value| value.is_finite())
+                || edit.rect[2] <= edit.rect[0]
+                || edit.rect[3] <= edit.rect[1]
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "edit {index} has invalid canonical rectangle {:?}",
+                    edit.rect
+                )));
             }
         }
 
-        let mut doc =
-            lopdf::Document::load(input).map_err(|e| EngineError::LoadFailed(format!("{e}")))?;
-
-        let mut applied_count = 0;
-        let mut modified_pages = std::collections::HashSet::new();
-
-        let mut edits_by_page: std::collections::HashMap<usize, Vec<&serde_json::Value>> =
-            std::collections::HashMap::new();
-        for edit in &edits {
-            if let Some(page) = edit["page"].as_u64() {
-                edits_by_page.entry(page as usize).or_default().push(edit);
-            }
+        let mut document = lopdf::Document::load(input)
+            .map_err(|error| EngineError::LoadFailed(format!("{error}")))?;
+        let pages = document.get_pages();
+        let expected_pages = pages.len();
+        let mut edits_by_page: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, edit) in edits.iter().enumerate() {
+            edits_by_page.entry(edit.page).or_default().push(index);
         }
 
-        let pages = doc.get_pages();
-
-        for (page_idx, page_edits) in edits_by_page {
+        for (page_index, edit_indices) in edits_by_page {
             let page_id = *pages
-                .get(&(page_idx as u32 + 1))
-                .ok_or_else(|| EngineError::ApplyFailed(format!("Page {page_idx} not found")))?;
-            let page_box = effective_page_box(&doc, page_id)?;
-
-            let content_bytes = doc.get_page_content(page_id).unwrap_or_default();
+                .get(&(page_index as u32 + 1))
+                .ok_or_else(|| EngineError::ApplyFailed(format!("Page {page_index} not found")))?;
+            let rotation = inherited_page_rotation(&document, page_id);
+            if rotation != 0 {
+                return Err(EngineError::ApplyFailed(format!(
+                    "native exact editor does not support page {page_index} rotation {rotation}; use the Pro engine"
+                )));
+            }
+            let page_box = effective_page_box(&document, page_id)?;
+            let content_bytes = document.get_page_content(page_id).map_err(|error| {
+                EngineError::ApplyFailed(format!(
+                    "Failed to read page {page_index} content: {error}"
+                ))
+            })?;
             if content_bytes.is_empty() {
-                continue;
+                return Err(EngineError::ApplyFailed(format!(
+                    "page {page_index} has no editable text content"
+                )));
             }
+            let mut content = lopdf::content::Content::decode(&content_bytes).map_err(|error| {
+                EngineError::ApplyFailed(format!("Failed to decode page {page_index}: {error}"))
+            })?;
+            let targets = collect_native_text_targets(&content.operations, page_box)?;
+            let mut selected_operations = std::collections::HashSet::new();
+            let mut replacements = Vec::new();
 
-            let mut content = match lopdf::content::Content::decode(&content_bytes) {
-                Ok(c) => c,
-                Err(e) => {
+            for edit_index in edit_indices {
+                let edit = &edits[edit_index];
+                let identity = normalized_text_identity(&edit.old_text);
+                let candidates: Vec<&NativeTextTarget> = targets
+                    .iter()
+                    .filter(|target| {
+                        normalized_text_identity(&target.text) == identity
+                            && bbox_overlap_fraction(edit.rect, target.bbox) >= 0.5
+                    })
+                    .collect();
+                if candidates.is_empty() {
                     return Err(EngineError::ApplyFailed(format!(
-                        "Failed to decode content: {e}"
-                    )))
+                        "edit {edit_index} stable target not found on page {page_index}: old_text={:?}, rect={:?}",
+                        edit.old_text, edit.rect
+                    )));
                 }
-            };
-
-            let mut tm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
-            let mut tlm = tm;
-            let mut font_size: f32 = 12.0;
-            let mut text_leading: f32 = 0.0;
-            let mut in_text = false;
-
-            for op in &mut content.operations {
-                match op.operator.as_str() {
-                    "BT" => {
-                        in_text = true;
-                        tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                        tlm = tm;
-                    }
-                    "ET" => {
-                        in_text = false;
-                    }
-                    "Tf" if in_text => {
-                        if op.operands.len() >= 2 {
-                            font_size = operand_to_f32(&op.operands[1]).unwrap_or(12.0);
-                        }
-                    }
-                    "Tl" if in_text => {
-                        if !op.operands.is_empty() {
-                            text_leading = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                        }
-                    }
-                    "Tm" if in_text => {
-                        if op.operands.len() >= 6 {
-                            for (i, operand) in op.operands.iter().enumerate().take(6) {
-                                tm[i] = operand_to_f32(operand).unwrap_or(0.0);
-                            }
-                            tlm = tm;
-                        }
-                    }
-                    "Td" if in_text => {
-                        if op.operands.len() >= 2 {
-                            let tx = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                            let ty = operand_to_f32(&op.operands[1]).unwrap_or(0.0);
-                            tlm[4] += tx;
-                            tlm[5] += ty;
-                            tm = tlm;
-                        }
-                    }
-                    "TD" if in_text => {
-                        if op.operands.len() >= 2 {
-                            let tx = operand_to_f32(&op.operands[0]).unwrap_or(0.0);
-                            let ty = operand_to_f32(&op.operands[1]).unwrap_or(0.0);
-                            text_leading = -ty;
-                            tlm[4] += tx;
-                            tlm[5] += ty;
-                            tm = tlm;
-                        }
-                    }
-                    "T*" if in_text => {
-                        let shift = if text_leading == 0.0 {
-                            font_size
-                        } else {
-                            text_leading
-                        };
-                        tlm[5] -= shift;
-                        tm = tlm;
-                    }
-                    "Tj" | "TJ" if in_text => {
-                        let x = tm[4];
-                        let y = tm[5];
-                        for edit in &page_edits {
-                            if let Some(rect) = edit["rect"].as_array() {
-                                if rect.len() == 4 {
-                                    tracing::debug!("edit bbox match found");
-                                    let canonical_bbox = [
-                                        rect[0].as_f64().unwrap_or(0.0) as f32,
-                                        rect[1].as_f64().unwrap_or(0.0) as f32,
-                                        rect[2].as_f64().unwrap_or(0.0) as f32,
-                                        rect[3].as_f64().unwrap_or(0.0) as f32,
-                                    ];
-                                    let content_bbox = page_box.top_left_to_content(canonical_bbox);
-                                    if x >= content_bbox[0] - 1.0
-                                        && y >= content_bbox[1] - 1.0
-                                        && x <= content_bbox[2] + 1.0
-                                        && y <= content_bbox[3] + 1.0
-                                    {
-                                        if let Some(new_text) = edit["new_text"].as_str() {
-                                            op.operator = "Tj".to_string();
-                                            op.operands = vec![lopdf::Object::String(
-                                                new_text.as_bytes().to_vec(),
-                                                lopdf::StringFormat::Literal,
-                                            )];
-                                            applied_count += 1;
-                                            modified_pages.insert(page_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+                if candidates.len() != 1 {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "edit {edit_index} is ambiguous on page {page_index}: {} operators match old_text={:?} and rect={:?}",
+                        candidates.len(), edit.old_text, edit.rect
+                    )));
                 }
+                let operation_index = candidates[0].operation_index;
+                if !selected_operations.insert(operation_index) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "multiple edits select page {page_index} operation {operation_index}"
+                    )));
+                }
+                replacements.push((operation_index, edit_index));
             }
 
-            if modified_pages.contains(&page_id) {
-                let new_content_bytes = content.encode().map_err(|e| {
-                    EngineError::ApplyFailed(format!("Failed to encode content: {e}"))
+            for (operation_index, edit_index) in replacements {
+                let operation = content.operations.get_mut(operation_index).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "resolved operation {operation_index} disappeared on page {page_index}"
+                    ))
                 })?;
-
-                doc.change_page_content(page_id, new_content_bytes)
-                    .map_err(|e| EngineError::ApplyFailed(format!("Failed to update page: {e}")))?;
+                operation.operator = "Tj".to_string();
+                operation.operands = vec![lopdf::Object::String(
+                    edits[edit_index].new_text.as_bytes().to_vec(),
+                    lopdf::StringFormat::Literal,
+                )];
             }
+            let encoded = content.encode().map_err(|error| {
+                EngineError::ApplyFailed(format!("Failed to encode page {page_index}: {error}"))
+            })?;
+            document
+                .change_page_content(page_id, encoded)
+                .map_err(|error| {
+                    EngineError::ApplyFailed(format!("Failed to update page {page_index}: {error}"))
+                })?;
         }
 
-        doc.save(output)
-            .map_err(|e| EngineError::ApplyFailed(format!("Failed to save: {e}")))?;
-
-        Ok(applied_count)
+        save_lopdf_atomically(&mut document, output, expected_pages)?;
+        Ok(edits.len())
     }
 
     fn clone_pages(

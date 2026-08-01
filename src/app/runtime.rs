@@ -2788,32 +2788,44 @@ async fn process_job_inner(
                                             );
                             }
                             Some(target) => {
-                                let fields: Vec<(&str, Option<[f32; 4]>, String)> = vec![
-                                    ("date", target.field_bboxes.date, tx.date.clone()),
+                                let fields: Vec<(&str, Option<[f32; 4]>, String, String)> = vec![
+                                    (
+                                        "date",
+                                        target.field_bboxes.date,
+                                        target.date.clone(),
+                                        tx.date.clone(),
+                                    ),
                                     (
                                         "description",
                                         target.field_bboxes.description,
+                                        target.raw_text.clone(),
                                         tx.description.clone(),
                                     ),
                                     (
                                         "debit",
                                         target.field_bboxes.debit,
+                                        target.debit.map(|d| d.to_string()).unwrap_or_default(),
                                         tx.debit.map(|d| d.to_string()).unwrap_or_default(),
                                     ),
                                     (
                                         "credit",
                                         target.field_bboxes.credit,
+                                        target.credit.map(|c| c.to_string()).unwrap_or_default(),
                                         tx.credit.map(|c| c.to_string()).unwrap_or_default(),
                                     ),
                                     (
                                         "balance",
                                         target.field_bboxes.running_balance,
+                                        target
+                                            .running_balance
+                                            .map(|balance| balance.to_string())
+                                            .unwrap_or_default(),
                                         tx.running_balance.to_string(),
                                     ),
                                 ];
 
                                 let mut any_field_written = false;
-                                for (_field_name, field_bbox, field_text) in &fields {
+                                for (_field_name, field_bbox, old_text, field_text) in &fields {
                                     if field_text.is_empty() {
                                         continue;
                                     }
@@ -2821,6 +2833,7 @@ async fn process_job_inner(
                                         batch_edits.push(serde_json::json!({
                                             "page": adjusted_page,
                                             "rect": bbox,
+                                            "old_text": old_text.clone(),
                                             "new_text": field_text.clone(),
                                         }));
                                         actually_edited_bboxes.push((adjusted_page, *bbox));
@@ -2843,6 +2856,7 @@ async fn process_job_inner(
                                         batch_edits.push(serde_json::json!({
                                             "page": adjusted_page,
                                             "rect": bbox,
+                                            "old_text": target.raw_text.clone(),
                                             "new_text": new_text.clone(),
                                         }));
                                         actually_edited_bboxes.push((adjusted_page, bbox));
@@ -2997,14 +3011,26 @@ async fn process_job_inner(
                             .await
                             .unwrap_or(Ok(0));
 
+                            let native_temp = output_pdf.with_extension("temp.pdf");
                             if let Ok(c) = native_res {
-                                if c > 0 {
+                                if c == total_edits && native_temp.is_file() {
                                     edits_applied = c;
-                                    let _ = std::fs::rename(
-                                        output_pdf.with_extension("temp.pdf"),
-                                        &output_pdf,
+                                    if let Err(error) = std::fs::rename(&native_temp, &output_pdf) {
+                                        edits_applied = 0;
+                                        let _ = std::fs::remove_file(&native_temp);
+                                        tracing::warn!(
+                                            "[TRANSFER] Native exact batch could not be published: {error}"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "[TRANSFER] (Native) Exact batch edit succeeded"
+                                        );
+                                    }
+                                } else {
+                                    let _ = std::fs::remove_file(&native_temp);
+                                    tracing::warn!(
+                                        "[TRANSFER] Native batch rejected: applied {c}/{total_edits} edits"
                                     );
-                                    tracing::info!("[TRANSFER] (Native) Batch edit succeeded");
                                 }
                             }
 
@@ -5397,6 +5423,7 @@ async fn process_job_inner(
                                 Some(serde_json::json!({
                                     "page": local,
                                     "rect": [b[0], b[1], b[2], b[3]],
+                                    "old_text": ch.old_text,
                                     "new_text": ch.new_text,
                                 }))
                             })
@@ -5673,6 +5700,7 @@ async fn process_job_inner(
                         serde_json::json!({
                             "page": e.page,
                             "rect": [e.bbox[0], e.bbox[1], e.bbox[2], e.bbox[3]],
+                            "old_text": e.old_text,
                             "new_text": e.new_text,
                         })
                     })

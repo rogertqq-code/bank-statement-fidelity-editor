@@ -296,18 +296,15 @@ fn test_native_engine_text_operators() {
 
     assert_eq!(blocks.len(), 5);
     assert_eq!(blocks[0].text, "Line 1");
-    // Verify Y coordinates go down (in PDF coordinate space, origin is bottom-left, so Y decreases)
-    // Actually, in our engine `extract_text_blocks_from_page` inverts Y so Y increases down the page
-    // Wait, let's just check relative positions.
+    // Canonical bboxes use a visible top-left origin, so lower lines have larger Y.
     let y1 = blocks[0].bbox[1];
     let y2 = blocks[1].bbox[1];
     let y3 = blocks[2].bbox[1];
     let y4 = blocks[3].bbox[1];
 
-    // As Y increases from bottom to top in PDF coordinate space, Y should decrease for each new line
-    assert!(y1 > y2);
-    assert!(y2 > y3);
-    assert!(y3 > y4);
+    assert!(y1 < y2);
+    assert!(y2 < y3);
+    assert!(y3 < y4);
 
     // Line 5 is parsed as "Line 5" from TJ array
     assert_eq!(blocks[4].text, "Line 5");
