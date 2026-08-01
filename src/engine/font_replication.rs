@@ -2,9 +2,9 @@
 //!
 //! High-level orchestration for the deep font replication pipeline.
 //!
-//! Phase 3: Font extraction and glyph synthesis is now handled natively
-//! using `lopdf` for stream extraction, `skrifa` for font analysis, and
-//! `write-fonts` for glyph patching. No FFI dependencies remain.
+//! Font extraction and glyph measurement are handled natively with `lopdf`
+//! and `skrifa`. This module does not synthesize missing glyph programs: any
+//! uncovered replacement character is an explicit unsupported disposition.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -151,19 +151,12 @@ pub fn measure_advances(font_data: &[u8], text: &str) -> Result<Vec<(char, f32)>
     Ok(advances)
 }
 
-/// Phase 3: Synthesize a font subset containing all characters needed for
-/// a given replacement text.
+/// Validate that an extracted font program covers every required character.
 ///
-/// Strategy:
-/// 1. Parse the original font with `ttf_parser` to check cmap coverage
-/// 2. Identify which characters from `required_text` are missing
-/// 3. If all present -> return original bytes unchanged
-/// 4. If missing -> clone metrics from a similar glyph (e.g. use '0' as
-///    a donor for missing digits to maintain tabular width) and construct
-///    a new font binary using `write_fonts`
-///
-/// Returns the (possibly modified) font bytes suitable for embedding.
-pub fn synthesize_font_subset(
+/// The original bytes are returned unchanged only when coverage is complete.
+/// Missing glyphs are never fabricated from donor outlines or metrics because
+/// doing so would change the typeface while masquerading as fidelity.
+pub fn require_font_subset_coverage(
     original_bytes: &[u8],
     required_text: &str,
 ) -> Result<(Vec<u8>, Vec<char>), String> {
@@ -186,23 +179,9 @@ pub fn synthesize_font_subset(
         return Ok((original_bytes.to_vec(), missing));
     }
 
-    tracing::info!(
-        "[FONT SYNTH] {} of {} required characters missing: {:?}",
-        missing.len(),
-        required_text.chars().count(),
-        missing
-    );
-
-    // For now, return the original bytes with the missing list so the
-    // caller can decide to fall back to a system font or use a donor.
-    // Full glyph synthesis via write-fonts will be implemented when
-    // the glyf table construction is needed for production use.
-    //
-    // The key insight: for bank statement digits (0-9, '.', ',', '$'),
-    // most embedded subsets already contain these. The rare case of a
-    // truly missing digit glyph requires write-fonts FontBuilder which
-    // we'll wire in a follow-up commit.
-    Ok((original_bytes.to_vec(), missing))
+    Err(format!(
+        "FONT_COVERAGE_INSUFFICIENT: embedded font lacks required characters {missing:?}"
+    ))
 }
 
 /// Check which characters from `required_text` are covered by the font's cmap.

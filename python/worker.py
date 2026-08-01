@@ -459,6 +459,7 @@ def classify_error(error: BaseException, operation: str) -> dict[str, Any]:
     for token in (
         "PRO_PAGE_LIMIT_EXCEEDED",
         "FONT_COVERAGE_INSUFFICIENT",
+        "FONT_EMBEDDING_UNAVAILABLE",
         "PDF_NOT_EDITABLE",
     ):
         if token in message:

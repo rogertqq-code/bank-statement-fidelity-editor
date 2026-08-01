@@ -91,18 +91,18 @@ pub struct FontAnalysisSummary {
     pub all_fonts_covered: bool,
 }
 
-/// Stage 12 / Item #3: result of one cascade invocation, surfaced to the
-/// GUI and audit trail. The Rust runtime decodes the JSON shape returned
-/// by `font_replicator.replicate_font_for_chars` into this struct.
+/// Legacy font-substitution operation result retained for audit compatibility.
+/// Automatic composite, donor, and AI-selected glyph generation is disabled;
+/// historical payloads that reported success are decoded as rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FontCascadeReport {
-    /// True when the cascade closed the gap. False when some characters
-    /// still couldn't be covered.
+    /// Always false for the supported runtime policy. Kept for wire and audit
+    /// compatibility with historical payloads.
     pub success: bool,
     /// Original font name as reported by the editor.
     pub original_font: String,
-    /// Path to the extended font file the editor will use on the retry,
-    /// when one was produced.
+    /// Historical generated-font path, retained only as audit evidence and
+    /// never used for an edit retry.
     pub extended_font_path: Option<std::path::PathBuf>,
     /// Tiers that actually contributed glyphs (subset of
     /// `["composite", "subset_extension", "gemini_vision"]`).
@@ -118,23 +118,17 @@ pub struct FontCascadeReport {
 }
 
 impl FontCascadeReport {
-    /// One-line summary for the GUI status bar / audit log.
+    /// One-line audit summary. Generated typefaces are never represented as a
+    /// successful fidelity result.
     pub fn one_line_summary(&self) -> String {
-        if self.success {
-            let mut parts = Vec::new();
-            if !self.synthesised.is_empty() {
-                parts.push(format!("composite ({})", self.synthesised.len()));
-            }
-            if !self.donor_extended.is_empty() {
-                parts.push(format!("donor ({})", self.donor_extended.len()));
-            }
-            if !self.ai_extended.is_empty() {
-                parts.push(format!("AI donor ({})", self.ai_extended.len()));
-            }
-            format!("✅ font cascade: {}", parts.join(" + "))
+        let generated = self.synthesised.len() + self.donor_extended.len() + self.ai_extended.len();
+        if generated > 0 || self.extended_font_path.is_some() {
+            format!(
+                "Font substitution blocked: rejected {generated} generated glyph(s) from a legacy cascade payload"
+            )
         } else {
             format!(
-                "⛔ font cascade incomplete: {} char(s) still missing",
+                "Font substitution disabled: {} character(s) remain unsupported",
                 self.still_missing.len()
             )
         }
@@ -148,7 +142,8 @@ impl FontCascadeReport {
     ) -> Result<Self, String> {
         let v: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| format!("cascade decode: {e}"))?;
-        let success = v.get("success").and_then(|b| b.as_bool()).unwrap_or(false);
+        let _reported_success = v.get("success").and_then(|b| b.as_bool()).unwrap_or(false);
+        let success = false;
         let extended_font_path = v
             .get("extended_font_path")
             .and_then(|s| s.as_str())

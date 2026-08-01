@@ -2399,8 +2399,8 @@ async fn process_job_inner(
                 let mut best_math_verified = false;
                 let mut best_result = None;
                 let mut correction_hint: Option<String> = None;
-                let mut synthesized_fonts_used = false;
-                let mut font_override_path: Option<String> = None;
+                let synthesized_fonts_used = false;
+                let font_override_path: Option<String> = None;
                 let mut total_corrections = 0;
 
                 loop {
@@ -3195,46 +3195,18 @@ async fn process_job_inner(
                         fraction: 0.55,
                     });
 
-                    // Handle PyMuPDF standard-14 fallback detection
-                    if !fallback_fonts_used.is_empty()
-                        && font_override_path.is_none()
-                        && attempt < max_retries
-                    {
-                        tracing::warn!("[TRANSFER] PyMuPDF used fallback fonts on pages {:?}. Synthesizing font...", fallback_fonts_used);
-                        let _ = res_tx.send(JobResult::Progress {
-                            label: format!(
-                                "(Attempt {attempt}) Synthesizing precise missing glyphs..."
+                    // Any engine-reported fallback-font usage is a hard fidelity
+                    // failure. Automatic glyph synthesis and donor substitution are
+                    // not approved transfer recovery paths.
+                    if !fallback_fonts_used.is_empty() {
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "PdfSurgery".into(),
+                            message: format!(
+                                "Font fidelity unavailable on pages {:?}; no substituted output was accepted",
+                                fallback_fonts_used
                             ),
-                            fraction: 0.55,
                         });
-                        let (rtx, rrx) = tokio::sync::oneshot::channel();
-                        let _ = py_tx.send((
-                            PythonJob::ReplicateFontForMissingChars {
-                                pdf_path: output_pdf.to_string_lossy().to_string(),
-                                font_name: "default".to_string(),
-                                missing_chars_csv: batch_edits
-                                    .iter()
-                                    .map(|v| v["new_text"].as_str().unwrap_or_default().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(""),
-                                output_dir: "audit/fonts".to_string(),
-                            },
-                            rtx,
-                        ));
-                        if let Ok(PythonJobResult::Json(json_str)) = rrx.await {
-                            if let Ok(res) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                if let Some(fpath) = res["font_path"].as_str() {
-                                    font_override_path = Some(fpath.to_string());
-                                    synthesized_fonts_used = true;
-                                    total_corrections += 1;
-                                    tracing::info!(
-                                        "[TRANSFER] Font synthesized at {}. Retrying loop.",
-                                        fpath
-                                    );
-                                    continue; // RETRY LOOP
-                                }
-                            }
-                        }
+                        return;
                     }
 
                     // ======= STAGE 6: Visual Fidelity Check ========
@@ -3326,34 +3298,10 @@ async fn process_job_inner(
                         }
                     }
 
-                    if (vision_anomaly || !visual_verified) && attempt < max_retries {
-                        tracing::warn!("[TRANSFER] Visual check failed (anomaly or strict threshold). Attempting font synthesis for retry.");
-                        let _ = res_tx.send(JobResult::Progress {
-                                        label: format!("(Attempt {attempt}) Adapting font metrics to Gemini Vision anomaly..."),
-                                        fraction: 0.75,
-                                    });
-                        let (rtx, rrx) = tokio::sync::oneshot::channel();
-                        let _ = py_tx.send((
-                            PythonJob::CompleteFontWithAdaption {
-                                pdf_path: target_pdf.to_string_lossy().to_string(),
-                                font_name: "default".to_string(),
-                            },
-                            rtx,
-                        ));
-                        if let Ok(PythonJobResult::Json(json_str)) = rrx.await {
-                            if let Ok(res) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                if let Some(fpath) = res["font_path"].as_str() {
-                                    font_override_path = Some(fpath.to_string());
-                                    synthesized_fonts_used = true;
-                                    total_corrections += 1;
-                                    tracing::info!(
-                                        "[TRANSFER] Adapted font synthesized at {}. Retrying loop.",
-                                        fpath
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
+                    if vision_anomaly || !visual_verified {
+                        tracing::warn!(
+                            "[TRANSFER] visual validation failed; automatic font adaptation is disabled"
+                        );
                     }
 
                     // ======= STAGE 7: Math Verification (Engine) ========
@@ -4529,7 +4477,6 @@ async fn process_job_inner(
             let eng = engine_for_tokio.clone();
             let audit_log_clone = audit_log.clone();
             let history_clone = history.clone();
-            let py_tx = python_tx_clone.clone();
             let res_tx = result_tx_clone.clone();
             let cfg_clone = config_for_tokio.clone();
 
@@ -4539,41 +4486,16 @@ async fn process_job_inner(
                 .map(|m| m.temp_path().to_path_buf());
 
             tokio::task::spawn(async move {
-                // Optional: deep font replication via Python actor.
-                let mut font_path: Option<PathBuf> = None;
+                // Automatic font generation is not a fidelity-preserving edit.
+                // Reject the compatibility flag before staging any artifact.
+                let font_path: Option<PathBuf> = None;
                 if deep_font_replication {
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: "Deep Replicating Font...".to_string(),
-                        fraction: 0.2,
+                    let _ = res_tx.send(JobResult::Error {
+                        job_label: "apply_change".into(),
+                        message: "Automatic glyph synthesis and donor-font substitution are disabled; choose covered text or a separately reviewed supplied font."
+                            .into(),
                     });
-                    let (tx, rx) = oneshot::channel();
-
-                    // In three-page mode, we use the segment path for font replication analysis
-                    let analysis_path = if let Some(ref map) = map_opt {
-                        map.resolve(page)
-                            .map(|(idx, _)| map.segments[idx].path.clone())
-                            .unwrap_or(input.clone())
-                    } else {
-                        input.clone()
-                    };
-
-                    let _ = py_tx.send((
-                        PythonJob::DeepFontReplication {
-                            pdf_path: analysis_path.to_string_lossy().to_string(),
-                            font_name: "Helvetica".to_string(),
-                            output_dir: "output/temp_fonts".to_string(),
-                        },
-                        tx,
-                    ));
-                    if let Ok(PythonJobResult::Json(json)) = rx.await {
-                        let res: serde_json::Value =
-                            serde_json::from_str(&json).unwrap_or_default();
-                        if res["success"].as_bool().unwrap_or(false) {
-                            font_path = res["metrics"]["font_path"].as_str().map(PathBuf::from);
-                        } else if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
-                            tracing::warn!("[apply_change] deep font replication failed: {}", err);
-                        }
-                    }
+                    return;
                 }
 
                 // Every mutation is staged first. The live output and segment
@@ -4860,41 +4782,12 @@ async fn process_job_inner(
                 }
             });
         }
-        Job::CompleteFont { path, font_name } => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if python_tx_clone
-                .send((
-                    PythonJob::CompleteFontWithAdaption {
-                        pdf_path: path.to_string_lossy().to_string(),
-                        font_name,
-                    },
-                    reply_tx,
-                ))
-                .is_ok()
-            {
-                match reply_rx.await {
-                    Ok(PythonJobResult::Json(json)) => {
-                        let _ = result_tx_clone.send(JobResult::FontCompleted(json));
-                    }
-                    Ok(PythonJobResult::Error(e)) => {
-                        let _ = result_tx_clone.send(JobResult::Error {
-                            job_label: "complete_font".into(),
-                            message: e,
-                        });
-                    }
-                    _ => {
-                        let _ = result_tx_clone.send(JobResult::Error {
-                            job_label: "complete_font".into(),
-                            message: "Unexpected response".into(),
-                        });
-                    }
-                }
-            } else {
-                let _ = result_tx_clone.send(JobResult::Error {
-                    job_label: "complete_font".into(),
-                    message: "Failed to send to Python actor".into(),
-                });
-            }
+        Job::CompleteFont { .. } => {
+            let _ = result_tx_clone.send(JobResult::Error {
+                job_label: "complete_font".into(),
+                message: "Automatic font completion is disabled because synthesized or donor glyphs are not fidelity-preserving."
+                    .into(),
+            });
         }
         Job::Undo => {
             let history_clone = history.clone();
@@ -7048,7 +6941,6 @@ async fn process_job_inner(
             let eng = engine_for_tokio.clone();
             let py_tx = python_tx_clone.clone();
             let cfg = config_for_tokio.clone();
-            let audit_log_clone = audit_log.clone();
             let map_opt = segment_map.clone();
             let mgr_opt = segment_manager
                 .as_ref()
@@ -7217,59 +7109,78 @@ async fn process_job_inner(
                     let mut all_ok = true;
                     let mut last_failure: Option<crate::engine::workflow::WorkflowFailure> = None;
 
-                    // Pre-flight: optional deep font replication once
-                    // (not per-edit), so the supplied font path is the
-                    // same for the whole batch.
-                    let mut font_path: Option<PathBuf> = None;
+                    // Automatic deep-font generation is not an approved fidelity
+                    // operation. Retain the request field for compatibility but
+                    // reject it before creating or mutating any output.
+                    let font_path: Option<PathBuf> = None;
                     if deep_font_replication {
-                        let (tx, rx) = oneshot::channel();
-                        let _ = py_tx.send((
-                            PythonJob::DeepFontReplication {
-                                pdf_path: input.to_string_lossy().to_string(),
-                                font_name: "Helvetica".to_string(),
-                                output_dir: "output/temp_fonts".to_string(),
-                            },
-                            tx,
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(
+                                "Automatic glyph synthesis and donor-font substitution are disabled. Use replacement text covered by the original font or a separately reviewed coverage-complete supplied font."
+                                    .into(),
+                            ),
                         ));
-                        if let Ok(PythonJobResult::Json(json)) = rx.await {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-                                if v["success"].as_bool().unwrap_or(false) {
-                                    font_path =
-                                        v["metrics"]["font_path"].as_str().map(PathBuf::from);
-                                }
-                            }
-                        }
+                        return;
                     }
 
                     // --- Pre-flight Font Coverage Check ---
-                    if !ignore_font_coverage {
-                        if let Some(ref fp) = font_path {
-                            if let Ok(bytes) = std::fs::read(fp) {
-                                let mut all_new_text = String::new();
-                                for e in &edits {
-                                    all_new_text.push_str(&e.new_text);
-                                }
-                                if let Ok((_, missing)) =
-                                    crate::engine::font_replication::check_glyph_coverage(
-                                        &bytes,
-                                        &all_new_text,
-                                    )
-                                {
-                                    if !missing.is_empty() {
-                                        tracing::warn!(
-                                            "[font_coverage] Missing characters detected: {:?}",
-                                            missing
-                                        );
-                                        let _ = res_tx.send(JobResult::WorkflowStageChanged {
-                                                        stage: crate::engine::workflow::WorkflowStage::FontCoverageWarning {
-                                                            missing_chars: missing,
-                                                        }
-                                                    });
-                                        // Abort the current job, wait for user to decide (Proceed or Cancel)
-                                        return;
-                                    }
-                                }
+                    // A supplied or replicated font must be parseable and cover every
+                    // replacement glyph. The legacy override is retained only for
+                    // wire compatibility; it now converts unresolved coverage into an
+                    // explicit terminal failure rather than undisclosed substitution.
+                    if let Some(ref fp) = font_path {
+                        let bytes = match std::fs::read(fp) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                let _ = res_tx.send(JobResult::WorkflowFailed(
+                                    crate::engine::workflow::WorkflowFailure::Other(format!(
+                                        "Could not read supplied font {}: {error}",
+                                        fp.display()
+                                    )),
+                                ));
+                                return;
                             }
+                        };
+                        let all_new_text = edits
+                            .iter()
+                            .map(|edit| edit.new_text.as_str())
+                            .collect::<String>();
+                        let missing = match crate::engine::font_replication::check_glyph_coverage(
+                            &bytes,
+                            &all_new_text,
+                        ) {
+                            Ok((_, missing)) => missing,
+                            Err(error) => {
+                                let _ = res_tx.send(JobResult::WorkflowFailed(
+                                    crate::engine::workflow::WorkflowFailure::Other(format!(
+                                        "Could not validate supplied font coverage: {error}"
+                                    )),
+                                ));
+                                return;
+                            }
+                        };
+                        if !missing.is_empty() {
+                            tracing::warn!(
+                                "[font_coverage] Missing characters detected: {:?}",
+                                missing
+                            );
+                            if ignore_font_coverage {
+                                let _ = res_tx.send(JobResult::WorkflowFailed(
+                                    crate::engine::workflow::WorkflowFailure::FontCoverageFailed {
+                                        missing_chars: missing
+                                            .iter()
+                                            .map(char::to_string)
+                                            .collect(),
+                                    },
+                                ));
+                            } else {
+                                let _ = res_tx.send(JobResult::WorkflowStageChanged {
+                                    stage: crate::engine::workflow::WorkflowStage::FontCoverageWarning {
+                                        missing_chars: missing,
+                                    },
+                                });
+                            }
+                            return;
                         }
                     }
 
@@ -7474,7 +7385,7 @@ async fn process_job_inner(
                         .join("apply_cache")
                         .join(format!("{edit_hash}.pdf"));
 
-                    let mut apply_result: Result<
+                    let apply_result: Result<
                         PythonJobResult,
                         tokio::sync::oneshot::error::RecvError,
                     >;
@@ -7690,120 +7601,18 @@ async fn process_job_inner(
                         }
                     }
 
-                    // Stage 11: if the apply hit FONT_COVERAGE_INSUFFICIENT,
-                    // run the cascade once and retry with the extended font.
-                    // We do this only once per attempt to avoid loops on
-                    // genuinely-uncoverable glyphs.
-                    if let Ok(PythonJobResult::Error(ref msg)) = apply_result {
-                        if msg.contains("FONT_COVERAGE_INSUFFICIENT") {
-                            let parsed: Option<serde_json::Value> = serde_json::from_str(msg).ok();
-                            let missing_chars: Vec<String> = parsed
-                                .as_ref()
-                                .and_then(|v| v.get("missing_chars"))
-                                .cloned()
-                                .and_then(|m| serde_json::from_value::<Vec<String>>(m).ok())
-                                .unwrap_or_default();
-                            let original_font = parsed
-                                .as_ref()
-                                .and_then(|v| v.get("original_font"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if !missing_chars.is_empty() && !original_font.is_empty() {
-                                tracing::info!(
-                                                "[workflow] FONT_COVERAGE_INSUFFICIENT: \
-                                                 running font cascade for {} missing char(s) on font {}",
-                                                missing_chars.len(),
-                                                original_font
-                                            );
-                                let cascade_dir = std::path::PathBuf::from("audit")
-                                    .join("font_cascade")
-                                    .join(format!("attempt{attempt}"));
-                                let _ = std::fs::create_dir_all(&cascade_dir);
-
-                                let (cascade_tx, cascade_rx) = oneshot::channel();
-                                let _ = py_tx.send((
-                                    PythonJob::ReplicateFontForMissingChars {
-                                        pdf_path: input.to_string_lossy().to_string(),
-                                        font_name: original_font.clone(),
-                                        missing_chars_csv: missing_chars.join(","),
-                                        output_dir: cascade_dir.to_string_lossy().to_string(),
-                                    },
-                                    cascade_tx,
-                                ));
-                                if let Ok(PythonJobResult::Json(json)) = cascade_rx.await {
-                                    // Stage 12 / Items #3, #4: decode the cascade
-                                    // result, surface it to the GUI and audit it.
-                                    let report = crate::engine::font_analysis::FontCascadeReport::from_python_json(
-                                                    &json,
-                                                    original_font.clone(),
-                                                    attempt,
-                                                );
-                                    if let Ok(report) = report {
-                                        tracing::info!("[workflow] {}", report.one_line_summary());
-                                        let _ =
-                                            res_tx.send(JobResult::FontCascadeUsed(report.clone()));
-
-                                        // Item #4: write a structured record to
-                                        // the audit log so the trail captures
-                                        // every cascade invocation.
-                                        let audit_payload = serde_json::json!({
-                                            "event": "font_cascade",
-                                            "original_font": report.original_font,
-                                            "workflow_attempt": report.workflow_attempt,
-                                            "success": report.success,
-                                            "tiers_used": report.tiers_used,
-                                            "synthesised": report.synthesised,
-                                            "donor_extended": report.donor_extended,
-                                            "ai_extended": report.ai_extended,
-                                            "still_missing": report.still_missing,
-                                            "extended_font_path": report.extended_font_path
-                                                .as_ref()
-                                                .map(|p| p.to_string_lossy().to_string()),
-                                        });
-                                        if let Ok(line) = serde_json::to_string(&audit_payload) {
-                                            if let Ok(mut log) = audit_log_clone.lock() {
-                                                let _ = log.append_line(&line);
-                                            }
-                                        }
-
-                                        if report.success {
-                                            if let Some(ext) = report.extended_font_path {
-                                                tracing::info!(
-                                                                "[workflow] retrying apply with extended font: {}",
-                                                                ext.display()
-                                                            );
-                                                let (rt_tx, rt_rx) = oneshot::channel();
-                                                let _ = py_tx.send((
-                                                    PythonJob::ApplyManyEdits {
-                                                        pdf_path: input
-                                                            .to_string_lossy()
-                                                            .to_string(),
-                                                        output_path: scratch
-                                                            .to_string_lossy()
-                                                            .to_string(),
-                                                        edits_json,
-                                                        font_path: Some(
-                                                            ext.to_string_lossy().to_string(),
-                                                        ),
-                                                    },
-                                                    rt_tx,
-                                                ));
-                                                apply_result = rt_rx.await;
-                                            }
-                                        } else {
-                                            tracing::warn!(
-                                                            "[workflow] font cascade incomplete; {} char(s) still missing",
-                                                            report.still_missing.len()
-                                                        );
-                                        }
-                                    } else {
-                                        tracing::warn!(
-                                            "[workflow] cascade response decode failed: {json}"
-                                        );
-                                    }
-                                }
-                            }
+                    // Missing glyphs are an explicit unsupported fidelity case.
+                    // Automatic composite, donor-font, or AI-selected glyph
+                    // construction is intentionally forbidden because it changes
+                    // the typeface without a separately reviewed substitution
+                    // workflow. Preserve the original apply error below.
+                    if let Ok(PythonJobResult::Error(ref message)) = apply_result {
+                        if message.contains("FONT_COVERAGE_INSUFFICIENT")
+                            || message.contains("FONT_EMBEDDING_UNAVAILABLE")
+                        {
+                            tracing::warn!(
+                                "[workflow] exact font fidelity unavailable; output will not be published"
+                            );
                         }
                     }
 

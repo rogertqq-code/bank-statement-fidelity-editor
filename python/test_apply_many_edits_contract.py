@@ -266,6 +266,35 @@ class ApplyManyEditsContractTests(unittest.TestCase):
                 self.assertIn(f"NEW_{index:02d}", observed_outputs[0])
                 self.assertNotIn(f"OLD_{index:02d}", observed_outputs[0])
 
+    def test_unavailable_embedded_font_never_substitutes_or_publishes(self):
+        with tempfile.TemporaryDirectory(prefix="font-embedding-block-") as temp:
+            root = Path(temp)
+            source = root / "source.pdf"
+            output = root / "existing.pdf"
+            bbox = create_text_pdf(source, "ORIGINAL")
+            shutil.copy2(source, output)
+            prior_hash = sha256(output)
+            edits = [{
+                "page": 0,
+                "rect": bbox,
+                "old_text": "ORIGINAL",
+                "new_text": "REPLACED",
+            }]
+
+            with (
+                mock.patch.object(BRIDGE, "_is_standard_14", return_value=False),
+                mock.patch.object(BRIDGE, "_embedded_font_xref_for_span", return_value=7),
+                mock.patch.object(BRIDGE, "_font_covers_text", return_value=(True, [])),
+                mock.patch.object(BRIDGE, "_resolve_embedded_font", return_value=None),
+            ):
+                with self.assertRaises(ValueError) as captured:
+                    BRIDGE.apply_many_edits(str(source), str(output), edits)
+
+            payload = json.loads(str(captured.exception))
+            self.assertEqual(payload["error"], "FONT_EMBEDDING_UNAVAILABLE")
+            self.assertEqual(payload["edit_index"], 0)
+            self.assertEqual(sha256(output), prior_hash)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

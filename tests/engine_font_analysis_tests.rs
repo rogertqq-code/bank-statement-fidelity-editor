@@ -167,13 +167,15 @@ fn test_font_cascade_report() {
 
     let report = FontCascadeReport::from_python_json(json_payload, "Helvetica".to_string(), 1)
         .expect("Parse failed");
-    assert!(report.success);
+    assert!(!report.success, "legacy synthesis success must be rejected");
     assert_eq!(report.original_font, "Helvetica");
     assert_eq!(report.synthesised.len(), 2);
 
     let summary = report.one_line_summary();
-    assert!(summary.contains("composite (2)"));
-    assert!(summary.contains("AI donor (1)"));
+    assert_eq!(
+        summary,
+        "Font substitution blocked: rejected 3 generated glyph(s) from a legacy cascade payload"
+    );
 }
 
 #[test]
@@ -197,6 +199,6 @@ fn test_font_cascade_report_failure() {
     let summary = report.one_line_summary();
     assert_eq!(
         summary,
-        "⛔ font cascade incomplete: 1 char(s) still missing"
+        "Font substitution disabled: 1 character(s) remain unsupported"
     );
 }

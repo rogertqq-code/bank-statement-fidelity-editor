@@ -793,19 +793,18 @@ def _resolve_embedded_font(page, font_xref):
     try:
         page.insert_font(fontname=refname, fontbuffer=buffer)
     except Exception:
-        # Some CFF/OTF subsets cannot be re-embedded by name. Signal the
-        # caller to fall back, but still hand back the measuring font.
+        # Some CFF/OTF subsets cannot be re-embedded by name. Preserve the
+        # measuring evidence but force the caller to fail closed.
         refname = None
+
     return {"refname": refname, "font_obj": font_obj, "buffer": buffer}
 
 
 def _fallback_standard14(font_name: str) -> str:
-    """Item #4: when embedded reuse genuinely can't happen, pick the closest
-    standard-14 builtin by *weight and style* instead of always Helvetica.
+    """Resolve an original standard-14 font name to PyMuPDF's builtin code.
 
-    Returns a PyMuPDF builtin font code (``helv``, ``hebo``, ``tiro``, ...).
-    The substitution is logged by the caller so the verifier / GUI can flag
-    the cell for review rather than passing a silent typeface change.
+    This helper is only valid when the selected source span itself uses a
+    standard-14 family; it must never substitute for an embedded typeface.
     """
     n = (font_name or "").lower()
     if "+" in n:
@@ -2314,11 +2313,9 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
     placed, failed, per-edit evidence, warnings, methods, review flags, source
     and output hashes, and publication state. A failed edit never publishes the
     partially modified in-memory document.
-    `review_flags` is a sorted list of unique segment-local page numbers whose
-    edit could not be reproduced at full fidelity because embedded font
-    coverage was insufficient and the edit was completed via the standard-14
-    font-cascade fallback instead (Req 18.6). It is the recoverable case and is
-    distinct from the hard FONT_COVERAGE_INSUFFICIENT failure below.
+    `review_flags` is a sorted list of segment-local pages requiring review
+    because exact target matching failed. Font coverage and embedding failures
+    are hard failures and never publish a substituted typeface.
     Raises ValueError(json) on FONT_COVERAGE_INSUFFICIENT for any edit; the
     error payload includes the index of the failing edit.
     """
@@ -2392,9 +2389,8 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
 
     evidence = []
     warnings = []
-    # Req 18.6: segment-local pages whose edit fell back to a standard-14
-    # builtin because embedded font coverage was insufficient. Deduped here
-    # and emitted as a sorted list so the bridge can map locals to globals.
+    # Segment-local pages whose exact target could not be selected. Font
+    # failures are not review-only fallbacks; they abort before publication.
     review_flag_pages = set()
     used_target_keys = set()
 
@@ -2541,21 +2537,16 @@ def apply_many_edits(pdf_path: str, output_path: str, edits: list, font_path: st
             except Exception:
                 measure_font = None
         else:  # embedded, non-standard
-            if embedded and embedded.get("refname"):
-                emit_fontname = embedded["refname"]
-                measure_font = embedded.get("font_obj")
-            else:
-                emit_fontname = _fallback_standard14(original_font_name)
-                measure_font = embedded.get("font_obj") if embedded else None
-                method = "embedded-fallback"
-                # Req 18.6: insufficient embedded coverage -> standard-14
-                # fallback completes the edit; flag this segment-local page
-                # for review.
-                review_flag_pages.add(page_num)
-                warnings.append(
-                    f"edit {idx}: embedded reuse unavailable for "
-                    f"{original_font_name!r}; builtin {emit_fontname!r} (review)"
-                )
+            if not embedded or not embedded.get("refname"):
+                doc.close()
+                raise ValueError(json.dumps({
+                    "error": "FONT_EMBEDDING_UNAVAILABLE",
+                    "edit_index": idx,
+                    "original_font": original_font_name,
+                    "reason": "covered embedded glyph program could not be re-registered",
+                }))
+            emit_fontname = embedded["refname"]
+            measure_font = embedded.get("font_obj")
 
         placement = _placement_for_edit(
             page,
@@ -3019,113 +3010,62 @@ def find_text_block_at_click(pdf_path: str, page_num: int, click_x: float, click
         doc.close()
 
 
-def complete_font_with_adaption_fallback(pdf_path: str, font_name: str, sample_text: str = "The quick brown fox"):
-    """
-    Main entry point for font completion.
-    1. Try Lipi.ai (placeholder - will be implemented when API key is available)
-    2. If fails or low confidence → Trigger smart "Adaption" fallback
-    """
-    try:
-        # Placeholder for real Lipi.ai call
-        # In production: call Lipi.ai API here with rendered sample
-        raise Exception("Lipi.ai not configured in this environment")
-    except Exception:
-        return adapt_font_fallback(pdf_path, font_name, sample_text)
-
-
-def adapt_font_fallback(pdf_path: str, font_name: str, sample_text: str = "The quick brown fox"):
-    """
-    Smart Adaption Fallback Strategy:
-    - Analyzes original font name for style hints (Bold, Italic, Serif, Mono, etc.)
-    - Chooses the closest standard PDF base font
-    - Applies appropriate style modifiers
-    - Returns a professional adapted font + explanation
-    """
-    _ensure_pro_unlocked()
-    doc = pymupdf.open(pdf_path)
-    
-    font_lower = font_name.lower()
-    
-    # Step 1: Determine base font family
-    if any(x in font_lower for x in ["times", "roman", "serif", "garamond", "georgia"]):
-        base = "times-roman"
-    elif any(x in font_lower for x in ["courier", "mono", "typewriter", "consolas"]):
-        base = "courier"
-    else:
-        base = "helvetica"  # Default safe choice
-    
-    # Step 2: Detect style modifiers
-    is_bold = any(x in font_lower for x in ["bold", "black", "heavy", "semibold"])
-    is_italic = any(x in font_lower for x in ["italic", "oblique", "slant"])
-    
-    # Step 3: Build adapted font name
-    if is_bold and is_italic:
-        adapted_name = f"{base}-boldoblique"
-    elif is_bold:
-        adapted_name = f"{base}-bold"
-    elif is_italic:
-        adapted_name = f"{base}-oblique"
-    else:
-        adapted_name = base
-    
-    # Step 4: Get font buffer
-    try:
-        font = pymupdf.Font(adapted_name)
-        font_bytes = font.buffer
-    except Exception:
-        # Ultimate fallback
-        font = pymupdf.Font("helvetica")
-        font_bytes = font.buffer
-        adapted_name = "helvetica"
-    
-    doc.close()
-    
-    confidence = 0.78 if adapted_name != "helvetica" else 0.65
-    
+def _font_substitution_disabled(missing_chars=None):
+    """Return the stable non-mutating disposition for legacy font APIs."""
     return {
-        "success": True,
-        "font_bytes": list(font_bytes),  # Convert to list for JSON compatibility
-        "adapted_font_name": adapted_name,
-        "original_font_name": font_name,
-        "confidence": confidence,
-        "message": f"Could not perfectly identify '{font_name}'. Using smart adaptation: {adapted_name}"
+        "success": False,
+        "error": "FONT_SUBSTITUTION_DISABLED",
+        "reason": (
+            "Automatic glyph synthesis, generic-font adaptation, donor-subset "
+            "extension, and AI-selected typeface substitution are not "
+            "fidelity-preserving operations."
+        ),
+        "font_path": None,
+        "extended_font_path": None,
+        "synthesised": [],
+        "donor_extended": [],
+        "ai_extended": [],
+        "still_missing": list(missing_chars or []),
+        "tiers_used": [],
     }
 
 
+def complete_font_with_adaption_fallback(
+    pdf_path: str,
+    font_name: str,
+    sample_text: str = "The quick brown fox",
+):
+    """Legacy compatibility endpoint; automatic typeface adaptation is disabled."""
+    del pdf_path, font_name, sample_text
+    return _font_substitution_disabled()
+
+
+def adapt_font_fallback(
+    pdf_path: str,
+    font_name: str,
+    sample_text: str = "The quick brown fox",
+):
+    """Legacy compatibility endpoint; generic-font substitution is disabled."""
+    del pdf_path, font_name, sample_text
+    return _font_substitution_disabled()
+
+
 def deep_font_replication_api(pdf_path, font_name, output_dir):
-    """API entry point for deep font replication.
-
-    Stage 11: this now delegates to `font_replicator.replicate_font_for_chars`
-    which runs the three-tier cascade (composite synthesis → subset
-    extension → Gemini Vision donor identification). Callers that pass
-    no `missing_chars` get the legacy "synthesise everything" behaviour
-    only as a side effect of an empty cascade run; modern callers should
-    use `replicate_font_for_missing_chars`.
-    """
-    import font_replicator
-    return font_replicator.replicate_font_for_chars(
-        pdf_path=pdf_path,
-        font_name=font_name,
-        missing_chars=[],
-        output_dir=output_dir,
-    )
+    """Legacy compatibility endpoint; automatic glyph generation is disabled."""
+    del pdf_path, font_name, output_dir
+    return _font_substitution_disabled()
 
 
-def replicate_font_for_missing_chars(pdf_path: str, font_name: str, missing_chars_csv: str, output_dir: str):
-    """Stage 11: targeted font cascade. Pass the comma-separated missing
-    characters returned by `_font_covers_text` and the cascade tries
-    composite synthesis first, then subset extension from a local donor,
-    then Gemini-Vision-identified donor. Returns the result dict shaped by
-    `replicate_font_for_chars`.
-    """
-    import font_replicator
-    chars = [c for c in missing_chars_csv.split(",") if c]
-    return font_replicator.replicate_font_for_chars(
-        pdf_path=pdf_path,
-        font_name=font_name,
-        missing_chars=chars,
-        output_dir=output_dir,
-    )
+def replicate_font_for_missing_chars(
+    pdf_path: str,
+    font_name: str,
+    missing_chars_csv: str,
+    output_dir: str,
+):
+    """Legacy compatibility endpoint; donor and composite substitution are disabled."""
+    del pdf_path, font_name, output_dir
+    chars = [character for character in missing_chars_csv.split(",") if character]
+    return _font_substitution_disabled(chars)
 
 
 def dry_run_edit_preview(

@@ -4046,19 +4046,15 @@ impl MyApp {
             if let crate::engine::workflow::WorkflowStage::FontCoverageWarning { missing_chars } = &self.workflow_stage {
                 ui.separator();
                 let palette = self.settings.theme.palette();
-                ui.colored_label(palette.warn, "⚠️ Font Coverage Warning");
-                ui.label(format!("The text you typed requires characters that are missing from the statement's subset font:\n{:?}", missing_chars));
-                ui.horizontal(|ui| {
-                    if ui.button("Proceed (Use Fallback Metrics)").clicked() {
-                        self.dispatch_confirm_and_render(true, true); // true for deep, true for ignore_font_coverage
-                    }
-                    if ui.button("Cancel Edits").clicked() {
-                        let preview = self.workflow_preview.clone().unwrap_or_default();
-                        self.apply_workflow_event(
-                            crate::engine::workflow::WorkflowEvent::ResumePreview(preview),
-                        );
-                    }
-                });
+                ui.colored_label(palette.warn, "Font Coverage Block");
+                ui.label(format!("The replacement requires characters absent from the selected embedded or supplied font:\n{:?}", missing_chars));
+                ui.label("Automatic typeface substitution is disabled because it would not preserve statement fidelity. Change the replacement text or supply a reviewed font that covers every character.");
+                if ui.button("Return to Edit Review").clicked() {
+                    let preview = self.workflow_preview.clone().unwrap_or_default();
+                    self.apply_workflow_event(
+                        crate::engine::workflow::WorkflowEvent::ResumePreview(preview),
+                    );
+                }
             }
 
             // Stage 12 / Item #3: surface cascade results so the user can

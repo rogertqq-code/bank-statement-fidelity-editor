@@ -1240,21 +1240,15 @@ impl AppModals for MyApp {
 
                 match &workflow_stage {
                     crate::engine::workflow::WorkflowStage::FontCoverageWarning { missing_chars } => {
-                        ui.heading("Font Coverage Warning");
-                        ui.label("The requested font does not cover all characters in your edits.");
+                        ui.heading("Font Coverage Block");
+                        ui.label("The selected font does not cover every character in the requested edits.");
                         ui.label(format!("Missing characters: {:?}", missing_chars));
+                        ui.label("Generic-font substitution is disabled because it would change the statement typeface. Return to edit review and change the text or provide a coverage-complete reviewed font.");
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Cancel Workflow").clicked() {
-                                self.cancel_active_workflow();
-                                resolved = true;
-                            }
-                            if ui.button("Proceed with Generic Font (Helvetica)").clicked() {
-                                // Add job dispatch here if needed
-                                // let _ = self.job_tx.send(Job::...);
-                                resolved = true;
-                            }
-                        });
+                        if ui.button("Cancel Workflow").clicked() {
+                            self.cancel_active_workflow();
+                            resolved = true;
+                        }
                     }
                     crate::engine::workflow::WorkflowStage::VisualFidelityWarning { score, threshold, attempt, is_borderline } => {
                         ui.heading("Visual Fidelity Warning");
