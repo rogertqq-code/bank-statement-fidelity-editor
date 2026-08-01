@@ -1,9 +1,9 @@
 # Remediation Program Status
 
-**Repository head audited:** `41993a8daf73266eaae5d6d4abcc2cc13ac85662`
-**Working branch:** `remediation/phase-03-unified-runtime`
-**Current phase:** Phase 03 / unified runtime complete
-**Current gate:** Gate 03 — `PASS`
+**Repository head audited:** `85e15fca5574068035eccab9e3a700958ee94b92`
+**Working branch:** `remediation/phase-04-python-fortification`
+**Current phase:** Phase 05 / extraction, financial algorithms, OCR, dates, and transfer workflows
+**Current gate:** Gate 04 — `PASS`
 **Release publication:** Frozen
 
 ## Accepted owner decisions
@@ -25,8 +25,8 @@
 | 01 | 01 | Complete | Windows, macOS, Linux development, Clippy, format, and optional-Pro jobs passed in CI run `30653780202`. |
 | 02 | 02 | Complete | All five P0 failure classes, related exact-success defects, canonical geometry, and mandatory Windows/macOS/Linux P0 regressions passed in CI run `30673473276`. |
 | 03 | 03 | Complete | Unified runtime protocol, authoritative state, routed results, cancellation/deadlines, isolated storage, atomic configuration, truthful capabilities, dispositions, and bounded diagnostics passed in CI run `30698338534`. |
-| 04 | 04 | Planned | Permanent Python/PyMuPDF pipeline bulletproofed. |
-| 05 | 05 | Planned | Extraction and financial invariants verified. |
+| 04 | 04 | Complete | Supervised Python 3.12/PyMuPDF protocol, atomic mutation publication, runtime manifest, bundled-runtime discovery, resource bounds, and cross-platform fault regressions passed in CI run `30707260996`. |
+| 05 | 05 | In progress | Extraction completeness, financial invariants, OCR/date corpus behavior, and transfer workflow repair. |
 | 06 | 06 | Planned | Exact PDF editing, fonts, geometry, segmentation, and atomic output. |
 | 07 | 07 | Planned | Independent fail-closed verification. |
 | 08 | 08 | Planned | Local LLM go/no-go and conditional integration. |
@@ -38,7 +38,7 @@
 
 ## Completed checkpoint
 
-Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b`; and Gate 03 closed the unified runtime at candidate `c84c631` in CI run `30698338534`. All work remains on remediation branches and the default branch is untouched.
+Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b`; Gate 03 closed the unified runtime at candidate `c84c631`; and Gate 04 closed the permanent supervised Python/PyMuPDF production pipeline at candidate `85e15fc` in CI run `30707260996`. All work remains on remediation branches and the default branch is untouched.
 
 ## Gate 01 checklist
 
@@ -106,12 +106,33 @@ Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 esta
 | Format, strict production Clippy, optional-Pro smoke | PASS |
 | Gate 03 evidence manifest | PASS — run `30698338534`, candidate `c84c631` |
 
+## Gate 04 checklist
+
+| Requirement | State |
+|---|---|
+| Versioned strict Rust/Python protocol for all 15 operations | PASS |
+| Supervised worker queue, deadlines, crash/hang recovery, and no replay | PASS |
+| Atomic staged mutation publication with exact hash/count evidence | PASS |
+| Python 3.12 and PyMuPDF/PyMuPDF Pro 1.28.0 compatibility manifest | PASS |
+| Core text extraction remains Pro-free and closes documents deterministically | PASS |
+| Native-extension stdout quarantined from JSON-lines transport | PASS |
+| Operation, RSS-growth, and handle-growth recycling budgets | PASS |
+| Hundred-operation real-PDF resource stress | PASS |
+| Bundled-runtime-first Windows/macOS discovery | PASS |
+| Offline copied-runtime smoke without system PATH or build inputs | PASS |
+| Embedded PyO3 bridge and dependency removed | PASS |
+| Windows base-state and P0 regressions | PASS — jobs `91388433285`, `91388887095` |
+| macOS base-state and P0 regressions | PASS — jobs `91388433302`, `91388887124` |
+| Linux base-state and P0 regressions | PASS — jobs `91388433293`, `91388887084` |
+| Format, strict production Clippy, optional-Pro smoke | PASS |
+| Gate 04 evidence manifest | PASS — run `30707260996`, candidate `85e15fc` |
+
 ## Open decisions with later blocking phases
 
 | Decision | Default until owner responds | Blocks |
 |---|---|---|
 | macOS Intel/universal support | Apple Silicon only | Phase 10 packaging |
-| PyMuPDF Pro redistribution/license model | User-provided key; core capability must be truthful without it | Phase 04/10 |
+| PyMuPDF Pro redistribution/license model | User-provided key; core capability must be truthful without it | Phase 10 packaging |
 | Required cloud providers for v1 | Optional providers remain quarantined until contract-qualified | Phase 05/11 |
 | Local OCR distribution | Optional component with explicit model capability | Phase 05/10 |
 | Signing identities/certificates | Build unsigned internal candidates only; no GA | Phase 10/13 |
@@ -120,7 +141,7 @@ Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 esta
 
 ## Next executable work
 
-1. Commit and push the evidence-only Gate 03 closure without modifying the default branch.
-2. Create the Phase 04 Python/PyMuPDF fortification branch from the verified Gate 03 checkpoint.
-3. Define the versioned cross-language operation schema and exact Rust/Python golden fixtures.
-4. Harden worker lifecycle, scratch publication, crash/restart, cancellation, timeouts, resource cleanup, compatibility probes, and standalone contract tests while keeping every prior gate mandatory.
+1. Commit and push the evidence-only Gate 04 closure without modifying the default branch.
+2. Start Phase 05 from the verified `85e15fc` candidate while retaining every prior gate.
+3. Establish extraction completeness thresholds and corpus regressions for partial, empty, OCR, rotated, and ambiguous statements.
+4. Repair and verify transfer workflow prerequisites, financial math, date-adjust corpus behavior, and explicit failure semantics end to end.
