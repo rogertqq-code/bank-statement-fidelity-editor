@@ -40,6 +40,11 @@ pub enum DocAiError {
     Middleware(#[from] reqwest_middleware::Error),
     #[error("Parse Error: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("Operation timed out after {timeout_secs}s: {operation}")]
+    Timeout {
+        operation: &'static str,
+        timeout_secs: u64,
+    },
     #[error("API Error (HTTP {0}): {1}")]
     Api(StatusCode, String),
 }
@@ -598,7 +603,19 @@ impl DocumentAiClient {
         if total_pages <= 15 {
             self.parse_entire_statement(pdf_path, version).await
         } else {
-            self.parse_via_lro(pdf_path, version).await
+            const LRO_TIMEOUT_SECS: u64 = 20 * 60;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(LRO_TIMEOUT_SECS),
+                self.parse_via_lro(pdf_path, version),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(DocAiError::Timeout {
+                    operation: "Document AI batch processing",
+                    timeout_secs: LRO_TIMEOUT_SECS,
+                }),
+            }
         }
     }
 
@@ -785,6 +802,7 @@ impl DocumentAiClient {
                     .http
                     .get(&op_url)
                     .bearer_auth(&access_token)
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await
                 {
