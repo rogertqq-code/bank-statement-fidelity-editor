@@ -81,6 +81,41 @@ pub struct MathInputs {
     pub transactions: Vec<Transaction>,
     pub opening_balance: Decimal,
     pub expected_final_balance: Option<Decimal>,
+    /// When true, missing or unusable financial evidence is a verification
+    /// failure. Generic non-statement PDF comparisons may set this to false.
+    pub required: bool,
+}
+
+fn validate_math_inputs(inputs: MathInputs) -> (bool, String) {
+    if inputs.transactions.is_empty() {
+        return if inputs.required {
+            (
+                false,
+                "❌ Mathematical verification required, but no transactions were supplied."
+                    .to_string(),
+            )
+        } else {
+            (
+                true,
+                "➖ Math check not applicable; visual-only verification was explicitly requested."
+                    .to_string(),
+            )
+        };
+    }
+
+    match process_and_reconcile(
+        inputs.transactions,
+        inputs.opening_balance,
+        inputs.expected_final_balance,
+    ) {
+        Ok((_, None)) => (true, "✅ Mathematical integrity verified.".to_string()),
+        Ok((_, Some(message))) => (false, format!("⚠️ Mathematical mismatch: {message}")),
+        Err(error) if !inputs.required => (
+            true,
+            format!("➖ Optional math check unavailable ({error}); visual-only verification."),
+        ),
+        Err(error) => (false, format!("❌ Balance Engine error: {error}")),
+    }
 }
 
 /// Page-level diff gate. Localized tile scoring (Item #17) is far more
@@ -435,9 +470,15 @@ pub async fn verify_edit_pages_with_padding(
 ) -> Result<VerificationReport, VerificationError> {
     std::fs::create_dir_all(output_dir)?;
 
-    // Load Pdfium using the centralized robust resolver
-    let lib_dir = crate::pdf::native_engine::pdfium_resolver::resolve()
-        .map_err(|e| VerificationError::PdfiumLoad(format!("Pdfium resolve error: {}", e)))?;
+    // Library discovery may perform a blocking download on first use. Keep it
+    // off the async executor so reqwest's blocking runtime is never created and
+    // dropped inside a Tokio async context.
+    let lib_dir = tokio::task::spawn_blocking(crate::pdf::native_engine::pdfium_resolver::resolve)
+        .await
+        .map_err(|error| {
+            VerificationError::PdfiumLoad(format!("Pdfium resolver task failed: {error}"))
+        })?
+        .map_err(|error| VerificationError::PdfiumLoad(format!("Pdfium resolve error: {error}")))?;
     let bindings = if lib_dir.as_os_str().is_empty() {
         Pdfium::bind_to_system_library()
             .map_err(|e| VerificationError::PdfiumLoad(format!("System bind error: {}", e)))?
@@ -685,37 +726,9 @@ pub async fn verify_edit_pages_with_padding(
     // Report number favours the most sensitive signal we computed.
     let max_visual_score = max_tile_score.max(legacy_pixel_score);
 
-    // 5. Math validity.
-    //
-    // Improvement #4: when the document carries no transaction/balance data
-    // (e.g. a non-statement PDF or a page with no parseable rows), math
-    // reconciliation is *not applicable* rather than a failure. Emitting a
-    // scary "Balance Engine error: Missing opening balance" in that case is
-    // misleading, so we degrade gracefully to a visual-only verdict and mark
-    // math_valid = true (nothing to disprove).
-    let has_balance_data =
-        !math_inputs.transactions.is_empty() && math_inputs.opening_balance != Decimal::ZERO;
-    let (math_valid, math_message) = if !has_balance_data {
-        (
-            true,
-            "➖ Math check not applicable (no transaction/balance data found); visual-only verification.".to_string(),
-        )
-    } else {
-        match process_and_reconcile(
-            math_inputs.transactions,
-            math_inputs.opening_balance,
-            math_inputs.expected_final_balance,
-        ) {
-            Ok((_, None)) => (true, "✅ Mathematical integrity verified.".to_string()),
-            Ok((_, Some(msg))) => (false, format!("⚠️ Mathematical mismatch: {msg}")),
-            // A genuine engine error on a doc that *did* have balance data.
-            Err(crate::engine::balance::BalanceError::MissingOpeningBalance) => (
-                true,
-                "➖ Math check skipped (opening balance could not be determined); visual-only verification.".to_string(),
-            ),
-            Err(e) => (false, format!("❌ Balance Engine error: {e}")),
-        }
-    };
+    // 5. Math validity. Bank-statement callers mark evidence as required;
+    // generic PDF comparisons may explicitly opt into visual-only behavior.
+    let (math_valid, math_message) = validate_math_inputs(math_inputs);
 
     let mut final_message = format!(
         "Verification Result:\nMath: {}\nVisual (tile-max): {:.4} (Threshold: {})\nOnly Intended: {}",
@@ -748,6 +761,7 @@ pub async fn verify_edit_pages_with_padding(
 mod stage_g_tests {
     use super::*;
     use image::{GrayImage, Luma};
+    use rust_decimal_macros::dec;
 
     /// Build a white gray image with an optional black rectangle "glyph".
     fn img_with_block(w: u32, h: u32, block: Option<(u32, u32, u32, u32)>) -> GrayImage {
@@ -760,6 +774,57 @@ mod stage_g_tests {
             }
         }
         g
+    }
+
+    fn math_transaction(amount: Decimal, balance: Decimal) -> Transaction {
+        Transaction {
+            page: 0,
+            line_on_page: 0,
+            date: "2026-01-01".into(),
+            raw_text: "Deposit".into(),
+            debit: Some(amount),
+            credit: None,
+            running_balance: Some(balance),
+            bbox: Some([10.0, 20.0, 100.0, 30.0]),
+            field_bboxes: Default::default(),
+            provenance: crate::engine::model::Provenance::Computed,
+            category: None,
+        }
+    }
+
+    #[test]
+    fn required_math_rejects_missing_evidence() {
+        let (valid, message) = validate_math_inputs(MathInputs {
+            transactions: Vec::new(),
+            opening_balance: Decimal::ZERO,
+            expected_final_balance: Some(dec!(0)),
+            required: true,
+        });
+        assert!(!valid);
+        assert!(message.contains("no transactions"));
+    }
+
+    #[test]
+    fn required_math_accepts_legitimate_zero_opening_balance() {
+        let (valid, message) = validate_math_inputs(MathInputs {
+            transactions: vec![math_transaction(dec!(10), dec!(10))],
+            opening_balance: Decimal::ZERO,
+            expected_final_balance: Some(dec!(10)),
+            required: true,
+        });
+        assert!(valid, "{message}");
+    }
+
+    #[test]
+    fn required_math_rejects_closing_mismatch() {
+        let (valid, message) = validate_math_inputs(MathInputs {
+            transactions: vec![math_transaction(dec!(10), dec!(10))],
+            opening_balance: Decimal::ZERO,
+            expected_final_balance: Some(dec!(20)),
+            required: true,
+        });
+        assert!(!valid);
+        assert!(message.contains("mismatch"));
     }
 
     /// Item #17: a single localized glyph change must produce a high tile

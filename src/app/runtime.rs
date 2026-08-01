@@ -3123,6 +3123,7 @@ async fn process_job_inner(
                             transactions: math_input_txns,
                             opening_balance,
                             expected_final_balance: None,
+                            required: true,
                         },
                         cfg.auto_match_dpi,
                         cfg.vision_api_key.clone(),
@@ -6341,10 +6342,13 @@ async fn process_job_inner(
                             fraction: 0.5,
                         });
 
+                        let math_required =
+                            !transactions.is_empty() || expected_final_balance.is_some();
                         let math_inputs = crate::engine::verification::MathInputs {
                             transactions,
                             opening_balance,
                             expected_final_balance, // Now sourced from the original PDF
+                            required: math_required,
                         };
 
                         match crate::engine::verification::verify_edit(
@@ -6979,11 +6983,26 @@ async fn process_job_inner(
                     ));
                     return;
                 }
+                let expected_closing = match expected_closing.or_else(|| {
+                    original_transactions
+                        .last()
+                        .and_then(|transaction| transaction.running_balance)
+                }) {
+                    Some(balance) => balance.round_dp(2),
+                    None => {
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(
+                                "confirm-and-render requires a verified closing balance".into(),
+                            ),
+                        ));
+                        return;
+                    }
+                };
                 let pre_render_preview = match crate::engine::workflow::build_preview(
                     &original_transactions,
                     &edits,
                     opening_balance,
-                    expected_closing,
+                    Some(expected_closing),
                 ) {
                     Ok(preview) => preview,
                     Err(error) => {
@@ -6995,7 +7014,7 @@ async fn process_job_inner(
                         return;
                     }
                 };
-                if expected_closing.is_some() && !pre_render_preview.balanced {
+                if !pre_render_preview.balanced {
                     let _ = res_tx.send(JobResult::WorkflowFailed(
                         crate::engine::workflow::WorkflowFailure::FinalMathInvalid {
                             imbalance: pre_render_preview.final_imbalance,
@@ -7028,9 +7047,20 @@ async fn process_job_inner(
                 }
 
                 let pre_render_imbalance = pre_render_preview.final_imbalance;
-                let pre_render_math_valid = expected_closing
-                    .map(|_| pre_render_preview.balanced)
-                    .unwrap_or(true);
+                let pre_render_math_valid = pre_render_preview.balanced;
+                let post_edit_transactions: Vec<_> = original_transactions
+                    .iter()
+                    .zip(&pre_render_preview.rows)
+                    .map(|(original, preview)| {
+                        let mut transaction = original.clone();
+                        transaction.date = preview.date.clone();
+                        transaction.raw_text = preview.description.clone();
+                        transaction.debit = preview.debit;
+                        transaction.credit = preview.credit;
+                        transaction.running_balance = preview.new_running_balance;
+                        transaction
+                    })
+                    .collect();
                 let rollback = RollbackGuard::new(&output);
                 let mut attempt: u32 = 1;
                 let mut visual_attempts: u32 = 0;
@@ -7375,7 +7405,7 @@ async fn process_job_inner(
                         if let Ok(recomputed) = crate::engine::balance::process_and_reconcile(
                             working_transactions.clone(),
                             opening_balance,
-                            expected_closing,
+                            Some(expected_closing),
                         )
                         .map(|(r, _)| r)
                         {
@@ -7385,8 +7415,7 @@ async fn process_job_inner(
                         let reconstructed_statement = crate::ai::document_ai::BankStatement {
                             transactions: working_transactions,
                             opening_balance,
-                            closing_balance: expected_closing
-                                .unwrap_or(rust_decimal::Decimal::ZERO),
+                            closing_balance: expected_closing,
                             account_number: None,
                             total_pages: 1,
                             bank_name: None,
@@ -7853,7 +7882,7 @@ async fn process_job_inner(
                         if let Ok(recomputed) = crate::engine::balance::process_and_reconcile(
                             working_transactions.clone(),
                             opening_balance,
-                            expected_closing,
+                            Some(expected_closing),
                         )
                         .map(|(r, _)| r)
                         {
@@ -7863,8 +7892,7 @@ async fn process_job_inner(
                         let reconstructed_statement = crate::ai::document_ai::BankStatement {
                             transactions: working_transactions,
                             opening_balance,
-                            closing_balance: expected_closing
-                                .unwrap_or(rust_decimal::Decimal::ZERO),
+                            closing_balance: expected_closing,
                             account_number: None,
                             total_pages: 1,
                             bank_name: None,
@@ -7916,9 +7944,10 @@ async fn process_job_inner(
                     });
 
                     let math_inputs = crate::engine::verification::MathInputs {
-                        transactions: vec![],
-                        opening_balance: rust_decimal::Decimal::ZERO,
-                        expected_final_balance: None,
+                        transactions: post_edit_transactions.clone(),
+                        opening_balance,
+                        expected_final_balance: Some(expected_closing),
+                        required: true,
                     };
                     let out_dir = std::path::PathBuf::from("audit/verify").join(format!(
                         "workflow-{}",
@@ -8215,62 +8244,59 @@ async fn process_job_inner(
                             Ok(stmt) => {
                                 re_parsed_count = stmt.transactions.len();
                                 let opening = stmt.opening_balance;
-                                let expected_close =
-                                    if stmt.closing_balance.abs() > rust_decimal::Decimal::ZERO {
-                                        Some(stmt.closing_balance)
-                                    } else {
-                                        None
-                                    };
-                                match crate::engine::workflow::build_preview(
-                                    &stmt.transactions,
-                                    &[],
-                                    opening,
-                                    expected_close,
-                                ) {
-                                    Ok(p) => {
-                                        final_imbalance = p.final_imbalance;
-                                        let is_valid = p.balanced;
+                                let mut issues =
+                                    crate::engine::workflow::deterministic_parse_issues(
+                                        stmt.total_pages,
+                                        &stmt.transactions,
+                                        opening,
+                                        stmt.closing_balance,
+                                    );
+                                if re_parsed_count != post_edit_transactions.len() {
+                                    issues.push(format!(
+                                        "final output re-parse found {re_parsed_count} rows; expected {}",
+                                        post_edit_transactions.len()
+                                    ));
+                                }
+                                if stmt.closing_balance.round_dp(2) != expected_closing {
+                                    issues.push(format!(
+                                        "final output closing balance is {}, expected {}",
+                                        stmt.closing_balance.round_dp(2),
+                                        expected_closing
+                                    ));
+                                }
+                                if !issues.is_empty() {
+                                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                                        crate::engine::workflow::WorkflowFailure::FidelityCheckFailed(
+                                            format!(
+                                                "final output ledger validation failed: {}",
+                                                issues.join("; ")
+                                            ),
+                                        ),
+                                    ));
+                                    return;
+                                }
 
-                                        // Double-verify with Gemini (advisory only)
-                                        if is_valid {
-                                            if let Ok(gemini) =
-                                                crate::ai::backend::AiBackend::from_app_config(&cfg)
-                                            {
-                                                let tx_json =
-                                                    serde_json::to_string(&stmt.transactions)
-                                                        .unwrap_or_default();
-                                                let _ = res_tx.send(JobResult::Progress {
-                                                    label: "Double-verifying math with Gemini..."
-                                                        .into(),
-                                                    fraction: 0.98,
-                                                });
-                                                let opening_f64 =
-                                                    crate::engine::model::dec_to_f64(opening);
-                                                if let Ok(is_sound) = gemini
-                                                    .verify_statement_mathematics(
-                                                        &tx_json,
-                                                        opening_f64,
-                                                    )
-                                                    .await
-                                                {
-                                                    if !is_sound {
-                                                        // Advisory only - log but do NOT override engine result.
-                                                        // The engine balance check is deterministic; Gemini
-                                                        // re-parse can produce different transaction counts.
-                                                        tracing::warn!("[workflow] Gemini flagged mathematics as unsound, but engine approved it. Treating as advisory.");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        math_valid = is_valid;
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            "[workflow] Final balance re-parse could not be evaluated: {}. Retaining the deterministic pre-render result.",
-                                            error
-                                        );
-                                        final_imbalance = pre_render_imbalance;
-                                        math_valid = pre_render_math_valid;
+                                final_imbalance =
+                                    (stmt.closing_balance - expected_closing).round_dp(2);
+                                math_valid = true;
+
+                                // Optional AI may flag concerns for logs, but cannot
+                                // override the exact deterministic ledger result.
+                                if let Ok(gemini) =
+                                    crate::ai::backend::AiBackend::from_app_config(&cfg)
+                                {
+                                    let tx_json = serde_json::to_string(&stmt.transactions)
+                                        .unwrap_or_default();
+                                    let _ = res_tx.send(JobResult::Progress {
+                                        label: "Double-verifying math with Gemini...".into(),
+                                        fraction: 0.98,
+                                    });
+                                    let opening_f64 = crate::engine::model::dec_to_f64(opening);
+                                    if let Ok(false) = gemini
+                                        .verify_statement_mathematics(&tx_json, opening_f64)
+                                        .await
+                                    {
+                                        tracing::warn!("[workflow] Optional AI flagged mathematics after deterministic validation; manual review may be useful.");
                                     }
                                 }
                             }

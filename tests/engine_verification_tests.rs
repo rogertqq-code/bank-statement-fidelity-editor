@@ -1,10 +1,8 @@
-use dual_core_pdf_pipeline::app::config::AppConfig;
 use dual_core_pdf_pipeline::engine::verification::{verify_edit_pages, MathInputs};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 use rust_decimal_macros::dec;
 use std::path::Path;
-use std::sync::Arc;
 
 /// Helper to generate a simple PDF with specific text elements at exact coordinates.
 fn create_simple_pdf(path: &Path, strings: &[(&str, f32, f32)]) {
@@ -76,12 +74,11 @@ async fn test_verify_edit_pages_identical() {
     create_simple_pdf(&orig, &[("100.00", 50.0, 700.0)]);
     create_simple_pdf(&edited, &[("100.00", 50.0, 700.0)]);
 
-    let _config = Arc::new(AppConfig::default());
-
     let math = MathInputs {
         transactions: vec![],
         opening_balance: dec!(0.0),
         expected_final_balance: None,
+        required: false,
     };
 
     let report = verify_edit_pages(
@@ -112,12 +109,11 @@ async fn test_verify_edit_pages_different() {
     create_simple_pdf(&orig, &[("100.00", 50.0, 700.0)]);
     create_simple_pdf(&edited, &[("200.00", 50.0, 700.0)]);
 
-    let _config = Arc::new(AppConfig::default());
-
     let math = MathInputs {
         transactions: vec![],
         opening_balance: dec!(0.0),
         expected_final_balance: None,
+        required: false,
     };
 
     // Provide a bounding box that does NOT cover the edit,

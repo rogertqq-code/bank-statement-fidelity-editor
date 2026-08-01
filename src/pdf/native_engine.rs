@@ -409,7 +409,7 @@ pub mod pdfium_resolver {
 
         // Use a known stable Pdfium release (chromium/6721)
         let url = format!(
-            "https://github.com/nicely formatted/pdfium-binaries/releases/latest/download/pdfium-{os_tag}.tgz"
+            "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-{os_tag}.tgz"
         );
 
         tracing::info!("[pdfium] Auto-downloading Pdfium from {}", url);
