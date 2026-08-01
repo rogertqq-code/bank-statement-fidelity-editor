@@ -118,7 +118,8 @@ pub fn enforce_log_retention(
     let now = SystemTime::now();
     let mut removed = 0usize;
     for prefix in MANAGED_LOG_PREFIXES {
-        for (index, (path, modified)) in managed_log_files(log_dir, prefix)?.into_iter().enumerate() {
+        for (index, (path, modified)) in managed_log_files(log_dir, prefix)?.into_iter().enumerate()
+        {
             let expired = now.duration_since(modified).unwrap_or_default() > max_age;
             if expired || index >= max_files_per_stream {
                 std::fs::remove_file(path)?;
@@ -360,8 +361,8 @@ mod tests {
         }
         std::fs::write(temp.path().join("unmanaged.txt"), "keep").unwrap();
 
-        let removed = enforce_log_retention(temp.path(), Duration::from_secs(24 * 60 * 60), 2)
-            .unwrap();
+        let removed =
+            enforce_log_retention(temp.path(), Duration::from_secs(24 * 60 * 60), 2).unwrap();
         assert_eq!(removed, 6);
         for prefix in MANAGED_LOG_PREFIXES {
             assert_eq!(managed_log_files(temp.path(), prefix).unwrap().len(), 2);

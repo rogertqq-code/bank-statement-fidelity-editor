@@ -715,9 +715,7 @@ impl Job {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationDisposition {
     Succeeded,
@@ -929,14 +927,15 @@ impl ResultSink {
     fn send(&self, result: JobResult) -> Result<(), mpsc::SendError<JobResult>> {
         use std::sync::atomic::Ordering;
 
-        let terminal = result.is_terminal();
+        let disposition = result.disposition();
+        let terminal = disposition.is_some();
         tracing::debug!(
             job_id = self.metadata.job_id,
             correlation_id = %self.metadata.correlation_id,
             document_id = self.metadata.document_id.as_deref().unwrap_or("none"),
             job_label = self.metadata.label,
             terminal,
-            disposition = ?result.disposition(),
+            disposition = ?disposition,
             "runtime result emitted"
         );
         if self.terminal_sent.load(Ordering::Acquire) {
@@ -966,7 +965,7 @@ impl ResultSink {
                 correlation_id = %self.metadata.correlation_id,
                 document_id = self.metadata.document_id.as_deref().unwrap_or("none"),
                 job_label = self.metadata.label,
-                disposition = ?result.disposition(),
+                disposition = ?disposition,
                 "runtime job terminated"
             );
             self.cancellations.complete(self.metadata.job_id);
@@ -1771,7 +1770,9 @@ async fn process_job_inner(
                                 tail
                             ));
                         }
-                        Ok(_) => tracing::info!("No managed log tail was available for the bug report"),
+                        Ok(_) => {
+                            tracing::info!("No managed log tail was available for the bug report")
+                        }
                         Err(error) => tracing::warn!(
                             "Could not prepare the bounded support log tail: {error}"
                         ),

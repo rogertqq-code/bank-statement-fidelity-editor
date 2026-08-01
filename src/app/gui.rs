@@ -2108,9 +2108,9 @@ impl MyApp {
                 let (kind, prefix) = match disposition {
                     OperationDisposition::Succeeded => (ToastKind::Success, "Completed"),
                     OperationDisposition::NoOp => (ToastKind::Info, "No changes"),
-                    OperationDisposition::Partial => (ToastKind::Warning, "Partially completed"),
+                    OperationDisposition::Partial => (ToastKind::Warn, "Partially completed"),
                     OperationDisposition::Failed => (ToastKind::Error, "Failed"),
-                    OperationDisposition::Cancelled => (ToastKind::Warning, "Cancelled"),
+                    OperationDisposition::Cancelled => (ToastKind::Warn, "Cancelled"),
                     OperationDisposition::TimedOut => (ToastKind::Error, "Timed out"),
                 };
                 let artifact_note = artifact
