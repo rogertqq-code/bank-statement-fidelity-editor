@@ -479,26 +479,23 @@ pub mod pdfium_resolver {
         Err("Auto-download disabled in tests".into())
     }
 
-    /// Resolve the Pdfium library path, caching the result.
+    /// Probe only installed or system Pdfium libraries. This function never
+    /// downloads files and is safe for readiness, doctor, and capability UI.
+    pub fn probe_local() -> Result<PathBuf, String> {
+        if let Some(dir) = find_local() {
+            return Ok(dir);
+        }
+        if pdfium_render::prelude::Pdfium::bind_to_system_library().is_ok() {
+            return Ok(PathBuf::new());
+        }
+        Err("Pdfium is not installed locally or available as a system library".into())
+    }
+
+    /// Resolve the Pdfium library path, caching the result. Optional download
+    /// remains an explicit resolver policy and is never used by `probe_local`.
     pub fn resolve() -> Result<PathBuf, String> {
         RESOLVED
-            .get_or_init(|| {
-                // Try local first
-                if let Some(dir) = find_local() {
-                    tracing::info!("[pdfium] Found Pdfium library in {:?}", dir);
-                    return Ok(dir);
-                }
-
-                // Try system library by attempting a bind
-                if pdfium_render::prelude::Pdfium::bind_to_system_library().is_ok() {
-                    tracing::info!("[pdfium] Bound to system Pdfium library");
-                    // Return empty path - system library is used directly
-                    return Ok(PathBuf::new());
-                }
-
-                // Try auto-download
-                auto_download()
-            })
+            .get_or_init(|| probe_local().or_else(|_| auto_download()))
             .clone()
     }
 }
