@@ -115,6 +115,7 @@ pub fn parse_statement_from_geometry(
             line_on_page: g.line_on_page,
             text: g.text.clone(),
             bbox: g.bbox,
+            blocks: Vec::new(),
         })
         .collect();
 
@@ -140,17 +141,24 @@ struct RawRow {
     line_on_page: usize,
     text: String,
     bbox: [f32; 4],
+    blocks: Vec<crate::pdf::TextBlock>,
 }
 
 impl RawRow {
     fn from_blocks(page: usize, line_on_page: usize, blocks: &[crate::pdf::TextBlock]) -> Self {
+        let mut ordered_blocks = blocks.to_vec();
+        ordered_blocks.sort_by(|left, right| {
+            left.bbox[0]
+                .partial_cmp(&right.bbox[0])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut text = String::new();
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
         let mut max_x = f32::MIN;
         let mut max_y = f32::MIN;
 
-        for b in blocks {
+        for b in &ordered_blocks {
             if !text.is_empty() {
                 text.push(' ');
             }
@@ -166,6 +174,7 @@ impl RawRow {
             line_on_page,
             text: text.trim().to_string(),
             bbox: [min_x, min_y, max_x, max_y],
+            blocks: ordered_blocks,
         }
     }
 }
@@ -180,7 +189,7 @@ static AMOUNT_RE: std::sync::LazyLock<regex::Regex> =
 
 static DATE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"(?i)(\d{1,2}[/ ](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2})[/ ]\d{2,4})",
+        r"(?ix)\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}(?:[-/.]|\s)(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2})(?:[-/.]|\s)\d{2,4})\b",
     )
     .unwrap()
 });
@@ -210,6 +219,7 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
     let mut closing_balance = Decimal::ZERO;
     let mut found_opening = false;
     let mut found_closing = false;
+    let mut continuity_balance: Option<Decimal> = None;
 
     for row in rows {
         let text_lower = row.text.to_lowercase();
@@ -223,6 +233,7 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
 
         if is_opening && !amounts.is_empty() && !found_opening {
             opening_balance = *amounts.last().unwrap();
+            continuity_balance = Some(opening_balance);
             found_opening = true;
             continue;
         }
@@ -243,7 +254,7 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
         // Heuristic: if there are 3+ amounts, the last is likely the running balance
         // If 2 amounts, the first is debit/credit and the second is running balance
         // If 1 amount, it's a debit or credit with no running balance shown
-        let (debit, credit, running_balance) = match amounts.len() {
+        let (mut debit, mut credit, mut running_balance) = match amounts.len() {
             1 => {
                 // Single amount - assume it's a debit (money in) if positive
                 let amt = amounts[0];
@@ -303,6 +314,46 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
             }
         };
 
+        let mut field_bboxes = FieldBboxes::default();
+        if let Some(spatial) = extract_spatial_amounts(row) {
+            running_balance = Some(spatial.running_balance);
+            field_bboxes.date = spatial.date_bbox;
+            field_bboxes.description = spatial.description_bbox;
+            field_bboxes.running_balance = Some(spatial.running_balance_bbox);
+
+            if let Some(previous) = continuity_balance {
+                let action = spatial.action.abs();
+                let adds = (previous + action).round_dp(2) == spatial.running_balance.round_dp(2);
+                let subtracts =
+                    (previous - action).round_dp(2) == spatial.running_balance.round_dp(2);
+                match (adds, subtracts) {
+                    (true, false) => {
+                        debit = Some(action);
+                        credit = None;
+                        field_bboxes.debit = Some(spatial.action_bbox);
+                    }
+                    (false, true) => {
+                        debit = None;
+                        credit = Some(action);
+                        field_bboxes.credit = Some(spatial.action_bbox);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            page = row.page,
+                            line = row.line_on_page,
+                            previous = %previous,
+                            action = %action,
+                            running = %spatial.running_balance,
+                            "offline row direction is not uniquely supported by balance continuity"
+                        );
+                    }
+                }
+            }
+            continuity_balance = Some(spatial.running_balance);
+        } else if let Some(balance) = running_balance {
+            continuity_balance = Some(balance);
+        }
+
         transactions.push(Transaction {
             page: row.page,
             line_on_page: row.line_on_page,
@@ -312,7 +363,7 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
             credit,
             running_balance,
             bbox: Some(row.bbox),
-            field_bboxes: FieldBboxes::default(),
+            field_bboxes,
             provenance: Provenance::Computed,
             category: None,
         });
@@ -334,6 +385,87 @@ fn parse_rows_into_transactions(rows: &[RawRow]) -> (Vec<Transaction>, Decimal, 
     }
 
     (transactions, opening_balance, closing_balance)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpatialAmounts {
+    action: Decimal,
+    action_bbox: [f32; 4],
+    running_balance: Decimal,
+    running_balance_bbox: [f32; 4],
+    date_bbox: Option<[f32; 4]>,
+    description_bbox: Option<[f32; 4]>,
+}
+
+fn extract_spatial_amounts(row: &RawRow) -> Option<SpatialAmounts> {
+    let mut monetary_blocks: Vec<(&crate::pdf::TextBlock, Decimal)> = row
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let amounts = extract_amounts(&block.text);
+            (amounts.len() == 1).then(|| (block, amounts[0]))
+        })
+        .collect();
+    if monetary_blocks.len() < 2 {
+        return None;
+    }
+    monetary_blocks.sort_by(|(left, _), (right, _)| {
+        left.bbox[0]
+            .partial_cmp(&right.bbox[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let (balance_block, running_balance) = monetary_blocks.pop()?;
+    let action_candidates: Vec<_> = monetary_blocks
+        .iter()
+        .copied()
+        .filter(|(_, amount)| !amount.is_zero())
+        .collect();
+    let (action_block, action) = match action_candidates.as_slice() {
+        [only] => *only,
+        [] if monetary_blocks.len() == 1 => monetary_blocks[0],
+        _ => return None,
+    };
+
+    let date_bbox = row
+        .blocks
+        .iter()
+        .find(|block| DATE_RE.is_match(&block.text))
+        .map(|block| block.bbox);
+    let description_limit = action_block.bbox[0].min(balance_block.bbox[0]);
+    let description_bbox = union_bboxes(
+        row.blocks
+            .iter()
+            .filter(|block| {
+                block.bbox[0] < description_limit
+                    && !DATE_RE.is_match(&block.text)
+                    && extract_amounts(&block.text).is_empty()
+            })
+            .map(|block| block.bbox),
+    );
+
+    Some(SpatialAmounts {
+        action,
+        action_bbox: action_block.bbox,
+        running_balance,
+        running_balance_bbox: balance_block.bbox,
+        date_bbox,
+        description_bbox,
+    })
+}
+
+fn union_bboxes(boxes: impl Iterator<Item = [f32; 4]>) -> Option<[f32; 4]> {
+    boxes.fold(None, |accumulator, bbox| {
+        Some(match accumulator {
+            Some(current) => [
+                current[0].min(bbox[0]),
+                current[1].min(bbox[1]),
+                current[2].max(bbox[2]),
+                current[3].max(bbox[3]),
+            ],
+            None => bbox,
+        })
+    })
 }
 
 fn extract_amounts(text: &str) -> Vec<Decimal> {
@@ -458,6 +590,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_date_finds_iso_and_hyphenated_dates() {
+        assert_eq!(
+            extract_date("2026-03-01 Direct Deposit $2,256.02"),
+            "2026-03-01"
+        );
+        assert_eq!(
+            extract_date("01-03-2026 Direct Deposit $2,256.02"),
+            "01-03-2026"
+        );
+    }
+
+    #[test]
     fn extract_date_finds_month_name() {
         let d = extract_date("15 Jan 2024 Direct debit $100.00");
         assert_eq!(d, "15 Jan 2024");
@@ -471,24 +615,28 @@ mod tests {
                 line_on_page: 0,
                 text: "Opening Balance $1,000.00".into(),
                 bbox: [0.0; 4],
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 1,
                 text: "15/01/2024 Direct Deposit $500.00 $1,500.00".into(),
                 bbox: [0.0; 4],
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 2,
                 text: "16/01/2024 ATM Withdrawal -$200.00 $1,300.00".into(),
                 bbox: [0.0; 4],
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 3,
                 text: "Closing Balance $1,300.00".into(),
                 bbox: [0.0; 4],
+                blocks: Vec::new(),
             },
         ];
         let (txs, opening, closing) = parse_rows_into_transactions(&rows);
@@ -505,16 +653,52 @@ mod tests {
                 line_on_page: 0,
                 text: "Bank of Test".into(),
                 bbox: [0.0; 4],
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 1,
                 text: "Account No. 123-456-789".into(),
                 bbox: [0.0; 4],
+                blocks: Vec::new(),
             },
         ];
         let acct = extract_account_number(&rows);
         assert_eq!(acct, Some("123456789".to_string()));
+    }
+
+    #[test]
+    fn representative_two_page_statement_extracts_all_rows_offline() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/stress_pdfs/Standard_Bank_Statement_01.pdf");
+        let engine = Arc::new(crate::pdf::native_engine::OxidizePdfEngine::new());
+
+        let statement = parse_statement_offline(&fixture, engine).unwrap();
+
+        assert_eq!(statement.total_pages, 2);
+        assert_eq!(statement.transactions.len(), 30);
+        assert_eq!(statement.opening_balance, dec!(10000.00));
+        assert_eq!(statement.closing_balance, dec!(19741.65));
+        assert_eq!(statement.transactions[0].debit, Some(dec!(2256.02)));
+        assert_eq!(statement.transactions[0].credit, None);
+        assert_eq!(statement.transactions[1].debit, None);
+        assert_eq!(statement.transactions[1].credit, Some(dec!(28.89)));
+        assert!(statement.transactions[0].field_bboxes.date.is_some());
+        assert!(statement.transactions[0].field_bboxes.description.is_some());
+        assert!(statement.transactions[0].field_bboxes.debit.is_some());
+        assert!(statement.transactions[0]
+            .field_bboxes
+            .running_balance
+            .is_some());
+
+        let mut expected = statement.opening_balance;
+        for transaction in &statement.transactions {
+            assert!(!transaction.date.is_empty());
+            assert!(transaction.bbox.is_some());
+            expected = (expected + transaction.delta_in() - transaction.delta_out()).round_dp(2);
+            assert_eq!(transaction.running_balance, Some(expected));
+        }
+        assert_eq!(expected, statement.closing_balance);
     }
 
     #[test]
@@ -554,24 +738,28 @@ mod tests {
                 line_on_page: 0,
                 bbox: [0.0; 4],
                 text: "15/01/2024 Deposit $50.00".into(),
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 1,
                 bbox: [0.0; 4],
                 text: "16/01/2024 Fee -$10.00".into(),
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 2,
                 bbox: [0.0; 4],
                 text: "17/01/2024 Deposit $100.00 $0.00 $140.00".into(),
+                blocks: Vec::new(),
             },
             RawRow {
                 page: 0,
                 line_on_page: 3,
                 bbox: [0.0; 4],
                 text: "18/01/2024 Withdrawal $0.00 $20.00 $120.00".into(),
+                blocks: Vec::new(),
             },
         ];
 
@@ -600,6 +788,7 @@ mod tests {
             line_on_page: 0,
             bbox: [0.0; 4],
             text: "15/01/2024 Deposit $50.00 $150.00".into(),
+            blocks: Vec::new(),
         }];
         let (_txs, opening, closing) = parse_rows_into_transactions(&rows);
         assert_eq!(opening, dec!(100.00));
