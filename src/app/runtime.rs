@@ -2402,6 +2402,26 @@ async fn process_job_inner(
                 let synthesized_fonts_used = false;
                 let font_override_path: Option<String> = None;
                 let mut total_corrections = 0;
+                let requested_output_pdf = output_pdf.clone();
+                let requested_output_parent = requested_output_pdf
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let staged_transfer_output = match crate::app::commit::staging_path(
+                    requested_output_parent,
+                    ".dcpp-transfer-",
+                    ".pdf",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "PdfSurgery".into(),
+                            message: format!("Failed to stage transfer output: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let output_pdf = staged_transfer_output.to_path_buf();
 
                 loop {
                     attempt += 1;
@@ -2968,7 +2988,6 @@ async fn process_job_inner(
 
                     let total_edits = batch_edits.len();
                     let mut edits_applied = 0usize;
-                    let mut fallback_fonts_used = Vec::new();
                     if total_edits > 0 {
                         tracing::info!("[TRANSFER] Applying batch of {} text edits", total_edits);
 
@@ -3001,13 +3020,32 @@ async fn process_job_inner(
                                     usize,
                                     Vec<serde_json::Value>,
                                 > = std::collections::BTreeMap::new();
-                                for edit in &batch_edits {
-                                    let global_page = edit["page"].as_u64().unwrap_or(0) as usize;
-                                    if let Some((seg_idx, local_page)) = map.resolve(global_page) {
-                                        let mut new_edit = edit.clone();
-                                        new_edit["page"] = serde_json::json!(local_page);
-                                        edits_by_seg.entry(seg_idx).or_default().push(new_edit);
-                                    }
+                                for (edit_index, edit) in batch_edits.iter().enumerate() {
+                                    let Some(global_page) =
+                                        edit["page"].as_u64().map(|page| page as usize)
+                                    else {
+                                        let _ = res_tx.send(JobResult::TransferFailed {
+                                            stage: "PdfSurgery".into(),
+                                            message: format!(
+                                                "Edit {edit_index} has no valid global page identity; no segmented output was published"
+                                            ),
+                                        });
+                                        return;
+                                    };
+                                    let Some((seg_idx, local_page)) = map.resolve(global_page)
+                                    else {
+                                        let _ = res_tx.send(JobResult::TransferFailed {
+                                            stage: "PdfSurgery".into(),
+                                            message: format!(
+                                                "Edit {edit_index} references global page {global_page}, outside the {}-page target; no segmented output was published",
+                                                map.total_pages
+                                            ),
+                                        });
+                                        return;
+                                    };
+                                    let mut local_edit = edit.clone();
+                                    local_edit["page"] = serde_json::json!(local_page);
+                                    edits_by_seg.entry(seg_idx).or_default().push(local_edit);
                                 }
 
                                 let mut final_paths = Vec::new();
@@ -3034,44 +3072,49 @@ async fn process_job_inner(
                                         ));
                                         match reply_rx.await {
                                             Ok(PythonJobResult::ApplyReport(report))
-                                                if report.success =>
+                                                if report.success
+                                                    && report.requested == seg_edits.len()
+                                                    && report.matched == seg_edits.len()
+                                                    && report.placed == seg_edits.len()
+                                                    && report.failed == 0
+                                                    && report.review_flags.is_empty()
+                                                    && edited_path.is_file() =>
                                             {
                                                 edits_applied += report.placed;
-                                                for local_page in report.review_flags {
-                                                    if let Some(global_page) =
-                                                        map.to_global(i, local_page)
-                                                    {
-                                                        fallback_fonts_used.push(global_page);
-                                                    }
-                                                }
                                                 final_paths.push(edited_path);
                                             }
                                             Ok(PythonJobResult::ApplyReport(report)) => {
-                                                tracing::warn!(
-                                                    segment = i,
-                                                    requested = report.requested,
-                                                    matched = report.matched,
-                                                    placed = report.placed,
-                                                    warnings = ?report.warnings,
-                                                    "[TRANSFER] Exact batch edit failed; preserving unedited segment"
-                                                );
-                                                final_paths.push(seg.path.clone());
+                                                let _ = res_tx.send(JobResult::TransferFailed {
+                                                    stage: "PdfSurgery".into(),
+                                                    message: format!(
+                                                        "Segment {i} failed exact edit membership: requested {}, matched {}, placed {}, failed {}, expected {}; no merged output was published. {}",
+                                                        report.requested,
+                                                        report.matched,
+                                                        report.placed,
+                                                        report.failed,
+                                                        seg_edits.len(),
+                                                        report.warnings.join("; ")
+                                                    ),
+                                                });
+                                                return;
                                             }
                                             Ok(PythonJobResult::Error(error)) => {
-                                                tracing::warn!(
-                                                    segment = i,
-                                                    %error,
-                                                    "[TRANSFER] Batch edit errored; preserving unedited segment"
-                                                );
-                                                final_paths.push(seg.path.clone());
+                                                let _ = res_tx.send(JobResult::TransferFailed {
+                                                    stage: "PdfSurgery".into(),
+                                                    message: format!(
+                                                        "Segment {i} edit failed before merge: {error}"
+                                                    ),
+                                                });
+                                                return;
                                             }
                                             other => {
-                                                tracing::warn!(
-                                                    segment = i,
-                                                    result = ?other,
-                                                    "[TRANSFER] Unexpected batch-edit result; preserving unedited segment"
-                                                );
-                                                final_paths.push(seg.path.clone());
+                                                let _ = res_tx.send(JobResult::TransferFailed {
+                                                    stage: "PdfSurgery".into(),
+                                                    message: format!(
+                                                        "Segment {i} returned an unexpected exact-edit result {other:?}; no merged output was published"
+                                                    ),
+                                                });
+                                                return;
                                             }
                                         }
                                     } else {
@@ -3079,16 +3122,47 @@ async fn process_job_inner(
                                     }
                                 }
 
-                                if let Err(e) = crate::engine::pdf_split_merge::merge_pdfs(
+                                if edits_applied != total_edits {
+                                    let _ = res_tx.send(JobResult::TransferFailed {
+                                        stage: "PdfSurgery".into(),
+                                        message: format!(
+                                            "Segmented edit count mismatch: applied {edits_applied}/{total_edits}; no merged output was published"
+                                        ),
+                                    });
+                                    return;
+                                }
+                                match crate::engine::pdf_split_merge::merge_pdfs(
                                     &final_paths,
                                     &output_pdf,
                                 ) {
-                                    tracing::error!("[TRANSFER] Failed to merge segments: {}", e);
+                                    Ok(merged_pages) if merged_pages == map.total_pages => {}
+                                    Ok(merged_pages) => {
+                                        let _ = res_tx.send(JobResult::TransferFailed {
+                                            stage: "PdfSurgery".into(),
+                                            message: format!(
+                                                "Segment merge page-count mismatch: expected {}, got {merged_pages}",
+                                                map.total_pages
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        let _ = res_tx.send(JobResult::TransferFailed {
+                                            stage: "PdfSurgery".into(),
+                                            message: format!(
+                                                "Atomic segment merge failed: {error}"
+                                            ),
+                                        });
+                                        return;
+                                    }
                                 }
                             } else {
-                                tracing::error!(
-                                    "[TRANSFER] Failed to prepare document segments for chunking"
-                                );
+                                let _ = res_tx.send(JobResult::TransferFailed {
+                                    stage: "PdfSurgery".into(),
+                                    message: "Failed to prepare exact document segments; no output was published"
+                                        .into(),
+                                });
+                                return;
                             }
                         } else {
                             let edits_json =
@@ -3114,17 +3188,19 @@ async fn process_job_inner(
                             let native_temp = output_pdf.with_extension("temp.pdf");
                             if let Ok(c) = native_res {
                                 if c == total_edits && native_temp.is_file() {
-                                    edits_applied = c;
-                                    if let Err(error) = std::fs::rename(&native_temp, &output_pdf) {
-                                        edits_applied = 0;
-                                        let _ = std::fs::remove_file(&native_temp);
-                                        tracing::warn!(
-                                            "[TRANSFER] Native exact batch could not be published: {error}"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            "[TRANSFER] (Native) Exact batch edit succeeded"
-                                        );
+                                    match publish_surgery_output(&native_temp, &output_pdf) {
+                                        Ok(()) => {
+                                            edits_applied = c;
+                                            tracing::info!(
+                                                "[TRANSFER] (Native) Exact batch edit succeeded"
+                                            );
+                                        }
+                                        Err(error) => {
+                                            let _ = std::fs::remove_file(&native_temp);
+                                            tracing::warn!(
+                                                "[TRANSFER] Native exact batch could not be published: {error}"
+                                            );
+                                        }
                                     }
                                 } else {
                                     let _ = std::fs::remove_file(&native_temp);
@@ -3151,12 +3227,19 @@ async fn process_job_inner(
                                 ));
 
                                 match reply_rx.await {
-                                    Ok(PythonJobResult::ApplyReport(report)) if report.success => {
+                                    Ok(PythonJobResult::ApplyReport(report))
+                                        if report.success
+                                            && report.requested == total_edits
+                                            && report.matched == total_edits
+                                            && report.placed == total_edits
+                                            && report.failed == 0
+                                            && report.review_flags.is_empty()
+                                            && output_pdf.with_extension("temp.pdf").is_file() =>
+                                    {
                                         let temp_output = output_pdf.with_extension("temp.pdf");
-                                        match std::fs::rename(&temp_output, &output_pdf) {
+                                        match publish_surgery_output(&temp_output, &output_pdf) {
                                             Ok(()) => {
                                                 edits_applied = report.placed;
-                                                fallback_fonts_used.extend(report.review_flags);
                                                 tracing::info!(
                                                     "[TRANSFER] (Python) Exact batch edit succeeded"
                                                 );
@@ -3170,13 +3253,19 @@ async fn process_job_inner(
                                             }
                                         }
                                     }
-                                    Ok(PythonJobResult::ApplyReport(report)) => tracing::error!(
-                                        requested = report.requested,
-                                        matched = report.matched,
-                                        placed = report.placed,
-                                        warnings = ?report.warnings,
-                                        "[TRANSFER] (Python) Exact batch edit failed"
-                                    ),
+                                    Ok(PythonJobResult::ApplyReport(report)) => {
+                                        let _ = std::fs::remove_file(
+                                            output_pdf.with_extension("temp.pdf"),
+                                        );
+                                        tracing::error!(
+                                            requested = report.requested,
+                                            matched = report.matched,
+                                            placed = report.placed,
+                                            failed = report.failed,
+                                            warnings = ?report.warnings,
+                                            "[TRANSFER] (Python) Exact batch edit failed"
+                                        );
+                                    }
                                     Ok(PythonJobResult::Error(error)) => tracing::error!(
                                         "[TRANSFER] (Python) Batch edit failed: {}",
                                         error
@@ -3190,24 +3279,19 @@ async fn process_job_inner(
                         }
                     }
 
-                    let _ = res_tx.send(JobResult::Progress {
-                        label: format!("PDF changes applied ✓ ({edits_applied}/{total_edits})"),
-                        fraction: 0.55,
-                    });
-
-                    // Any engine-reported fallback-font usage is a hard fidelity
-                    // failure. Automatic glyph synthesis and donor substitution are
-                    // not approved transfer recovery paths.
-                    if !fallback_fonts_used.is_empty() {
+                    if edits_applied != total_edits {
                         let _ = res_tx.send(JobResult::TransferFailed {
                             stage: "PdfSurgery".into(),
                             message: format!(
-                                "Font fidelity unavailable on pages {:?}; no substituted output was accepted",
-                                fallback_fonts_used
+                                "Exact edit count mismatch: applied {edits_applied}/{total_edits}; verification and publication were stopped"
                             ),
                         });
                         return;
                     }
+                    let _ = res_tx.send(JobResult::Progress {
+                        label: format!("PDF changes applied ✓ ({edits_applied}/{total_edits})"),
+                        fraction: 0.55,
+                    });
 
                     // ======= STAGE 6: Visual Fidelity Check ========
                     send_progress(&res_tx, TransferStage::VisualFidelityCheck);
@@ -3425,7 +3509,7 @@ async fn process_job_inner(
                     // STAGE 9: Final Audit setup
                     let elapsed = started_at.elapsed().as_secs_f64();
                     let result = TransferResult {
-                        output_path: output_pdf.clone(),
+                        output_path: requested_output_pdf.clone(),
                         source_tx_count: source_transactions.len(),
                         target_tx_count: target_transactions.len(),
                         pages_added: actual_pages_added,
@@ -3541,27 +3625,86 @@ async fn process_job_inner(
                     }
                 }
 
-                // Get the best result from the loop
+                // Only a currently staged result that passed both deterministic
+                // math and visual gates may be published. “Best effort” output is
+                // review evidence, never a successful transfer artifact.
                 let final_result = match best_result {
-                    Some(r) => r,
+                    Some(result) if result.math_verified && result.visual_verified => result,
+                    Some(result) => {
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "FinalVerification".into(),
+                            message: format!(
+                                "No transfer attempt passed all publication gates (math_verified={}, visual_verified={}); prior output was preserved",
+                                result.math_verified, result.visual_verified
+                            ),
+                        });
+                        return;
+                    }
                     None => {
-                        let _ = res_tx.send(JobResult::Error {
-                            job_label: String::new(),
-                            message: "Transfer loop failed to yield any valid result".into(),
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "FinalVerification".into(),
+                            message: "Transfer loop produced no verified result; prior output was preserved"
+                                .into(),
                         });
                         return;
                     }
                 };
 
-                // ======= STAGE 9: Final Audit ========
+                // ======= STAGE 9: Atomic Publication and Final Audit ========
                 send_progress(&res_tx, TransferStage::FinalAudit);
+                let staged_bytes = match std::fs::read(&output_pdf) {
+                    Ok(bytes) if !bytes.is_empty() => bytes,
+                    Ok(_) => {
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "FinalAudit".into(),
+                            message: "Verified staged transfer output is empty; prior output was preserved"
+                                .into(),
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "FinalAudit".into(),
+                            message: format!(
+                                "Verified staged transfer output is unavailable: {error}; prior output was preserved"
+                            ),
+                        });
+                        return;
+                    }
+                };
+                let staged_hash = crate::engine::workflow::sha256_hex_of(&staged_bytes);
+                let mut publication = crate::app::commit::FileCommitBarrier::new();
+                if let Err(error) = publication.publish(&output_pdf, &requested_output_pdf) {
+                    let _ = res_tx.send(JobResult::TransferFailed {
+                        stage: "FinalAudit".into(),
+                        message: format!(
+                            "Transfer output publication failed: {error}; prior output was preserved"
+                        ),
+                    });
+                    return;
+                }
+                let published_hash = std::fs::read(&requested_output_pdf)
+                    .map(|bytes| crate::engine::workflow::sha256_hex_of(&bytes));
+                if !matches!(published_hash, Ok(ref hash) if *hash == staged_hash) {
+                    let _ = res_tx.send(JobResult::TransferFailed {
+                        stage: "FinalAudit".into(),
+                        message: "Published transfer output did not match the verified stage; prior output was restored"
+                            .into(),
+                    });
+                    return;
+                }
 
                 match write_transfer_audit(&final_result, &source_pdf, &target_pdf) {
-                    Ok(_audit_path) => {
-                        // Phase 7: Audit reports are securely saved purely in Rust via serde_json.
-                        // No external python post-processing is required.
+                    Ok(_audit_path) => publication.commit(),
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::TransferFailed {
+                            stage: "FinalAudit".into(),
+                            message: format!(
+                                "Transfer audit failed: {error}; prior output was restored"
+                            ),
+                        });
+                        return;
                     }
-                    Err(e) => tracing::warn!("[TRANSFER] Failed to write audit report: {}", e),
                 }
 
                 tracing::info!(
@@ -4525,6 +4668,11 @@ async fn process_job_inner(
 
                 let outcome = tokio::task::spawn_blocking(move || {
                     if let (Some(map), Some(temp_dir)) = (map_opt, mgr_opt) {
+                        map.validate_structure().map_err(|error| {
+                            crate::pdf::EngineError::ApplyFailed(format!(
+                                "Invalid segment map: {error}"
+                            ))
+                        })?;
                         let (seg_idx, local_page) = map.resolve(page).ok_or_else(|| {
                             crate::pdf::EngineError::ApplyFailed(format!(
                                 "Global page {page} not found in segment map"
@@ -4555,7 +4703,7 @@ async fn process_job_inner(
 
                         let mut ordered_paths = map.ordered_merge_paths();
                         ordered_paths[seg_idx] = staged_segment.to_path_buf();
-                        crate::engine::pdf_split_merge::merge_pdfs(
+                        let merged_pages = crate::engine::pdf_split_merge::merge_pdfs(
                             &ordered_paths,
                             &staged_output_for_blocking,
                         )
@@ -4564,6 +4712,12 @@ async fn process_job_inner(
                                 "Failed to merge staged segments: {error}"
                             ))
                         })?;
+                        if merged_pages != map.total_pages {
+                            return Err(crate::pdf::EngineError::ApplyFailed(format!(
+                                "Segment merge page-count mismatch: expected {}, got {merged_pages}",
+                                map.total_pages
+                            )));
+                        }
 
                         Ok((
                             ReplaceOutcome {
@@ -5401,6 +5555,16 @@ async fn process_job_inner(
                             )),
                         }
                     }
+                    if !failures.is_empty() {
+                        let _ = res_tx.send(JobResult::Error {
+                            job_label: "apply_proposed_changes".into(),
+                            message: format!(
+                                "Segment membership validation failed before mutation: {}",
+                                failures.join("; ")
+                            ),
+                        });
+                        return;
+                    }
 
                     // 3) Per-segment apply via the Python actor (each <=3 pages, Pro-legal).
                     let mut seg_paths: Vec<std::path::PathBuf> =
@@ -5428,6 +5592,7 @@ async fn process_job_inner(
                             serde_json::to_string(&edits_json).unwrap_or_else(|_| "[]".into());
                         let json_str_for_fallback = json_str.clone();
                         let edited_out = tmp.path().join(format!("segment_{si:03}_edited.pdf"));
+                        let expected = edits.len();
 
                         let (rtx, rrx) = oneshot::channel();
                         let _ = py_tx.send((
@@ -5440,15 +5605,41 @@ async fn process_job_inner(
                             rtx,
                         ));
                         match rrx.await {
-                            Ok(PythonJobResult::ApplyReport(report)) if report.success => {
-                                seg_paths[si] = edited_out;
-                                applied += report.placed;
+                            Ok(PythonJobResult::ApplyReport(report))
+                                if report.success
+                                    && report.requested == expected
+                                    && report.matched == expected
+                                    && report.placed == expected
+                                    && report.failed == 0
+                                    && report.review_flags.is_empty()
+                                    && edited_out.is_file() =>
+                            {
+                                match crate::engine::segments::validate_segment_replacement(
+                                    &segments[si].path,
+                                    &edited_out,
+                                    segments[si].page_count,
+                                ) {
+                                    Ok(()) => {
+                                        seg_paths[si] = edited_out;
+                                        applied += report.placed;
+                                    }
+                                    Err(validation_error) => {
+                                        let _ = std::fs::remove_file(&edited_out);
+                                        failures.push(format!(
+                                            "segment {si}: Python output failed page membership validation: {validation_error}"
+                                        ));
+                                    }
+                                }
                             }
                             Ok(PythonJobResult::ApplyReport(report)) => {
+                                let _ = std::fs::remove_file(&edited_out);
                                 failures.push(format!(
-                                    "segment {si}: exact Python apply failed ({}/{} placed): {}",
-                                    report.placed,
+                                    "segment {si}: exact Python apply failed (requested {}, matched {}, placed {}, failed {}, expected {}): {}",
                                     report.requested,
+                                    report.matched,
+                                    report.placed,
+                                    report.failed,
+                                    expected,
                                     report.warnings.join("; ")
                                 ));
                             }
@@ -5458,7 +5649,6 @@ async fn process_job_inner(
                                     python_error = %error,
                                     "Python actor errored; attempting exact-count native fallback"
                                 );
-                                let expected = edits.len();
                                 let native_in = seg_paths[si].clone();
                                 let native_path =
                                     tmp.path().join(format!("segment_{si:03}_native.pdf"));
@@ -5476,14 +5666,28 @@ async fn process_job_inner(
                                 })
                                 .await;
                                 match native_result {
-                                    Ok(Ok(count)) if count == expected && native_path.exists() => {
-                                        seg_paths[si] = native_path;
-                                        applied += count;
-                                        tracing::info!(
-                                            segment = si,
-                                            edits_applied = count,
-                                            "Exact-count native fallback succeeded"
-                                        );
+                                    Ok(Ok(count)) if count == expected && native_path.is_file() => {
+                                        match crate::engine::segments::validate_segment_replacement(
+                                            &segments[si].path,
+                                            &native_path,
+                                            segments[si].page_count,
+                                        ) {
+                                            Ok(()) => {
+                                                seg_paths[si] = native_path;
+                                                applied += count;
+                                                tracing::info!(
+                                                    segment = si,
+                                                    edits_applied = count,
+                                                    "Exact-count native fallback succeeded"
+                                                );
+                                            }
+                                            Err(validation_error) => {
+                                                let _ = std::fs::remove_file(&native_path);
+                                                failures.push(format!(
+                                                    "segment {si}: native output failed page membership validation: {validation_error}"
+                                                ));
+                                            }
+                                        }
                                     }
                                     Ok(Ok(count)) => {
                                         let _ = std::fs::remove_file(&native_path);
@@ -5517,25 +5721,76 @@ async fn process_job_inner(
                         return;
                     }
 
-                    // 4) Merge (pure-Rust lopdf) on a blocking task.
+                    // 4) Merge into a same-directory stage, then publish through
+                    // a rollback-capable barrier only after page membership passes.
                     let _ = res_tx.send(JobResult::Progress {
                         label: "Merging segments".into(),
                         fraction: 0.9,
                     });
+                    let output_parent = output
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    let staged_output = match crate::app::commit::staging_path(
+                        output_parent,
+                        ".dcpp-proposed-merge-",
+                        ".pdf",
+                    ) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_proposed_changes".into(),
+                                message: format!("Failed to stage segment merge: {error}"),
+                            });
+                            return;
+                        }
+                    };
                     let seg_paths_for_merge = seg_paths.clone();
-                    let output_merge = output.clone();
+                    let staged_for_merge = staged_output.to_path_buf();
                     let merge_res = tokio::task::spawn_blocking(move || {
-                        merge_pdfs(&seg_paths_for_merge, &output_merge)
-                            .map_err(|e| format!("merge failed: {e}"))
+                        merge_pdfs(&seg_paths_for_merge, &staged_for_merge)
+                            .map_err(|error| format!("merge failed: {error}"))
                     })
                     .await
-                    .unwrap_or_else(|e| Err(format!("merge task panicked: {e}")));
+                    .unwrap_or_else(|error| Err(format!("merge task panicked: {error}")));
 
                     // Keep tmp alive until after merge reads the segment files.
                     drop(tmp);
 
                     match merge_res {
                         Ok(merged) if merged == page_count => {
+                            let mut barrier = crate::app::commit::FileCommitBarrier::new();
+                            if let Err(error) = barrier.publish(staged_output.as_ref(), &output) {
+                                let _ = res_tx.send(JobResult::Error {
+                                    job_label: "apply_proposed_changes".into(),
+                                    message: format!("Merged output commit failed: {error}"),
+                                });
+                                return;
+                            }
+                            let published_pages = lopdf::Document::load(&output)
+                                .map(|document| document.get_pages().len());
+                            match published_pages {
+                                Ok(count) if count == page_count => {}
+                                Ok(count) => {
+                                    let _ = res_tx.send(JobResult::Error {
+                                        job_label: "apply_proposed_changes".into(),
+                                        message: format!(
+                                            "Published page count {count} != original {page_count}; prior output restored"
+                                        ),
+                                    });
+                                    return;
+                                }
+                                Err(error) => {
+                                    let _ = res_tx.send(JobResult::Error {
+                                        job_label: "apply_proposed_changes".into(),
+                                        message: format!(
+                                            "Published merge could not be reopened: {error}; prior output restored"
+                                        ),
+                                    });
+                                    return;
+                                }
+                            }
+                            barrier.commit();
                             let _ = res_tx.send(JobResult::ProposedChangesApplied {
                                 changes_applied: applied,
                                 failures,
@@ -5546,12 +5801,17 @@ async fn process_job_inner(
                             });
                         }
                         Ok(merged) => {
-                            let _ = res_tx.send(JobResult::Error { job_label: "apply_proposed_changes".into(), message: format!("merged page count {merged} != original {page_count}; output not trusted") });
-                        }
-                        Err(e) => {
                             let _ = res_tx.send(JobResult::Error {
                                 job_label: "apply_proposed_changes".into(),
-                                message: e,
+                                message: format!(
+                                    "Merged page count {merged} != original {page_count}; output not published"
+                                ),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_proposed_changes".into(),
+                                message: error,
                             });
                         }
                     }
@@ -5612,22 +5872,17 @@ async fn process_job_inner(
                 }
 
                 match reply_rx.await {
-                    Ok(PythonJobResult::ApplyReport(report)) if report.success => {
-                        if report.placed != usable.len() {
-                            let _ = std::fs::remove_file(&scratch);
-                            let _ = res_tx.send(JobResult::Error {
-                                job_label: "apply_proposed_changes".into(),
-                                message: format!(
-                                    "Exact batch placed {}/{} changes",
-                                    report.placed,
-                                    usable.len()
-                                ),
-                            });
-                            return;
-                        }
-                        if let Err(error) =
-                            crate::app::audit::snapshot_link_or_copy(&scratch, &output)
-                        {
+                    Ok(PythonJobResult::ApplyReport(report))
+                        if report.success
+                            && report.requested == usable.len()
+                            && report.matched == usable.len()
+                            && report.placed == usable.len()
+                            && report.failed == 0
+                            && report.review_flags.is_empty()
+                            && scratch.is_file() =>
+                    {
+                        let mut barrier = crate::app::commit::FileCommitBarrier::new();
+                        if let Err(error) = barrier.publish(&scratch, &output) {
                             let _ = std::fs::remove_file(&scratch);
                             let _ = res_tx.send(JobResult::Error {
                                 job_label: "apply_proposed_changes".into(),
@@ -5635,6 +5890,17 @@ async fn process_job_inner(
                             });
                             return;
                         }
+                        let published_pages = lopdf::Document::load(&output)
+                            .map(|document| document.get_pages().len());
+                        if !matches!(published_pages, Ok(count) if count == page_count) {
+                            let _ = res_tx.send(JobResult::Error {
+                                job_label: "apply_proposed_changes".into(),
+                                message: "Published exact output failed page-count validation; prior output restored"
+                                    .into(),
+                            });
+                            return;
+                        }
+                        barrier.commit();
                         let _ = std::fs::remove_file(&scratch);
                         let _ = res_tx.send(JobResult::Progress {
                             label: "Exact batch committed".to_string(),
@@ -6946,50 +7212,16 @@ async fn process_job_inner(
                 .as_ref()
                 .map(|m| m.temp_path().to_path_buf());
 
-            struct RollbackGuard {
-                output: std::path::PathBuf,
-                backup: std::path::PathBuf,
-                had_existing: bool,
-                success: bool,
-            }
-            impl RollbackGuard {
-                fn new(output: &std::path::Path) -> Self {
-                    let backup = output.with_extension("pdf.rollback.bak");
-                    let had_existing = output.exists();
-                    if had_existing {
-                        let _ = std::fs::copy(output, &backup);
-                    }
-                    Self {
-                        output: output.to_path_buf(),
-                        backup,
-                        had_existing,
-                        success: false,
-                    }
-                }
-                fn commit(mut self) {
-                    self.success = true;
-                }
-            }
-            impl Drop for RollbackGuard {
-                fn drop(&mut self) {
-                    if !self.success {
-                        tracing::warn!(
-                            "Workflow failed. Rolling back {:?} using backup {:?}",
-                            self.output,
-                            self.backup
-                        );
-                        if self.had_existing {
-                            let _ = std::fs::rename(&self.backup, &self.output);
-                        } else {
-                            let _ = std::fs::remove_file(&self.output);
-                        }
-                    } else if self.had_existing {
-                        let _ = std::fs::remove_file(&self.backup);
-                    }
-                }
-            }
-
             tokio::spawn(async move {
+                if ignore_visual_fidelity {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::Other(
+                            "Visual-fidelity bypass is disabled for publishable bank-statement output"
+                                .into(),
+                        ),
+                    ));
+                    return;
+                }
                 if original_transactions.is_empty() {
                     let _ = res_tx.send(JobResult::WorkflowFailed(
                         crate::engine::workflow::WorkflowFailure::Other(
@@ -7077,7 +7309,27 @@ async fn process_job_inner(
                         transaction
                     })
                     .collect();
-                let rollback = RollbackGuard::new(&output);
+                let requested_output = output.clone();
+                let output_parent = requested_output
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let staged_workflow_output = match crate::app::commit::staging_path(
+                    output_parent,
+                    ".dcpp-workflow-",
+                    ".pdf",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(format!(
+                                "workflow output staging failed: {error}"
+                            )),
+                        ));
+                        return;
+                    }
+                };
+                let output = staged_workflow_output.to_path_buf();
                 let mut attempt: u32 = 1;
                 let mut visual_attempts: u32 = 0;
                 // Stage 13 / Item #5: per-workflow timestamp so
@@ -7418,15 +7670,23 @@ async fn process_job_inner(
                             })
                             .collect();
 
-                        // Out-of-range edits abort the apply (Req 8.5) and leave
-                        // all segment files unchanged.
-                        let grouped = match map.group_edits_by_segment(&global_edits) {
-                            Ok(g) => g,
-                            Err(e) => {
-                                ok = false;
-                                error_msg = e.to_string();
-                                std::collections::BTreeMap::new()
+                        // Invalid maps and out-of-range edits abort before any
+                        // engine call, leaving all source segments unchanged.
+                        if let Err(error) = map.validate_structure() {
+                            ok = false;
+                            error_msg = format!("Invalid segment map: {error}");
+                        }
+                        let grouped = if ok {
+                            match map.group_edits_by_segment(&global_edits) {
+                                Ok(groups) => groups,
+                                Err(error) => {
+                                    ok = false;
+                                    error_msg = error.to_string();
+                                    std::collections::BTreeMap::new()
+                                }
                             }
+                        } else {
+                            std::collections::BTreeMap::new()
                         };
 
                         for (i, seg) in map.segments.iter().enumerate() {
@@ -7492,28 +7752,46 @@ async fn process_job_inner(
                                     tx,
                                 ));
 
+                                let expected = segment_edits.len();
                                 match rx.await {
-                                    Ok(PythonJobResult::ApplyReport(report)) if report.success => {
-                                        match std::fs::rename(&temp_seg_out, &seg.path) {
+                                    Ok(PythonJobResult::ApplyReport(report))
+                                        if report.success
+                                            && report.requested == expected
+                                            && report.matched == expected
+                                            && report.placed == expected
+                                            && report.failed == 0
+                                            && report.review_flags.is_empty()
+                                            && temp_seg_out.is_file() =>
+                                    {
+                                        match crate::engine::segments::validate_segment_replacement(
+                                            &seg.path,
+                                            &temp_seg_out,
+                                            seg.page_count,
+                                        ) {
                                             Ok(()) => {
                                                 segment_applied += report.placed;
-                                                final_paths.push(seg.path.clone());
+                                                final_paths.push(temp_seg_out);
                                             }
-                                            Err(error) => {
+                                            Err(validation_error) => {
+                                                let _ = std::fs::remove_file(&temp_seg_out);
                                                 ok = false;
                                                 error_msg = format!(
-                                                    "segment {i} output commit failed: {error}"
+                                                    "segment {i} output failed page membership validation: {validation_error}"
                                                 );
                                                 break;
                                             }
                                         }
                                     }
                                     Ok(PythonJobResult::ApplyReport(report)) => {
+                                        let _ = std::fs::remove_file(&temp_seg_out);
                                         ok = false;
                                         error_msg = format!(
-                                            "segment {i} exact apply failed ({}/{} placed): {}",
-                                            report.placed,
+                                            "segment {i} exact apply failed: requested {}, matched {}, placed {}, failed {}, expected {}: {}",
                                             report.requested,
+                                            report.matched,
+                                            report.placed,
+                                            report.failed,
+                                            expected,
                                             report.warnings.join("; ")
                                         );
                                         break;
@@ -7537,8 +7815,7 @@ async fn process_job_inner(
                         }
 
                         if ok && segment_applied == edits.len() {
-                            let expected_pages: usize =
-                                map.segments.iter().map(|segment| segment.page_count).sum();
+                            let expected_pages = map.total_pages;
                             match crate::engine::pdf_split_merge::merge_pdfs(&final_paths, &scratch)
                             {
                                 Ok(merged_pages) if merged_pages == expected_pages => {
@@ -7678,102 +7955,6 @@ async fn process_job_inner(
                             last_failure = Some(crate::engine::workflow::WorkflowFailure::Other(
                                 format!("untyped or unexpected apply_many_edits result rejected: {other:?}"),
                             ));
-                        }
-                    }
-
-                    if !all_ok {
-                        tracing::warn!("[workflow] All native/PyMuPDF edit engines failed! Falling back to TypstReconstruct as ultimate fail-safe.");
-                        let mut working_transactions = original_transactions.clone();
-                        for e in &edits {
-                            if let Some(row) = working_transactions
-                                .iter_mut()
-                                .find(|t| t.page == e.page && t.line_on_page == e.line_on_page)
-                            {
-                                match e.field {
-                                    crate::engine::workflow::EditField::Date => {
-                                        row.date = e.new_text.clone()
-                                    }
-                                    crate::engine::workflow::EditField::Description => {
-                                        row.raw_text = e.new_text.clone()
-                                    }
-                                    crate::engine::workflow::EditField::Debit => {
-                                        let cleaned: String = e
-                                            .new_text
-                                            .chars()
-                                            .filter(|c| {
-                                                c.is_ascii_digit() || *c == '-' || *c == '.'
-                                            })
-                                            .collect();
-                                        if let Ok(v) = std::str::FromStr::from_str(&cleaned) {
-                                            row.debit = Some(v);
-                                            row.credit = None;
-                                        } else {
-                                            row.debit = None;
-                                        }
-                                    }
-                                    crate::engine::workflow::EditField::Credit => {
-                                        let cleaned: String = e
-                                            .new_text
-                                            .chars()
-                                            .filter(|c| {
-                                                c.is_ascii_digit() || *c == '-' || *c == '.'
-                                            })
-                                            .collect();
-                                        if let Ok(v) = std::str::FromStr::from_str(&cleaned) {
-                                            row.credit = Some(v);
-                                            row.debit = None;
-                                        } else {
-                                            row.credit = None;
-                                        }
-                                    }
-                                    crate::engine::workflow::EditField::RunningBalance => {
-                                        let cleaned: String = e
-                                            .new_text
-                                            .chars()
-                                            .filter(|c| {
-                                                c.is_ascii_digit() || *c == '-' || *c == '.'
-                                            })
-                                            .collect();
-                                        if let Ok(v) = std::str::FromStr::from_str(&cleaned) {
-                                            row.running_balance = Some(v);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Ok(recomputed) = crate::engine::balance::process_and_reconcile(
-                            working_transactions.clone(),
-                            opening_balance,
-                            Some(expected_closing),
-                        )
-                        .map(|(r, _)| r)
-                        {
-                            working_transactions = recomputed;
-                        }
-
-                        let reconstructed_statement = crate::ai::document_ai::BankStatement {
-                            transactions: working_transactions,
-                            opening_balance,
-                            closing_balance: expected_closing,
-                            account_number: None,
-                            total_pages: 1,
-                            bank_name: None,
-                        };
-                        let typst_engine = crate::engine::typst_engine::TypstEngine::new();
-                        match typst_engine
-                            .reconstruct_pdf(&reconstructed_statement, &output)
-                            .await
-                        {
-                            Ok(_) => {
-                                tracing::info!(
-                                    "[workflow] TypstReconstruct ultimate fail-safe succeeded!"
-                                );
-                                all_ok = true;
-                            }
-                            Err(e) => {
-                                tracing::error!("[workflow] TypstReconstruct also failed: {}", e);
-                            }
                         }
                     }
 
@@ -8017,7 +8198,7 @@ async fn process_job_inner(
                             Err(_) => true, // Gemini not configured -> skip
                         };
 
-                        if vision_ok || ignore_visual_fidelity {
+                        if vision_ok {
                             break;
                         } else if attempt >= max_visual_attempts {
                             let is_borderline = report.visual_diff_score <= visual_threshold * 2.5;
@@ -8047,40 +8228,23 @@ async fn process_job_inner(
 
                     // We reach here when:
                     //   - perceptual diff did NOT pass (attempt_state.passed() == false)
-                    // Early bail-out: if the score is very high (>0.30)
-                    // after 2+ attempts, the document has a structural
-                    // rendering issue that won't improve with retries.
-                    // Bail early to prevent OOM on large multi-page docs.
                     if attempt >= 2 && last_score > 0.30 {
-                        tracing::warn!(
-                                        "[workflow] Visual diff {:.4} after {} attempts - structural issue detected. \
-                                         Accepting early to prevent memory exhaustion. Manual review required.",
-                                        last_score, attempt
-                                    );
-                        break;
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::VisualNotConverged {
+                                last_score,
+                                attempts: attempt,
+                            },
+                        ));
+                        return;
                     }
                     if attempt >= max_visual_attempts {
-                        // Exhausted all attempts. Accept with appropriate
-                        // logging level based on severity.
-                        if last_score < 0.005 {
-                            tracing::info!(
-                                            "[workflow] Accepting render after {} attempts with score {:.6} (below 0.005 threshold)",
-                                            attempt, last_score
-                                        );
-                        } else if last_score < 0.10 {
-                            tracing::warn!(
-                                            "[workflow] Accepting render after {} attempts with elevated score {:.4}. \
-                                             Minor visual differences may be present.",
-                                            attempt, last_score
-                                        );
-                        } else {
-                            tracing::warn!(
-                                            "[workflow] Accepting render after {} attempts with HIGH visual diff score {:.4}. \
-                                             The output may have visual artifacts - manual review strongly recommended.",
-                                            attempt, last_score
-                                        );
-                        }
-                        break;
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::VisualNotConverged {
+                                last_score,
+                                attempts: attempt,
+                            },
+                        ));
+                        return;
                     }
                     attempt += 1;
                 }
@@ -8191,8 +8355,50 @@ async fn process_job_inner(
                     return;
                 }
 
+                let staged_bytes = match std::fs::read(&output) {
+                    Ok(bytes) if !bytes.is_empty() => bytes,
+                    Ok(_) => {
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(
+                                "verified workflow output is empty".into(),
+                            ),
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = res_tx.send(JobResult::WorkflowFailed(
+                            crate::engine::workflow::WorkflowFailure::Other(format!(
+                                "verified workflow output is unavailable: {error}"
+                            )),
+                        ));
+                        return;
+                    }
+                };
+                let staged_hash = crate::engine::workflow::sha256_hex_of(&staged_bytes);
+                let mut publication = crate::app::commit::FileCommitBarrier::new();
+                if let Err(error) = publication.publish(&output, &requested_output) {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::Other(format!(
+                            "verified workflow output publication failed: {error}"
+                        )),
+                    ));
+                    return;
+                }
+                let published_hash = std::fs::read(&requested_output)
+                    .map(|bytes| crate::engine::workflow::sha256_hex_of(&bytes));
+                if !matches!(published_hash, Ok(ref hash) if *hash == staged_hash) {
+                    let _ = res_tx.send(JobResult::WorkflowFailed(
+                        crate::engine::workflow::WorkflowFailure::Other(
+                            "published workflow output did not match the verified stage; prior output restored"
+                                .into(),
+                        ),
+                    ));
+                    return;
+                }
+                publication.commit();
+
                 let outcome = crate::engine::workflow::WorkflowOutcome {
-                                final_pdf: output.clone(),
+                                final_pdf: requested_output.clone(),
                                 transactions_re_parsed: re_parsed_count,
                                 final_imbalance,
                                 math_valid,
@@ -8201,7 +8407,6 @@ async fn process_job_inner(
                                     "Bank statement confirmed. Visual diff {last_score:.4}, intended-only={last_intended}, math valid={math_valid}."
                                 ),
                             };
-                rollback.commit();
                 let _ = res_tx.send(JobResult::WorkflowStageChanged {
                     stage: crate::engine::workflow::WorkflowStage::Complete(outcome.clone()),
                 });

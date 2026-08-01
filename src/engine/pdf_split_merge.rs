@@ -1,5 +1,6 @@
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Metadata returned for one produced segment.
@@ -108,10 +109,21 @@ fn build_segment_document(
     let catalog_id = out.new_object_id();
 
     // Collect the transitive closure of objects reachable from each page in the
-    // window (the page dict, its /Resources, /Contents, fonts, xobjects, ...).
+    // window (the page dict, its /Resources, /Contents, fonts, xobjects, ...),
+    // plus document metadata that remains valid for every standalone segment.
     let mut needed: BTreeSet<ObjectId> = BTreeSet::new();
     for &page_id in window {
         collect_referenced(doc, page_id, &mut needed);
+    }
+    if let Ok(info) = doc.trailer.get(b"Info") {
+        collect_from_object(doc, info, &mut needed);
+    }
+    if let Ok(catalog) = doc.catalog() {
+        for key in CATALOG_METADATA_KEYS {
+            if let Ok(value) = catalog.get(key) {
+                collect_from_object(doc, value, &mut needed);
+            }
+        }
     }
 
     // Assign a fresh id in `out` for every needed source object.
@@ -162,6 +174,27 @@ fn build_segment_document(
     );
 
     out.trailer.set("Root", catalog_id);
+    if let Ok(info) = doc.trailer.get(b"Info") {
+        let mut mapped = info.clone();
+        remap_references(&mut mapped, &id_map);
+        if !matches!(mapped, Object::Null) {
+            out.trailer.set("Info", mapped);
+        }
+    }
+    if let Ok(source_catalog) = doc.catalog() {
+        let output_catalog = out.get_dictionary_mut(catalog_id).map_err(|error| {
+            SplitMergeError::Structure(format!("new segment catalog is not a dictionary: {error}"))
+        })?;
+        for key in CATALOG_METADATA_KEYS {
+            if let Ok(value) = source_catalog.get(key) {
+                let mut mapped = value.clone();
+                remap_references(&mut mapped, &id_map);
+                if !matches!(mapped, Object::Null) {
+                    output_catalog.set(key, mapped);
+                }
+            }
+        }
+    }
     out.max_id = out.objects.keys().map(|(n, _)| *n).max().unwrap_or(0);
 
     Ok(out)
@@ -252,6 +285,18 @@ fn remap_references(obj: &mut Object, id_map: &BTreeMap<ObjectId, ObjectId>) {
 /// keep these on an intermediate node, but the merge step rebuilds a flat
 /// tree, so each value is materialized directly onto the leaf here.
 const INHERITABLE_ATTRS: [&[u8]; 4] = [b"MediaBox", b"CropBox", b"Rotate", b"Resources"];
+
+/// Document-level catalog entries that are safe and meaningful on every
+/// standalone segment and merged result. Page-targeting actions, outlines, and
+/// destinations are intentionally excluded because their page references must
+/// be rebuilt rather than copied blindly.
+const CATALOG_METADATA_KEYS: [&[u8]; 5] = [
+    b"Metadata",
+    b"Lang",
+    b"ViewerPreferences",
+    b"PageMode",
+    b"PageLayout",
+];
 
 /// Attributes whose presence on every retained leaf is mandatory for faithful
 /// rendering of a standalone segment. `/MediaBox` is required by the spec;
@@ -504,6 +549,11 @@ fn resolve_page_geometry(
 /// in source order. Returns the merged page count so the caller can assert it
 /// against `total_pages`.
 pub fn merge_pdfs(ordered_paths: &[PathBuf], output_path: &Path) -> Result<usize, SplitMergeError> {
+    if ordered_paths.is_empty() {
+        return Err(SplitMergeError::Structure(
+            "merge requires at least one input segment".into(),
+        ));
+    }
     let mut merged_doc = Document::with_version("1.7");
     let mut total_pages = 0usize;
 
@@ -523,6 +573,7 @@ pub fn merge_pdfs(ordered_paths: &[PathBuf], output_path: &Path) -> Result<usize
     merged_doc.trailer.set("Root", catalog_id);
 
     let mut next_object_id = merged_doc.max_id + 1;
+    let mut document_metadata_copied = false;
 
     for path in ordered_paths {
         let mut doc = Document::load(path).map_err(|e| SplitMergeError::Load {
@@ -543,6 +594,28 @@ pub fn merge_pdfs(ordered_paths: &[PathBuf], output_path: &Path) -> Result<usize
             id_map.insert(id, (next_object_id, 0));
             next_object_id += 1;
         }
+
+        let document_metadata = if document_metadata_copied {
+            None
+        } else {
+            let mut info = doc.trailer.get(b"Info").ok().cloned();
+            if let Some(value) = info.as_mut() {
+                renumber_object(value, &id_map);
+            }
+            let mut catalog_entries = Vec::new();
+            if let Ok(catalog) = doc.catalog() {
+                for key in CATALOG_METADATA_KEYS {
+                    if let Ok(value) = catalog.get(key) {
+                        let mut mapped = value.clone();
+                        renumber_object(&mut mapped, &id_map);
+                        if !matches!(mapped, Object::Null) {
+                            catalog_entries.push((key.to_vec(), mapped));
+                        }
+                    }
+                }
+            }
+            Some((info, catalog_entries))
+        };
 
         // Resolve each page's effective `/MediaBox`, `/CropBox`, and `/Rotate`
         // BEFORE `doc.objects` is moved below. The merged document uses a flat
@@ -592,6 +665,21 @@ pub fn merge_pdfs(ordered_paths: &[PathBuf], output_path: &Path) -> Result<usize
             merged_doc.objects.insert(new_id, object);
         }
 
+        if let Some((info, catalog_entries)) = document_metadata {
+            if let Some(info) = info {
+                if !matches!(info, Object::Null) {
+                    merged_doc.trailer.set("Info", info);
+                }
+            }
+            let catalog = merged_doc.get_dictionary_mut(catalog_id).map_err(|error| {
+                SplitMergeError::Structure(format!("merged catalog is not a dictionary: {error}"))
+            })?;
+            for (key, value) in catalog_entries {
+                catalog.set(key, value);
+            }
+            document_metadata_copied = true;
+        }
+
         // Append pages to the flat Pages tree in source order.
         for new_page_id in ordered_new_page_ids {
             // 1) Reparent onto the flat tree and explicitly copy the page's
@@ -636,13 +724,40 @@ pub fn merge_pdfs(ordered_paths: &[PathBuf], output_path: &Path) -> Result<usize
 
     merged_doc.max_id = next_object_id - 1;
 
+    let output_parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(output_parent)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".dcpp-merge-")
+        .suffix(".pdf")
+        .tempfile_in(output_parent)?;
     merged_doc
-        .save(output_path)
-        .map_err(|e| SplitMergeError::Save {
+        .save_to(&mut staged)
+        .map_err(|source| SplitMergeError::Save {
             path: output_path.to_path_buf(),
-            source: lopdf::Error::IO(e),
+            source: lopdf::Error::IO(source),
         })?;
+    staged.flush()?;
+    staged.as_file().sync_all()?;
+    let staged_path = staged.into_temp_path();
+    let staged_path_ref: &Path = staged_path.as_ref();
 
+    let validated = Document::load(staged_path_ref).map_err(|source| SplitMergeError::Load {
+        path: staged_path.to_path_buf(),
+        source,
+    })?;
+    let validated_pages = validated.get_pages().len();
+    if validated_pages != total_pages {
+        return Err(SplitMergeError::Structure(format!(
+            "staged merge page count mismatch: expected {total_pages}, got {validated_pages}"
+        )));
+    }
+
+    staged_path
+        .persist(output_path)
+        .map_err(|error| SplitMergeError::Io(error.error))?;
     Ok(total_pages)
 }
 
