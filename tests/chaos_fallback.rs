@@ -1,5 +1,5 @@
 use dual_core_pdf_pipeline::ai::document_ai::BankStatement;
-use dual_core_pdf_pipeline::app::config::{AppConfig, PdfEngineMode};
+use dual_core_pdf_pipeline::app::config::{AppConfig, ConfigManager, PdfEngineMode};
 use dual_core_pdf_pipeline::pdf::{
     DocumentLayout, EngineCapabilities, EngineError, PdfEngine, PdfEngineSelector, RenderedPage,
     ReplaceOutcome, TextBlock,
@@ -72,7 +72,7 @@ impl PdfEngine for MockFailingEngine {
 async fn test_chaos_fallback_selector_returns_encrypted_error() {
     let mut cfg_val = AppConfig::default();
     cfg_val.engine_mode = PdfEngineMode::PyMuPdfProPrimary;
-    let config = crate::app::config::ConfigManager::new(Arc::new(cfg_val));
+    let config = ConfigManager::new(Arc::new(cfg_val));
 
     let mock_primary = Arc::new(MockFailingEngine);
     let mock_fallback = Arc::new(MockFailingEngine);
