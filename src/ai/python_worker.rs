@@ -686,20 +686,47 @@ mod tests {
         );
     }
 
-    fn ping_request() -> PythonRequestEnvelope {
+    fn write_blank_pdf(path: &Path) {
+        use lopdf::{dictionary, Document, Object};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document.save(path).unwrap();
+    }
+
+    fn request_for(
+        operation: PythonOperation,
+        payload: serde_json::Value,
+    ) -> PythonRequestEnvelope {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        PythonRequestEnvelope::new(
-            PythonOperation::Ping,
-            Uuid::new_v4(),
-            now,
-            now + 30_000,
-            None,
-            json!({}),
-        )
-        .unwrap()
+        PythonRequestEnvelope::new(operation, Uuid::new_v4(), now, now + 30_000, None, payload)
+            .unwrap()
+    }
+
+    fn ping_request() -> PythonRequestEnvelope {
+        request_for(PythonOperation::Ping, json!({}))
     }
 
     #[test]
@@ -859,6 +886,55 @@ mod tests {
         );
         let replacement_pid = supervisor.handshake().unwrap().worker_pid;
         assert_ne!(first_pid, replacement_pid);
+        supervisor.shutdown();
+    }
+
+    #[test]
+    fn hundred_real_pdf_operations_close_handles_and_stay_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf_path = directory.path().join("resource-stress.pdf");
+        write_blank_pdf(&pdf_path);
+        let config = PythonWorkerConfig {
+            max_operations_per_worker: 25,
+            max_rss_growth_bytes: 128 * 1024 * 1024,
+            max_handle_growth: 16,
+            ..PythonWorkerConfig::default()
+        };
+        let mut supervisor = PythonWorkerSupervisor::start(config).unwrap();
+        let first_pid = supervisor.handshake().unwrap().worker_pid;
+        let mut rss_samples = Vec::new();
+        let mut handle_samples = Vec::new();
+
+        for _ in 0..100 {
+            let request = request_for(
+                PythonOperation::GetTextBlocks,
+                json!({"pdf_path": pdf_path, "page_num": 0}),
+            );
+            let operation_id = request.operation_id;
+            let response = supervisor.execute(&request).unwrap();
+            assert_eq!(response.operation_id, operation_id);
+            assert_eq!(
+                response.disposition,
+                crate::ai::python_protocol::PythonDisposition::Succeeded
+            );
+            if let Some(rss) = response.metrics.rss_after_bytes {
+                rss_samples.push(rss);
+            }
+            if let Some(handles) = response.metrics.open_handles_after {
+                handle_samples.push(handles);
+            }
+        }
+
+        assert_ne!(first_pid, supervisor.handshake().unwrap().worker_pid);
+        if let (Some(minimum), Some(maximum)) = (rss_samples.iter().min(), rss_samples.iter().max())
+        {
+            assert!(maximum.saturating_sub(*minimum) < 128 * 1024 * 1024);
+        }
+        if let (Some(minimum), Some(maximum)) =
+            (handle_samples.iter().min(), handle_samples.iter().max())
+        {
+            assert!(maximum.saturating_sub(*minimum) <= 16);
+        }
         supervisor.shutdown();
     }
 
