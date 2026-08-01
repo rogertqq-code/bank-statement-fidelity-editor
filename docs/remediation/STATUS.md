@@ -1,9 +1,9 @@
 # Remediation Program Status
 
-**Repository head audited:** `85e15fca5574068035eccab9e3a700958ee94b92`
-**Working branch:** `remediation/phase-04-python-fortification`
-**Current phase:** Phase 05 / extraction, financial algorithms, OCR, dates, and transfer workflows
-**Current gate:** Gate 04 — `PASS`
+**Repository head audited:** `9e5e8a1ca7ee32b3a8c8ee4bf73c3cbb2958c64f`
+**Working branch:** `remediation/phase-05-extraction-correctness`
+**Current phase:** Phase 06 / exact PDF editing, geometry, fonts, segmentation, and atomic output
+**Current gate:** Gate 05 — `PASS`
 **Release publication:** Frozen
 
 ## Accepted owner decisions
@@ -26,8 +26,8 @@
 | 02 | 02 | Complete | All five P0 failure classes, related exact-success defects, canonical geometry, and mandatory Windows/macOS/Linux P0 regressions passed in CI run `30673473276`. |
 | 03 | 03 | Complete | Unified runtime protocol, authoritative state, routed results, cancellation/deadlines, isolated storage, atomic configuration, truthful capabilities, dispositions, and bounded diagnostics passed in CI run `30698338534`. |
 | 04 | 04 | Complete | Supervised Python 3.12/PyMuPDF protocol, atomic mutation publication, runtime manifest, bundled-runtime discovery, resource bounds, and cross-platform fault regressions passed in CI run `30707260996`. |
-| 05 | 05 | In progress | Extraction completeness, financial invariants, OCR/date corpus behavior, and transfer workflow repair. |
-| 06 | 06 | Planned | Exact PDF editing, fonts, geometry, segmentation, and atomic output. |
+| 05 | 05 | Complete | Canonical ledger, selected-provider routing, exact 30-row offline extraction, fail-closed completeness/math, truthful OCR exclusion, validated dates, provider-free transfer, and bounded batch extraction passed in CI run `30712005667`. |
+| 06 | 06 | In progress | Exact PDF editing, fonts, geometry, segmentation, and atomic output. |
 | 07 | 07 | Planned | Independent fail-closed verification. |
 | 08 | 08 | Planned | Local LLM go/no-go and conditional integration. |
 | 09 | 09 | Planned | Coherent accessible GUI, batch, audit, and recovery UX. |
@@ -38,7 +38,7 @@
 
 ## Completed checkpoint
 
-Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b`; Gate 03 closed the unified runtime at candidate `c84c631`; and Gate 04 closed the permanent supervised Python/PyMuPDF production pipeline at candidate `85e15fc` in CI run `30707260996`. All work remains on remediation branches and the default branch is untouched.
+Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b`; Gate 03 closed the unified runtime at candidate `c84c631`; Gate 04 closed the permanent supervised Python/PyMuPDF production pipeline at candidate `85e15fc`; and Gate 05 closed extraction completeness and financial correctness at candidate `9e5e8a1` in CI run `30712005667`. All work remains on remediation branches and the default branch is untouched.
 
 ## Gate 01 checklist
 
@@ -127,6 +127,26 @@ Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 esta
 | Format, strict production Clippy, optional-Pro smoke | PASS |
 | Gate 04 evidence manifest | PASS — run `30707260996`, candidate `85e15fc` |
 
+## Gate 05 checklist
+
+| Requirement | State |
+|---|---|
+| Exact canonical transaction metadata and legacy compatibility | PASS |
+| Selected-provider routing without unrelated cloud calls | PASS |
+| Original representative two-page statement extracts exactly 30 rows | PASS |
+| Required fields, geometry, stable IDs, confidence, and review status | PASS |
+| Structural and financial incompleteness blocks Editing | PASS |
+| Local OCR removed from supported v1 selector with precise guidance | PASS |
+| Deterministic math before render and after output reparse | PASS |
+| Invalid dates rejected without hardcoded substitution | PASS |
+| Provider-free deterministic transfer with ambiguity/geometry gates | PASS |
+| Bounded recursive batch extraction with one result per file | PASS |
+| Windows base-state and P0 regressions | PASS — jobs `91400984016`, `91403264734` |
+| macOS base-state and P0 regressions | PASS — jobs `91400984011`, `91403264730` |
+| Linux base-state and P0 regressions | PASS — jobs `91400984073`, `91403264733` |
+| Format, strict Clippy, optional-Pro smoke | PASS |
+| Gate 05 evidence manifest | PASS — run `30712005667`, candidate `9e5e8a1` |
+
 ## Open decisions with later blocking phases
 
 | Decision | Default until owner responds | Blocks |
@@ -141,7 +161,7 @@ Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 esta
 
 ## Next executable work
 
-1. Commit and push the evidence-only Gate 04 closure without modifying the default branch.
-2. Start Phase 05 from the verified `85e15fc` candidate while retaining every prior gate.
-3. Establish extraction completeness thresholds and corpus regressions for partial, empty, OCR, rotated, and ambiguous statements.
-4. Repair and verify transfer workflow prerequisites, financial math, date-adjust corpus behavior, and explicit failure semantics end to end.
+1. Commit and push the evidence-only Gate 05 closure without modifying the default branch.
+2. Start Phase 06 from the verified `9e5e8a1` candidate while retaining every prior gate.
+3. Enforce exact requested/matched/placed counts and stable target identity across Python, Pro, and native editors.
+4. Repair CTM/rotation/crop geometry, segmentation membership, font coverage, Pdfium distribution, fidelity fallbacks, and atomic output fault handling.
