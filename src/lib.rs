@@ -21,7 +21,6 @@ pub use engine::font_metrics::ExactFontMetrics;
 pub use engine::verification::{verify_edit, VerificationReport};
 pub use engine::verification_v2::{EnhancedVerificationReport, VisualFidelityEngine};
 
-pub use app::config_v2::EnhancedConfig;
 pub use engine::workflow::{
     WorkflowEvent, WorkflowFailure, WorkflowStage, WorkflowStateKind, WorkflowTransitionError,
 };

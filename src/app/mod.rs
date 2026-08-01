@@ -6,7 +6,6 @@ pub mod capabilities;
 pub mod cli;
 pub mod commit;
 pub mod config;
-pub mod config_v2;
 pub mod env_spec;
 pub mod error;
 pub mod fontcache;
