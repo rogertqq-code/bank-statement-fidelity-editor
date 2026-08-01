@@ -1,9 +1,9 @@
 # Remediation Program Status
 
-**Repository head audited:** `9e5e8a1ca7ee32b3a8c8ee4bf73c3cbb2958c64f`
-**Working branch:** `remediation/phase-05-extraction-correctness`
-**Current phase:** Phase 06 / exact PDF editing, geometry, fonts, segmentation, and atomic output
-**Current gate:** Gate 05 — `PASS`
+**Repository head audited:** `913672163fb5eee329a3b2b63e8ae601958fda63`
+**Working branch:** `remediation/phase-06-pdf-exactness`
+**Current phase:** Phase 07 / independent fail-closed verification
+**Current gate:** Gate 06 — `PASS`
 **Release publication:** Frozen
 
 ## Accepted owner decisions
@@ -27,8 +27,8 @@
 | 03 | 03 | Complete | Unified runtime protocol, authoritative state, routed results, cancellation/deadlines, isolated storage, atomic configuration, truthful capabilities, dispositions, and bounded diagnostics passed in CI run `30698338534`. |
 | 04 | 04 | Complete | Supervised Python 3.12/PyMuPDF protocol, atomic mutation publication, runtime manifest, bundled-runtime discovery, resource bounds, and cross-platform fault regressions passed in CI run `30707260996`. |
 | 05 | 05 | Complete | Canonical ledger, selected-provider routing, exact 30-row offline extraction, fail-closed completeness/math, truthful OCR exclusion, validated dates, provider-free transfer, and bounded batch extraction passed in CI run `30712005667`. |
-| 06 | 06 | In progress | Exact PDF editing, fonts, geometry, segmentation, and atomic output. |
-| 07 | 07 | Planned | Independent fail-closed verification. |
+| 06 | 06 | Complete | Stable exact targets, CTM/CropBox/rotation geometry, fail-closed fonts, pinned Pdfium, transactional segmentation, and atomic output passed in CI run `30720299347`. |
+| 07 | 07 | In progress | Independent fail-closed verification. |
 | 08 | 08 | Planned | Local LLM go/no-go and conditional integration. |
 | 09 | 09 | Planned | Coherent accessible GUI, batch, audit, and recovery UX. |
 | 10 | 10 | Planned | Self-contained Windows/macOS packages. |
@@ -38,7 +38,7 @@
 
 ## Completed checkpoint
 
-Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b`; Gate 03 closed the unified runtime at candidate `c84c631`; Gate 04 closed the permanent supervised Python/PyMuPDF production pipeline at candidate `85e15fc`; and Gate 05 closed extraction completeness and financial correctness at candidate `9e5e8a1` in CI run `30712005667`. All work remains on remediation branches and the default branch is untouched.
+Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b`; Gate 03 closed the unified runtime at candidate `c84c631`; Gate 04 closed the permanent supervised Python/PyMuPDF production pipeline at candidate `85e15fc`; Gate 05 closed extraction completeness and financial correctness at candidate `9e5e8a1`; and Gate 06 closed exact PDF mutation, geometry, font, segmentation, Pdfium, fallback, and publication integrity at candidate `9136721` in CI run `30720299347`. All work remains on remediation branches and the default branch is untouched.
 
 ## Gate 01 checklist
 
@@ -147,6 +147,25 @@ Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 esta
 | Format, strict Clippy, optional-Pro smoke | PASS |
 | Gate 05 evidence manifest | PASS — run `30712005667`, candidate `9e5e8a1` |
 
+## Gate 06 checklist
+
+| Requirement | State |
+|---|---|
+| Stable old-text identity and exact requested/matched/placed counts across single and batch engines | PASS |
+| CTM, text matrix, CropBox, and 0/90/180/270-degree canonical geometry | PASS |
+| Duplicate, ambiguous, stale, and double-selected targets reject before mutation | PASS |
+| Missing glyphs and failed embedded-font registration block publication | PASS |
+| Automatic font synthesis, donor substitution, and undisclosed fallback disabled | PASS |
+| Segment membership, geometry, metadata, page order, interruption, and retry transactionality | PASS |
+| Pinned/checksummed/licensed Pdfium resolver | PASS |
+| Typst and mislabeled alternatives excluded from fidelity finalization | PASS |
+| Same-filesystem staged validation and rollback-capable publication across transformations | PASS |
+| Windows base-state and P0 regressions | PASS — jobs `91422854965`, `91423306041` |
+| macOS base-state and P0 regressions | PASS — jobs `91422854961`, `91423306040` |
+| Linux base-state and P0 regressions | PASS — jobs `91422854975`, `91423306039` |
+| Format, strict Clippy, optional-Pro smoke | PASS |
+| Gate 06 evidence manifest | PASS — run `30720299347`, candidate `9136721` |
+
 ## Open decisions with later blocking phases
 
 | Decision | Default until owner responds | Blocks |
@@ -157,11 +176,11 @@ Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 esta
 | Local OCR distribution | Optional component with explicit model capability | Phase 05/10 |
 | Signing identities/certificates | Build unsigned internal candidates only; no GA | Phase 10/13 |
 | Remote processing service | Excluded from v1 unless separately approved and designed | Phase 09/10 |
-| Typst reconstruction | Separate explicitly non-fidelity export or remove | Phase 06 |
+| Typst reconstruction | Removed from fidelity finalization; legacy operation is disabled and non-mutating | Closed in Phase 06 |
 
 ## Next executable work
 
-1. Commit and push the evidence-only Gate 05 closure without modifying the default branch.
-2. Start Phase 06 from the verified `9e5e8a1` candidate while retaining every prior gate.
-3. Enforce exact requested/matched/placed counts and stable target identity across Python, Pro, and native editors.
-4. Repair CTM/rotation/crop geometry, segmentation membership, font coverage, Pdfium distribution, fidelity fallbacks, and atomic output fault handling.
+1. Commit and push the evidence-only Gate 06 closure without modifying the default branch.
+2. Start Phase 07 from verified candidate `9136721` while retaining every prior gate.
+3. Rebuild the independent structural, pixel, geometry, content, editability, and financial verifier gates.
+4. Calibrate thresholds on authorized unchanged, positive, negative, drift, font, geometry, and partial-application fixtures; fail closed on missing evidence.
