@@ -123,13 +123,7 @@ class WorkerRuntime:
                 disposition="failed",
                 capability_tier=self._capability_tier(request["operation"]),
                 metrics=self._metrics(start_ns, rss_before, handles_before, gc_before),
-                failure={
-                    "code": self._error_code(error),
-                    "class": type(error).__name__,
-                    "message": str(error) or type(error).__name__,
-                    "retryable": self._is_retryable(error),
-                    "context": {},
-                },
+                failure=classify_error(error, request["operation"]),
             )
         return response
 
@@ -310,23 +304,53 @@ class WorkerRuntime:
             else "core"
         )
 
-    @staticmethod
-    def _error_code(error: BaseException) -> str:
-        message = str(error)
-        for code in (
-            "PRO_PAGE_LIMIT_EXCEEDED",
-            "FONT_COVERAGE_INSUFFICIENT",
-            "PDF_NOT_EDITABLE",
-        ):
-            if code in message:
-                return code
-        if isinstance(error, ProtocolError):
-            return error.code
-        return "PYTHON_OPERATION_FAILED"
 
-    @staticmethod
-    def _is_retryable(error: BaseException) -> bool:
-        return isinstance(error, (TimeoutError, InterruptedError))
+def classify_error(error: BaseException, operation: str) -> dict[str, Any]:
+    """Map every Python/backend exception to a stable protocol failure."""
+    message = str(error) or type(error).__name__
+    code = "PYTHON_OPERATION_FAILED"
+    retryable = False
+    for token in (
+        "PRO_PAGE_LIMIT_EXCEEDED",
+        "FONT_COVERAGE_INSUFFICIENT",
+        "PDF_NOT_EDITABLE",
+    ):
+        if token in message:
+            code = token
+            break
+    else:
+        if isinstance(error, ProtocolError):
+            code = error.code
+        elif isinstance(error, FileNotFoundError):
+            code = "INPUT_NOT_FOUND"
+        elif isinstance(error, PermissionError):
+            code = "PERMISSION_DENIED"
+        elif isinstance(error, TimeoutError):
+            code = "PYTHON_TIMEOUT"
+            retryable = True
+        elif isinstance(error, InterruptedError):
+            code = "PYTHON_INTERRUPTED"
+            retryable = True
+        elif isinstance(error, ConnectionError):
+            code = "PYTHON_CONNECTION_ERROR"
+            retryable = True
+        elif isinstance(error, MemoryError):
+            code = "PYTHON_MEMORY_EXHAUSTED"
+        elif isinstance(error, OSError):
+            code = "PYTHON_IO_ERROR"
+        elif isinstance(error, ValueError):
+            code = "PYTHON_INVALID_VALUE"
+        elif isinstance(error, RuntimeError):
+            code = "PYTHON_RUNTIME_ERROR"
+        elif not isinstance(error, Exception):
+            code = "PYTHON_WORKER_ABORTED"
+    return {
+        "code": code,
+        "class": type(error).__name__,
+        "message": message,
+        "retryable": retryable,
+        "context": {"operation": operation},
+    }
 
 
 def _emit(value: Mapping[str, Any]) -> None:

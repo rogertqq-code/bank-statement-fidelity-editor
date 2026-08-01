@@ -8,7 +8,8 @@ import time
 import unittest
 from pathlib import Path
 
-from bridge_protocol import OPERATIONS, PROTOCOL_VERSION, parse_response
+from bridge_protocol import OPERATIONS, PROTOCOL_VERSION, ProtocolError, parse_response
+from worker import classify_error
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "python" / "worker.py"
@@ -113,8 +114,27 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(response["operation"], "render_page_to_png")
         self.assertEqual(response["disposition"], "failed")
         self.assertIsNotNone(response["failure"])
+        self.assertEqual(response["failure"]["code"], "INPUT_NOT_FOUND")
         self.assertEqual(response["failure"]["class"], "FileNotFoundError")
         self.assertNotIn("traceback", response["failure"]["context"])
+
+    def test_exception_taxonomy_is_stable_and_retry_aware(self) -> None:
+        cases = [
+            (FileNotFoundError("missing"), "INPUT_NOT_FOUND", False),
+            (PermissionError("denied"), "PERMISSION_DENIED", False),
+            (TimeoutError("late"), "PYTHON_TIMEOUT", True),
+            (ConnectionError("offline"), "PYTHON_CONNECTION_ERROR", True),
+            (MemoryError("exhausted"), "PYTHON_MEMORY_EXHAUSTED", False),
+            (ValueError("bad"), "PYTHON_INVALID_VALUE", False),
+            (RuntimeError("PDF_NOT_EDITABLE: fixture"), "PDF_NOT_EDITABLE", False),
+            (ProtocolError("BAD_PROTOCOL", "bad"), "BAD_PROTOCOL", False),
+        ]
+        for error, expected_code, retryable in cases:
+            with self.subTest(expected_code=expected_code):
+                failure = classify_error(error, "ping")
+                self.assertEqual(failure["code"], expected_code)
+                self.assertEqual(failure["retryable"], retryable)
+                self.assertEqual(failure["context"], {"operation": "ping"})
 
     def test_eof_shuts_worker_down_cleanly(self) -> None:
         code, _stderr = self.worker.close()
