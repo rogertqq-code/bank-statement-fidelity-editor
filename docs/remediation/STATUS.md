@@ -1,9 +1,9 @@
 # Remediation Program Status
 
 **Repository head audited:** `41993a8daf73266eaae5d6d4abcc2cc13ac85662`
-**Working branch:** `remediation/phase-01-base-state`
-**Current phase:** Phase 01 / executable base state complete
-**Current gate:** Gate 01 — `PASS`
+**Working branch:** `remediation/phase-02-core-integrity`
+**Current phase:** Phase 02 / critical integrity complete
+**Current gate:** Gate 02 — `PASS`
 **Release publication:** Frozen
 
 ## Accepted owner decisions
@@ -23,7 +23,7 @@
 |---:|---:|---|---|
 | 00 | 00 | Complete | Backlog, ADRs, release freeze, evidence governance, and baseline inventory passed and were pushed at `5c3678c`. |
 | 01 | 01 | Complete | Windows, macOS, Linux development, Clippy, format, and optional-Pro jobs passed in CI run `30653780202`. |
-| 02 | 02 | Planned | Five P0 integrity defects and active blockers closed. |
+| 02 | 02 | Complete | All five P0 failure classes, related exact-success defects, canonical geometry, and mandatory Windows/macOS/Linux P0 regressions passed in CI run `30673473276`. |
 | 03 | 03 | Planned | Unified runtime protocol, state, storage, cancellation, and recovery. |
 | 04 | 04 | Planned | Permanent Python/PyMuPDF pipeline bulletproofed. |
 | 05 | 05 | Planned | Extraction and financial invariants verified. |
@@ -38,7 +38,7 @@
 
 ## Completed checkpoint
 
-Gate 00 passed locally, was committed at `5c3678c`, and was pushed to `remediation/phase-00-governance-baseline`. The default branch remains untouched.
+Gate 00 established governance and the release freeze at `5c3678c`; Gate 01 established the executable cross-platform base state; Gate 02 closed the critical integrity failure classes at candidate `500167b` in CI run `30673473276`. All work remains on remediation branches and the default branch is untouched.
 
 ## Gate 01 checklist
 
@@ -62,6 +62,28 @@ Gate 00 passed locally, was committed at `5c3678c`, and was pushed to `remediati
 | macOS Apple Silicon CI | PASS — job `91233067603` |
 | Gate 01 evidence manifest | PASS — run `30653780202`, candidate `7cb54c2` |
 
+## Gate 02 checklist
+
+| Requirement | State |
+|---|---|
+| Strict hash-backed Rust/Python `ApplyReport` | PASS |
+| No-overlap Python edit is non-destructive | PASS |
+| Twenty-edit exact transaction stress | PASS |
+| Preview and renderer edit-set identity | PASS |
+| Unbalanced preview blocks before mutation | PASS |
+| Zero-row extraction/balance rejects success | PASS |
+| Independent content-addressed snapshots | PASS |
+| Snapshot tamper and missing-object rejection | PASS |
+| All-or-nothing output/evidence commit barrier | PASS |
+| Exactly-once terminal result contract | PASS |
+| Per-keystroke PDF writer removed | PASS |
+| Canonical native/PyMuPDF top-left geometry | PASS |
+| Windows P0 regression job | PASS — job `91296489736` |
+| macOS P0 regression job | PASS — job `91296489716` |
+| Linux P0 regression job | PASS — job `91296489755` |
+| Gate 01 base-state, Clippy, and format regressions | PASS |
+| Gate 02 evidence manifest | PASS — run `30673473276`, candidate `500167b` |
+
 ## Open decisions with later blocking phases
 
 | Decision | Default until owner responds | Blocks |
@@ -76,7 +98,7 @@ Gate 00 passed locally, was committed at `5c3678c`, and was pushed to `remediati
 
 ## Next executable work
 
-1. Commit and push the Gate 01 closure evidence.
-2. Create the Phase 02 core-business-logic branch from the verified Phase 01 checkpoint.
-3. Add failing regressions for the five audited P0 destructive/false-success paths before changing production logic.
-4. Repair and verify each P0 ticket sequentially, preserving all Gate 01 regressions.
+1. Commit and push the Gate 02 closure evidence without modifying the default branch.
+2. Create the Phase 03 unified-runtime branch from the verified Gate 02 checkpoint.
+3. Introduce the typed job envelope, job/document correlation, cancellation, deadlines, and exactly-one terminal contract across every runtime job.
+4. Repair result routing, graceful shutdown, capability truth, isolated storage, and standardized dispositions while keeping the full P0 matrix mandatory.
