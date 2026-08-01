@@ -17,6 +17,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
+from verify_runtime_manifest import verify as verify_runtime_manifest
+
 from bridge_protocol import (
     OPERATIONS,
     PROTOCOL_VERSION,
@@ -142,7 +144,9 @@ class WorkerRuntime:
     def __init__(self) -> None:
         self.bridge: Any | None = None
         self.bridge_error_class: str | None = None
+        self.runtime_manifest: dict[str, Any] | None = None
         try:
+            self.runtime_manifest = verify_runtime_manifest("base")
             self.bridge = importlib.import_module("pymupdf_pro_integration")
         except BaseException as error:  # startup must report even loader-level failures
             self.bridge_error_class = type(error).__name__

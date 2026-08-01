@@ -1,0 +1,25 @@
+{
+  "entrypoint": "worker.py",
+  "packages": {
+    "base": {
+      "PyMuPDF": "1.28.0"
+    },
+    "pro": {
+      "PyMuPDF": "1.28.0",
+      "PyMuPDFPro": "1.28.0"
+    }
+  },
+  "protocol_version": "1.0.0",
+  "python": {
+    "major": 3,
+    "minor": 12
+  },
+  "schema_version": 1,
+  "source_files": {
+    "bridge_protocol.py": "70679ba037a12eb5b42b77a1de6333a54c8e90acf8c8e1a4c0889341f63caa4c",
+    "pymupdf_pro_integration.py": "4ff003941707f06fa25adbff27dd4b6ff03849f04914b3f92b5d526ebae302d5",
+    "verify_runtime_manifest.py": "09f3d91d6f7fb035d362922970f7d3f00ad4c9658c0386a6a4453b868c48b45f",
+    "verify_runtime_versions.py": "bbd3c8b67408e50f97086e236b0cf3ac14e87376f93f1f90cd2883561dadfe02",
+    "worker.py": "792baede9c5f45f4ef2c42ec59604402ac752e22ba19d16b28da9d934198cc44"
+  }
+}
