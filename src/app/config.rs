@@ -250,8 +250,12 @@ impl DocumentParserMode {
             Self::LlamaParse => "LlamaParse",
             Self::OfflineHeuristic => "Offline Heuristic",
 
-            Self::LocalOcrs => "Local OCR (ocrs)",
+            Self::LocalOcrs => "Local OCR (not available for PDF workflow)",
         }
+    }
+
+    pub const fn is_v1_selectable(self) -> bool {
+        !matches!(self, Self::LocalOcrs)
     }
 }
 
@@ -910,6 +914,16 @@ mod tests {
     fn detect_adc_path_returns_string_or_none_without_panicking() {
         // Whatever the platform, this must not crash.
         let _ = detect_adc_path();
+    }
+
+    #[test]
+    fn local_ocrs_is_legacy_only_and_not_v1_selectable() -> anyhow::Result<()> {
+        let parsed: DocumentParserMode = serde_json::from_str("\"local_ocrs\"")?;
+        assert_eq!(parsed, DocumentParserMode::LocalOcrs);
+        assert!(!parsed.is_v1_selectable());
+        assert!(DocumentParserMode::OfflineHeuristic.is_v1_selectable());
+        assert!(parsed.label().contains("not available"));
+        Ok(())
     }
 
     #[test]

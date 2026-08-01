@@ -377,6 +377,11 @@ impl AppModals for MyApp {
         use crate::app::capabilities::Capability;
         use crate::app::config::*;
 
+        let legacy_local_ocr = self.settings.document_parser == DocumentParserMode::LocalOcrs;
+        if legacy_local_ocr {
+            self.settings.document_parser = DocumentParserMode::OfflineHeuristic;
+        }
+
         let id = ui.make_persistent_id("backend_prefs_collapsing");
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
             .show_header(ui, |ui| {
@@ -385,6 +390,12 @@ impl AppModals for MyApp {
             .body(|ui| {
                 ui.small("Choose which backend to use for each stage of the workflow.");
                 ui.small("Options marked \u{26d4} require an API key that is not currently configured.");
+                if legacy_local_ocr {
+                    ui.colored_label(
+                        self.settings.theme.palette().warn,
+                        "Local OCR PDF parsing is not part of v1; Offline Heuristic was selected instead.",
+                    );
+                }
                 ui.add_space(6.0);
 
                 let capabilities = self.capability_registry.clone();
@@ -423,13 +434,6 @@ impl AppModals for MyApp {
                                     DocumentParserMode::LlamaParse,
                                     DocumentParserMode::LlamaParse.label(),
                                     capabilities.status(Capability::LlamaParse),
-                                );
-                                capability_selectable_value(
-                                    ui,
-                                    &mut self.settings.document_parser,
-                                    DocumentParserMode::LocalOcrs,
-                                    DocumentParserMode::LocalOcrs.label(),
-                                    capabilities.status(Capability::LocalOcr),
                                 );
                                 ui.selectable_value(
                                     &mut self.settings.document_parser,
@@ -633,9 +637,7 @@ impl AppModals for MyApp {
                             capabilities.status(Capability::LlamaParse),
                         )
                     }
-                    DocumentParserMode::LocalOcrs => {
-                        warn_if_unavailable("Local OCR", capabilities.status(Capability::LocalOcr))
-                    }
+                    DocumentParserMode::LocalOcrs => {}
                     DocumentParserMode::OfflineHeuristic => {}
                 }
 

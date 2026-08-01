@@ -6693,10 +6693,11 @@ async fn process_job_inner(
                                 }
                             }
                         }
-                        _ => {
+                        DocumentParserMode::LocalOcrs => {
                             let _ = res_tx.send(JobResult::WorkflowFailed(
                                 crate::engine::workflow::WorkflowFailure::ParseFailed(
-                                    "Unsupported parser mode".into(),
+                                    "Local OCR PDF parsing is not supported in v1. Use Offline Heuristic for text-layer PDFs; scanned-PDF OCR remains disabled until its model and page-geometry contract is qualified."
+                                        .into(),
                                 ),
                             ));
                             return;
