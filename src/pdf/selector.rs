@@ -45,7 +45,7 @@ fn file_revision(path: &Path) -> u64 {
 pub struct PdfEngineSelector {
     primary: Arc<dyn PdfEngine>,
     fallback: Arc<dyn PdfEngine>,
-    config: Arc<std::sync::Mutex<Arc<crate::app::config::AppConfig>>>,
+    config: crate::app::config::ConfigManager,
     caches: Arc<EngineCaches>,
 }
 
@@ -59,7 +59,7 @@ impl PdfEngineSelector {
     pub fn new(
         primary: Arc<dyn PdfEngine>,
         fallback: Arc<dyn PdfEngine>,
-        config: Arc<std::sync::Mutex<Arc<crate::app::config::AppConfig>>>,
+        config: crate::app::config::ConfigManager,
     ) -> Self {
         Self {
             primary,
@@ -69,14 +69,9 @@ impl PdfEngineSelector {
         }
     }
 
-    /// The engine mode currently configured, defaulting to `Auto`
-    /// when the config lock is momentarily contended.
+    /// Return the engine mode from one immutable configuration generation.
     fn current_mode(&self) -> crate::app::config::PdfEngineMode {
-        if let Ok(guard) = self.config.try_lock() {
-            guard.engine_mode
-        } else {
-            crate::app::config::PdfEngineMode::PyMuPdfProPrimary
-        }
+        self.config.snapshot().config().engine_mode
     }
 
     /// Sequential primary->fallback execution. Used for write operations
@@ -479,7 +474,7 @@ mod tests {
         PdfEngineSelector::new(
             primary,
             fallback,
-            Arc::new(std::sync::Mutex::new(Arc::new(cfg))),
+            crate::app::config::ConfigManager::new(Arc::new(cfg)),
         )
     }
 

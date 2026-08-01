@@ -717,6 +717,8 @@ pub enum JobResult {
     /// Emitted after a [`Job::ReloadConfig`]: reports whether the reloaded
     /// config has working AI credentials so the GUI can update its status line.
     ConfigReloaded {
+        generation: u64,
+        config: std::sync::Arc<crate::app::config::AppConfig>,
         document_ai_configured: bool,
         gemini_configured: bool,
         pro_editing_available: bool,
@@ -1065,7 +1067,7 @@ impl Runtime {
         let audit_log = Arc::new(Mutex::new(audit_log));
         let runtime_audit_log = audit_log.clone();
         let history = Arc::new(Mutex::new(ChangeHistory::new()));
-        let config_holder = Arc::new(Mutex::new(config));
+        let config_holder = crate::app::config::ConfigManager::new(config);
 
         let primary_engine = Arc::new(crate::pdf::PyMuPdfEngine::new(legacy_job_tx));
         let fallback_engine = Arc::new(crate::pdf::OxidizePdfEngine::new());
@@ -1307,13 +1309,7 @@ impl Runtime {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
-                let cfg = {
-                    if let Ok(g) = api_poll_config.lock() {
-                        g.clone()
-                    } else {
-                        Arc::new(crate::app::config::AppConfig::default())
-                    }
-                };
+                let cfg = api_poll_config.snapshot().config();
                 let report = crate::app::api_verification::verify_all_api_keys(&cfg, false).await;
                 if api_poll_tx
                     .send(JobResult::ApiKeysVerified(report))
@@ -1373,10 +1369,7 @@ impl Runtime {
                     spawn_job_lifecycle_monitor(result_sink.clone(), token);
                 }
                 let wdog = watchdog_clone.clone();
-                let config_for_tokio: Arc<crate::app::config::AppConfig> = config_holder
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_else(|p| p.into_inner().clone());
+                let config_for_tokio = config_holder.snapshot().config();
                 process_job_inner(
                     job,
                     python_tx_clone.clone(),
@@ -1429,10 +1422,7 @@ impl Runtime {
                     spawn_job_lifecycle_monitor(result_sink.clone(), token);
                 }
                 let wdog = fast_watchdog_clone.clone();
-                let config_for_tokio: Arc<crate::app::config::AppConfig> = fast_config_holder
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_else(|p| p.into_inner().clone());
+                let config_for_tokio = fast_config_holder.snapshot().config();
                 process_job_inner(
                     job,
                     fast_python_tx_clone.clone(),
@@ -1601,7 +1591,7 @@ async fn process_job_inner(
     parse_cache: std::sync::Arc<
         tokio::sync::Mutex<lru::LruCache<String, crate::ai::document_ai::BankStatement>>,
     >,
-    config_holder: std::sync::Arc<std::sync::Mutex<std::sync::Arc<crate::app::config::AppConfig>>>,
+    config_holder: crate::app::config::ConfigManager,
 ) {
     match job {
         Job::Ping => {
@@ -5466,18 +5456,15 @@ async fn process_job_inner(
         }
         Job::ReloadConfig => {
             let res_tx = result_tx_clone.clone();
-            match crate::app::config::AppConfig::from_env() {
-                Ok(new_cfg) => {
-                    let document_ai_configured = new_cfg.document_ai.is_some();
-                    let gemini_configured = new_cfg.gemini_api_key.is_some();
-                    let pro_editing_available = new_cfg.pro_editing_available();
-                    if let Ok(mut g) = config_holder.lock() {
-                        *g = Arc::new(new_cfg);
-                    }
+            match config_holder.reload_from_env() {
+                Ok(snapshot) => {
+                    let new_cfg = snapshot.config();
                     let _ = res_tx.send(JobResult::ConfigReloaded {
-                        document_ai_configured,
-                        gemini_configured,
-                        pro_editing_available,
+                        generation: snapshot.generation(),
+                        config: new_cfg.clone(),
+                        document_ai_configured: new_cfg.document_ai.is_some(),
+                        gemini_configured: new_cfg.gemini_api_key.is_some(),
+                        pro_editing_available: new_cfg.pro_editing_available(),
                     });
                 }
                 Err(e) => {
@@ -5490,13 +5477,7 @@ async fn process_job_inner(
         }
         Job::ValidateCredentials => {
             let res_tx = result_tx_clone.clone();
-            let cfg = {
-                if let Ok(g) = config_holder.lock() {
-                    g.clone()
-                } else {
-                    Arc::new(crate::app::config::AppConfig::default())
-                }
-            };
+            let cfg = config_holder.snapshot().config();
 
             tokio::spawn(async move {
                 let _ = res_tx.send(JobResult::Progress {

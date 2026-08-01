@@ -1700,6 +1700,8 @@ impl MyApp {
                 self.request_render("after");
             }
             JobResult::ConfigReloaded {
+                generation,
+                config,
                 document_ai_configured,
                 gemini_configured,
                 pro_editing_available,
@@ -1723,25 +1725,15 @@ impl MyApp {
                     if pro_editing_available { "✓" } else { "✗" }
                 ));
                 let summary = parts.join(" Â· ");
-                self.status = format!("Credentials reloaded: {summary}");
-                // Refresh API availability from the newly-reloaded config
-                // so the UI immediately reflects which backends are usable.
-                if let Ok(new_cfg) = crate::app::config::AppConfig::from_env() {
-                    let fresh_avail = new_cfg.detect_availability();
-                    fresh_avail.log_summary();
-                    self.api_availability = fresh_avail;
-                    self.capability_registry = crate::app::capabilities::CapabilityRegistry::probe(
-                        &new_cfg,
-                        &self.app_paths,
-                    );
-                    self.config = std::sync::Arc::new(new_cfg);
-                } else {
-                    let fresh_avail = crate::app::config::AppConfig::from_env()
-                        .map(|c| c.detect_availability())
-                        .unwrap_or_default();
-                    fresh_avail.log_summary();
-                    self.api_availability = fresh_avail;
-                }
+                self.status = format!("Configuration generation {generation} applied: {summary}");
+                // Refresh every GUI consumer from the exact immutable runtime
+                // generation instead of independently re-reading process state.
+                let fresh_avail = config.detect_availability();
+                fresh_avail.log_summary();
+                self.api_availability = fresh_avail;
+                self.capability_registry =
+                    crate::app::capabilities::CapabilityRegistry::probe(&config, &self.app_paths);
+                self.config = config;
                 self.toast(
                     if document_ai_configured && gemini_configured {
                         ToastKind::Success

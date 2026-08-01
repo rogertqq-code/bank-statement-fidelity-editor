@@ -1,6 +1,6 @@
 use std::env;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
@@ -403,6 +403,62 @@ impl Default for AppConfig {
             transfer_consensus_mode: true,
             auto_match_dpi: true, // Force high fidelity font replication default
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfigSnapshot {
+    generation: u64,
+    config: Arc<AppConfig>,
+}
+
+impl ConfigSnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn config(&self) -> Arc<AppConfig> {
+        self.config.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfigManager {
+    current: Arc<RwLock<ConfigSnapshot>>,
+}
+
+impl ConfigManager {
+    pub fn new(config: Arc<AppConfig>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(ConfigSnapshot {
+                generation: 0,
+                config,
+            })),
+        }
+    }
+
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        self.current
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    pub fn replace(&self, config: AppConfig) -> ConfigSnapshot {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = ConfigSnapshot {
+            generation: current.generation.saturating_add(1),
+            config: Arc::new(config),
+        };
+        *current = next.clone();
+        next
+    }
+
+    pub fn reload_from_env(&self) -> ConfigResult<ConfigSnapshot> {
+        AppConfig::from_env().map(|config| self.replace(config))
     }
 }
 
