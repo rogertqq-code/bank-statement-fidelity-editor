@@ -1047,6 +1047,7 @@ impl AppModals for MyApp {
     fn draw_workflow_hitl_modal(&mut self, ctx: &egui::Context) {
         let mut keep_open = self.active_modal == ActiveModal::WorkflowHitl;
         let mut resolved = false;
+        let workflow_stage = self.workflow_stage.clone();
 
         egui::Window::new("⚠️ Workflow Human-in-the-Loop Required")
             .open(&mut keep_open)
@@ -1056,7 +1057,7 @@ impl AppModals for MyApp {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
 
-                match &self.workflow_stage {
+                match &workflow_stage {
                     crate::engine::workflow::WorkflowStage::FontCoverageWarning { missing_chars } => {
                         ui.heading("Font Coverage Warning");
                         ui.label("The requested font does not cover all characters in your edits.");
@@ -1064,7 +1065,7 @@ impl AppModals for MyApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel Workflow").clicked() {
-                                let _ = self.job_tx.send(Job::Cancel { id: 0 });
+                                self.cancel_active_workflow();
                                 resolved = true;
                             }
                             if ui.button("Proceed with Generic Font (Helvetica)").clicked() {
@@ -1080,7 +1081,7 @@ impl AppModals for MyApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
-                                let _ = self.job_tx.send(Job::Cancel { id: 0 });
+                                self.cancel_active_workflow();
                                 resolved = true;
                             }
                             if ui.button("Accept Overlap & Proceed").clicked() {
@@ -1155,7 +1156,7 @@ impl AppModals for MyApp {
 
                         ui.add_space(8.0);
                         if ui.button("Cancel & Discard").clicked() {
-                            let _ = self.job_tx.send(Job::Cancel { id: 0 });
+                            self.cancel_active_workflow();
                             resolved = true;
                         }
                     }
@@ -1169,7 +1170,7 @@ impl AppModals for MyApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel").clicked() {
-                                let _ = self.job_tx.send(Job::Cancel { id: 0 });
+                                self.cancel_active_workflow();
                                 resolved = true;
                             }
                             if ui.button("Accept Proposed Corrections").clicked() {
@@ -1184,7 +1185,7 @@ impl AppModals for MyApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("Cancel Workflow").clicked() {
-                                let _ = self.job_tx.send(Job::Cancel { id: 0 });
+                                self.cancel_active_workflow();
                                 resolved = true;
                             }
                             if ui.button("Proceed Offline").clicked() {

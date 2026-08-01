@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::app::modals::AppModals;
-use crate::app::runtime::{Job, JobResult, PythonJob, PythonJobResult, RuntimeClient};
+use crate::app::runtime::{
+    Job, JobId, JobResult, PythonJob, PythonJobResult, RuntimeClient, RuntimeSubmitError,
+};
 use crate::engine::history::ChangeHistory;
 use crate::engine::verification::VerificationReport;
 use egui_plot::PlotPoints;
@@ -260,6 +262,7 @@ pub struct MyApp {
     pub proposed_changes: Vec<(crate::engine::model::ProposedChange, bool)>,
     pub last_imbalance: Option<rust_decimal::Decimal>,
     pub in_flight: usize,
+    pub active_workflow_job_id: Option<JobId>,
     pub settings: AppSettings,
     toasts: VecDeque<Toast>,
 
@@ -453,6 +456,7 @@ impl MyApp {
             proposed_changes: Vec::new(),
             last_imbalance: None,
             in_flight: 0,
+            active_workflow_job_id: None,
             toasts: VecDeque::new(),
             job_tx,
             job_rx,
@@ -729,6 +733,29 @@ impl MyApp {
         });
         while self.toasts.len() > 5 {
             self.toasts.pop_front();
+        }
+    }
+
+    fn dispatch_workflow_job(&mut self, job: Job) -> Result<JobId, RuntimeSubmitError> {
+        let job_id = self.job_tx.send(job)?;
+        self.active_workflow_job_id = Some(job_id);
+        Ok(job_id)
+    }
+
+    pub(crate) fn cancel_active_workflow(&mut self) {
+        let Some(job_id) = self.active_workflow_job_id else {
+            self.toast(ToastKind::Warn, "No active workflow to cancel");
+            return;
+        };
+        match self.job_tx.send(Job::Cancel { id: job_id }) {
+            Ok(_) => {
+                self.status = format!("Cancelling workflow job #{job_id}...");
+                self.toast(ToastKind::Info, format!("Cancelling job #{job_id}"));
+            }
+            Err(error) => {
+                tracing::error!("Runtime disconnected while cancelling job #{job_id}: {error}");
+                self.toast(ToastKind::Error, "Could not send cancellation request");
+            }
         }
     }
 
@@ -1097,7 +1124,7 @@ impl MyApp {
         let want_confirm =
             ctx.input(|i| i.modifiers.command_only() && i.key_pressed(egui::Key::Num3));
         if want_parse && !self.input_path.is_empty() {
-            if let Err(e) = self.job_tx.send(Job::WorkflowParseAndValidate {
+            if let Err(e) = self.dispatch_workflow_job(Job::WorkflowParseAndValidate {
                 input: PathBuf::from(&self.input_path),
                 version: Some(self.selected_parser_version.clone()),
                 parser_mode: self.settings.document_parser,
@@ -1117,7 +1144,7 @@ impl MyApp {
         }
         if want_preview {
             if let Some(v) = &self.workflow_validation {
-                if let Err(e) = self.job_tx.send(Job::WorkflowPreview {
+                if let Err(e) = self.dispatch_workflow_job(Job::WorkflowPreview {
                     original_transactions: self.workflow_transactions.clone(),
                     edits: self.workflow_edits.clone(),
                     opening_balance: v.opening_balance,
@@ -1148,7 +1175,7 @@ impl MyApp {
                         &self.workflow_edits,
                         &preview,
                     );
-                    match self.job_tx.send(Job::WorkflowConfirmAndRender {
+                    match self.dispatch_workflow_job(Job::WorkflowConfirmAndRender {
                         input: PathBuf::from(&self.input_path),
                         output: PathBuf::from(&self.output_path),
                         edits: kept,
@@ -1500,7 +1527,7 @@ impl MyApp {
                 self.workflow_outcome = None;
                 self.font_cascade_reports.clear();
                 self.workflow_dirty = true;
-                if let Err(e) = self.job_tx.send(Job::WorkflowParseAndValidate {
+                if let Err(e) = self.dispatch_workflow_job(Job::WorkflowParseAndValidate {
                     input: PathBuf::from(&self.input_path),
                     version: Some(self.selected_parser_version.clone()),
                     parser_mode: self.settings.document_parser,
@@ -1731,6 +1758,15 @@ impl MyApp {
             }
             JobResult::Error { job_label, message } => {
                 self.progress = None;
+                if matches!(
+                    job_label.as_str(),
+                    "workflow_parse_and_validate"
+                        | "workflow_preview"
+                        | "workflow_confirm_and_render"
+                        | "ai_fix_visual_fidelity"
+                ) {
+                    self.active_workflow_job_id = None;
+                }
                 // Autofix interception for ALL errors
                 let err = crate::app::error::AppError::parse_msg(&message)
                     .unwrap_or_else(|| crate::app::error::AppError::Unknown(message.clone()));
@@ -1791,11 +1827,17 @@ impl MyApp {
             }
             JobResult::Cancelled { id } => {
                 self.progress = None;
+                if self.active_workflow_job_id == Some(id) {
+                    self.active_workflow_job_id = None;
+                }
                 self.toast(ToastKind::Info, format!("Cancelled job #{id}"));
                 self.status = format!("Cancelled job #{id}");
             }
             JobResult::TimedOut { id, job_label } => {
                 self.progress = None;
+                if self.active_workflow_job_id == Some(id) {
+                    self.active_workflow_job_id = None;
+                }
                 self.toast(
                     ToastKind::Error,
                     format!("{job_label} timed out (job #{id})"),
@@ -1884,6 +1926,7 @@ impl MyApp {
             }
             JobResult::WorkflowComplete(outcome) => {
                 self.progress = None;
+                self.active_workflow_job_id = None;
                 self.toast(ToastKind::Success, outcome.completion_summary.clone());
                 self.workflow_outcome = Some(outcome);
                 // Stage 6: workflow finished cleanly - clear the in-flight
@@ -1897,6 +1940,7 @@ impl MyApp {
             }
             JobResult::WorkflowFailed(failure) => {
                 self.progress = None;
+                self.active_workflow_job_id = None;
                 let msg = match &failure {
                     crate::engine::workflow::WorkflowFailure::ParseFailed(s) => {
                         format!("Parse failed: {s}")
@@ -3662,7 +3706,7 @@ impl MyApp {
                         ui.selectable_value(&mut self.selected_parser_version, "pretrained-bankstatement-v1.1-2021-08-13".to_string(), "v1.1");
                     });
                 if ui.button("🔄 Parse").on_hover_text("Re-parse document with selected parser version").clicked() && !self.input_path.is_empty() {
-                    if let Err(e) = self.job_tx.send(Job::WorkflowParseAndValidate {
+                    if let Err(e) = self.dispatch_workflow_job(Job::WorkflowParseAndValidate {
                         input: PathBuf::from(&self.input_path),
                         version: Some(self.selected_parser_version.clone()),
                         parser_mode: self.settings.document_parser,
@@ -3742,7 +3786,7 @@ impl MyApp {
                 .clicked()
             {
                 if let Some(v) = &self.workflow_validation {
-                    if let Err(e) = self.job_tx.send(Job::WorkflowPreview {
+                    if let Err(e) = self.dispatch_workflow_job(Job::WorkflowPreview {
                         original_transactions: self.workflow_transactions.clone(),
                         edits: self.workflow_edits.clone(),
                         opening_balance: v.opening_balance,
@@ -3972,7 +4016,7 @@ impl MyApp {
                 "Applying with Quick (Native) fidelity..."
             },
         );
-        if let Err(e) = self.job_tx.send(Job::WorkflowConfirmAndRender {
+        if let Err(e) = self.dispatch_workflow_job(Job::WorkflowConfirmAndRender {
             input: PathBuf::from(&self.input_path),
             output: PathBuf::from(&self.output_path),
             edits: edits_to_apply,
@@ -4478,7 +4522,7 @@ impl MyApp {
                                                     new_text: self.new_text.clone(),
                                                     field: crate::engine::workflow::EditField::Description,
                                                 };
-                                                if let Err(e) = self.job_tx.send(Job::WorkflowConfirmAndRender {
+                                                if let Err(e) = self.dispatch_workflow_job(Job::WorkflowConfirmAndRender {
                                                     input,
                                                     output: std::path::PathBuf::from(&self.output_path),
                                                     edits: vec![edit],
@@ -4501,7 +4545,7 @@ impl MyApp {
 
                                         if ui.add(egui::Button::new(egui::RichText::new("✨ AI Fix Layout").color(p.text)).fill(p.panel).rounding(8.0).min_size(egui::vec2(140.0, 36.0))).on_hover_text("Use Gemini to fix discrepancies on this page").clicked() {
                                             let input = if self.current_pdf_path.exists() { self.current_pdf_path.clone() } else { std::path::PathBuf::from(&self.input_path) };
-                                            if let Err(e) = self.job_tx.send(Job::AiFixVisualFidelity { input, page: self.current_page }) { tracing::error!("Runtime disconnected: {}", e); }
+                                            if let Err(e) = self.dispatch_workflow_job(Job::AiFixVisualFidelity { input, page: self.current_page }) { tracing::error!("Runtime disconnected: {}", e); }
                                             self.toast(ToastKind::Info, "Requesting AI Layout Fix...");
                                             self.in_flight += 1;
                                         }
