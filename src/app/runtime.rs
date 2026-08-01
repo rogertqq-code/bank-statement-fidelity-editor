@@ -11,6 +11,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Opaque per-job handle. The runtime returns one when a job is enqueued;
@@ -929,6 +930,15 @@ impl ResultSink {
         use std::sync::atomic::Ordering;
 
         let terminal = result.is_terminal();
+        tracing::debug!(
+            job_id = self.metadata.job_id,
+            correlation_id = %self.metadata.correlation_id,
+            document_id = self.metadata.document_id.as_deref().unwrap_or("none"),
+            job_label = self.metadata.label,
+            terminal,
+            disposition = ?result.disposition(),
+            "runtime result emitted"
+        );
         if self.terminal_sent.load(Ordering::Acquire) {
             tracing::warn!(
                 job_id = self.metadata.job_id,
@@ -951,6 +961,14 @@ impl ResultSink {
             self.broadcast.send(result)
         };
         if terminal {
+            tracing::info!(
+                job_id = self.metadata.job_id,
+                correlation_id = %self.metadata.correlation_id,
+                document_id = self.metadata.document_id.as_deref().unwrap_or("none"),
+                job_label = self.metadata.label,
+                disposition = ?result.disposition(),
+                "runtime job terminated"
+            );
             self.cancellations.complete(self.metadata.job_id);
             self.completion.notify_waiters();
         }
@@ -1450,6 +1468,15 @@ impl Runtime {
                     job,
                     route,
                 } = envelope;
+                let job_span = tracing::info_span!(
+                    "runtime_job",
+                    job_id = metadata.job_id,
+                    correlation_id = %metadata.correlation_id,
+                    document_id = metadata.document_id.as_deref().unwrap_or("none"),
+                    job_label = metadata.label,
+                    execution_mode = ?metadata.execution_mode,
+                    queue = "slow",
+                );
                 let cancellation_token = if !matches!(&job, Job::Cancel { .. }) {
                     Some(cancellations_for_loop.register(metadata.job_id))
                 } else {
@@ -1483,6 +1510,7 @@ impl Runtime {
                     parse_cache.clone(),
                     config_holder.clone(),
                 )
+                .instrument(job_span)
                 .await;
             }
         });
@@ -1503,6 +1531,15 @@ impl Runtime {
                     job,
                     route,
                 } = envelope;
+                let job_span = tracing::info_span!(
+                    "runtime_job",
+                    job_id = metadata.job_id,
+                    correlation_id = %metadata.correlation_id,
+                    document_id = metadata.document_id.as_deref().unwrap_or("none"),
+                    job_label = metadata.label,
+                    execution_mode = ?metadata.execution_mode,
+                    queue = "fast",
+                );
                 let cancellation_token = if !matches!(&job, Job::Cancel { .. }) {
                     Some(fast_cancellations_for_loop.register(metadata.job_id))
                 } else {
@@ -1536,6 +1573,7 @@ impl Runtime {
                     parse_cache.clone(),
                     fast_config_holder.clone(),
                 )
+                .instrument(job_span)
                 .await;
             }
         });
@@ -1721,24 +1759,22 @@ async fn process_job_inner(
                     "content": format!("**New Bug Report**\n\n```\n{}\n```", description)
                 });
 
-                // In a real implementation we would attach the actual files using reqwest multipart.
-                // For this beta, we'll just read the tail of the logs if requested and append to content.
+                // Include only a bounded, re-scrubbed tail from the newest managed
+                // rolling log. Full logs, statement content, and credentials are never
+                // attached automatically.
                 if include_logs {
-                    if let Ok(app_log) = tokio::fs::read_to_string(log_dir.join("app.log")).await {
-                        let tail = app_log
-                            .lines()
-                            .rev()
-                            .take(50)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        payload["content"] = serde_json::Value::String(format!(
-                            "{}\n\n**App Log (Tail)**\n```\n{}\n```",
-                            payload["content"].as_str().unwrap(),
-                            tail
-                        ));
+                    match crate::app::telemetry::support_log_tail(&log_dir, 50, 64 * 1024) {
+                        Ok(tail) if !tail.is_empty() => {
+                            payload["content"] = serde_json::Value::String(format!(
+                                "{}\n\n**Scrubbed App Log (Tail)**\n```\n{}\n```",
+                                payload["content"].as_str().unwrap_or_default(),
+                                tail
+                            ));
+                        }
+                        Ok(_) => tracing::info!("No managed log tail was available for the bug report"),
+                        Err(error) => tracing::warn!(
+                            "Could not prepare the bounded support log tail: {error}"
+                        ),
                     }
                 }
 

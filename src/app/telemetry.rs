@@ -1,10 +1,12 @@
 use crate::app::config::AppConfig;
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::WithExportConfig;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
+use std::time::{Duration, SystemTime};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub struct ScrubbingWriter<W> {
@@ -12,7 +14,7 @@ pub struct ScrubbingWriter<W> {
 }
 
 impl<W: Write> ScrubbingWriter<W> {
-    fn scrub(text: &str) -> String {
+    pub(crate) fn scrub(text: &str) -> String {
         static RE_EMAIL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static RE_KEYS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         static RE_MAC_PATH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -78,6 +80,82 @@ impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for ScrubbingMakeWriter<M> {
     }
 }
 
+const MANAGED_LOG_PREFIXES: [&str; 2] = ["app.log", "error.log"];
+const DEFAULT_LOG_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const DEFAULT_MAX_FILES_PER_STREAM: usize = 28;
+
+fn managed_log_files(log_dir: &Path, prefix: &str) -> std::io::Result<Vec<(PathBuf, SystemTime)>> {
+    let mut files = Vec::new();
+    if !log_dir.exists() {
+        return Ok(files);
+    }
+    for entry in std::fs::read_dir(log_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        files.push((entry.path(), modified));
+    }
+    files.sort_by(|left, right| right.1.cmp(&left.1));
+    Ok(files)
+}
+
+pub fn enforce_log_retention(
+    log_dir: &Path,
+    max_age: Duration,
+    max_files_per_stream: usize,
+) -> std::io::Result<usize> {
+    std::fs::create_dir_all(log_dir)?;
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for prefix in MANAGED_LOG_PREFIXES {
+        for (index, (path, modified)) in managed_log_files(log_dir, prefix)?.into_iter().enumerate() {
+            let expired = now.duration_since(modified).unwrap_or_default() > max_age;
+            if expired || index >= max_files_per_stream {
+                std::fs::remove_file(path)?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+pub fn support_log_tail(
+    log_dir: &Path,
+    max_lines: usize,
+    max_bytes: usize,
+) -> std::io::Result<String> {
+    let Some((path, _)) = managed_log_files(log_dir, "app.log")?.into_iter().next() else {
+        return Ok(String::new());
+    };
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let tail = text
+        .lines()
+        .rev()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ScrubbingWriter::<std::io::Sink>::scrub(&tail))
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 pub struct TelemetryGuard {
@@ -124,6 +202,16 @@ pub fn init(cfg: &AppConfig) -> TelemetryGuard {
             cfg.log_dir.display(),
             e
         );
+    } else if let Err(error) = enforce_log_retention(
+        &cfg.log_dir,
+        DEFAULT_LOG_RETENTION,
+        DEFAULT_MAX_FILES_PER_STREAM,
+    ) {
+        eprintln!(
+            "⚠️ Could not enforce log retention in '{}': {}.",
+            cfg.log_dir.display(),
+            error
+        );
     }
     install_panic_hook();
 
@@ -143,7 +231,7 @@ pub fn init(cfg: &AppConfig) -> TelemetryGuard {
         .with_thread_ids(true)
         .with_thread_names(true);
 
-    let error_appender = tracing_appender::rolling::never("audit", "error_report.log");
+    let error_appender = tracing_appender::rolling::daily(&cfg.log_dir, "error.log");
     let error_layer = tracing_subscriber::fmt::layer()
         .with_writer(ScrubbingMakeWriter::new(error_appender))
         .with_ansi(false)
@@ -223,7 +311,6 @@ pub fn init(cfg: &AppConfig) -> TelemetryGuard {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "otel")]
     use super::*;
     #[cfg(feature = "otel")]
     use std::path::PathBuf;
@@ -257,5 +344,47 @@ mod tests {
         assert!(!output.contains("user@example.com"));
         assert!(!output.contains("1234567890abcdef123"));
         assert!(!output.contains("/Users/test_user/file.txt"));
+    }
+
+    #[test]
+    fn retention_bounds_each_managed_log_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        for prefix in MANAGED_LOG_PREFIXES {
+            for index in 0..5 {
+                std::fs::write(
+                    temp.path().join(format!("{prefix}.{index}")),
+                    format!("entry {index}"),
+                )
+                .unwrap();
+            }
+        }
+        std::fs::write(temp.path().join("unmanaged.txt"), "keep").unwrap();
+
+        let removed = enforce_log_retention(temp.path(), Duration::from_secs(24 * 60 * 60), 2)
+            .unwrap();
+        assert_eq!(removed, 6);
+        for prefix in MANAGED_LOG_PREFIXES {
+            assert_eq!(managed_log_files(temp.path(), prefix).unwrap().len(), 2);
+        }
+        assert!(temp.path().join("unmanaged.txt").exists());
+    }
+
+    #[test]
+    fn support_tail_is_bounded_and_rescrubbed() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("app.log.2026-08-01"),
+            "first\nuser@example.com API_KEY=1234567890abcdef123 /Users/private/file.pdf\nlast\n",
+        )
+        .unwrap();
+
+        let tail = support_log_tail(temp.path(), 2, 4096).unwrap();
+        assert!(tail.contains("last"));
+        assert!(tail.contains("***@***.***"));
+        assert!(tail.contains("API_KEY=***"));
+        assert!(!tail.contains("user@example.com"));
+        assert!(!tail.contains("1234567890abcdef123"));
+        assert!(!tail.contains("/Users/private"));
+        assert!(!tail.contains("first"));
     }
 }
