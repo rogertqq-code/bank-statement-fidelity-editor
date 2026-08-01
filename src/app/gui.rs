@@ -1790,8 +1790,17 @@ impl MyApp {
                 self.font_cascade_reports.push(report);
             }
             JobResult::Cancelled { id } => {
+                self.progress = None;
                 self.toast(ToastKind::Info, format!("Cancelled job #{id}"));
                 self.status = format!("Cancelled job #{id}");
+            }
+            JobResult::TimedOut { id, job_label } => {
+                self.progress = None;
+                self.toast(
+                    ToastKind::Error,
+                    format!("{job_label} timed out (job #{id})"),
+                );
+                self.status = format!("Timed out: {job_label}");
             }
 
             // ---- Multi-stage workflow ----------------------------------

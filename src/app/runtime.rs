@@ -697,6 +697,10 @@ pub enum JobResult {
     Cancelled {
         id: JobId,
     },
+    TimedOut {
+        id: JobId,
+        job_label: String,
+    },
     ReconstructComplete {
         output_path: std::path::PathBuf,
     },
@@ -758,6 +762,7 @@ impl JobResult {
             self,
             Self::Error { .. }
                 | Self::Cancelled { .. }
+                | Self::TimedOut { .. }
                 | Self::WorkflowComplete(_)
                 | Self::WorkflowFailed(_)
                 | Self::JobCompleted(_)
@@ -771,6 +776,8 @@ struct ResultSink {
     metadata: JobMetadata,
     route: Option<mpsc::Sender<JobResult>>,
     cancellations: CancellationRegistry,
+    terminal_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    completion: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl ResultSink {
@@ -785,12 +792,32 @@ impl ResultSink {
             metadata,
             route,
             cancellations,
+            terminal_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completion: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     #[allow(clippy::result_large_err)]
     fn send(&self, result: JobResult) -> Result<(), mpsc::SendError<JobResult>> {
+        use std::sync::atomic::Ordering;
+
         let terminal = result.is_terminal();
+        if self.terminal_sent.load(Ordering::Acquire) {
+            tracing::warn!(
+                job_id = self.metadata.job_id,
+                job_label = self.metadata.label,
+                "suppressing result emitted after terminal event"
+            );
+            return Ok(());
+        }
+        if terminal && self.terminal_sent.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                job_id = self.metadata.job_id,
+                job_label = self.metadata.label,
+                "suppressing duplicate terminal event"
+            );
+            return Ok(());
+        }
         let outcome = if let Some(route) = &self.route {
             route.send(result)
         } else {
@@ -798,9 +825,47 @@ impl ResultSink {
         };
         if terminal {
             self.cancellations.complete(self.metadata.job_id);
+            self.completion.notify_waiters();
         }
         outcome
     }
+
+    async fn completed(&self) {
+        if self
+            .terminal_sent
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.completion.notified().await;
+    }
+}
+
+fn spawn_job_lifecycle_monitor(
+    result_sink: ResultSink,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    let timeout = result_sink
+        .metadata
+        .deadline
+        .saturating_duration_since(std::time::Instant::now());
+    let job_id = result_sink.metadata.job_id;
+    let job_label = result_sink.metadata.label.to_string();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = result_sink.completed() => {}
+            _ = cancellation_token.cancelled() => {
+                let _ = result_sink.send(JobResult::Cancelled { id: job_id });
+            }
+            _ = tokio::time::sleep(timeout) => {
+                let _ = result_sink.send(JobResult::TimedOut {
+                    id: job_id,
+                    job_label,
+                });
+                cancellation_token.cancel();
+            }
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -1197,15 +1262,20 @@ impl Runtime {
                     job,
                     route,
                 } = envelope;
-                if !matches!(&job, Job::Cancel { .. }) {
-                    cancellations_for_loop.register(metadata.job_id);
-                }
+                let cancellation_token = if !matches!(&job, Job::Cancel { .. }) {
+                    Some(cancellations_for_loop.register(metadata.job_id))
+                } else {
+                    None
+                };
                 let result_sink = ResultSink::new(
                     result_tx_clone.clone(),
                     metadata,
                     route,
                     cancellations_for_loop.clone(),
                 );
+                if let Some(token) = cancellation_token {
+                    spawn_job_lifecycle_monitor(result_sink.clone(), token);
+                }
                 let wdog = watchdog_clone.clone();
                 let config_for_tokio: Arc<crate::app::config::AppConfig> = config_holder
                     .lock()
@@ -1248,15 +1318,20 @@ impl Runtime {
                     job,
                     route,
                 } = envelope;
-                if !matches!(&job, Job::Cancel { .. }) {
-                    fast_cancellations_for_loop.register(metadata.job_id);
-                }
+                let cancellation_token = if !matches!(&job, Job::Cancel { .. }) {
+                    Some(fast_cancellations_for_loop.register(metadata.job_id))
+                } else {
+                    None
+                };
                 let result_sink = ResultSink::new(
                     fast_result_tx_clone.clone(),
                     metadata,
                     route,
                     fast_cancellations_for_loop.clone(),
                 );
+                if let Some(token) = cancellation_token {
+                    spawn_job_lifecycle_monitor(result_sink.clone(), token);
+                }
                 let wdog = fast_watchdog_clone.clone();
                 let config_for_tokio: Arc<crate::app::config::AppConfig> = fast_config_holder
                     .lock()
@@ -7792,6 +7867,44 @@ mod tests {
             cancel.job,
             Job::Cancel { id } if id == ticket.metadata().job_id
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_timeout_emits_once_and_suppresses_late_results() {
+        let (tx, rx) = mpsc::channel();
+        let cancellations = CancellationRegistry::new();
+        let mut metadata = JobMetadata::for_job(&Job::Ping);
+        metadata.deadline = std::time::Instant::now() + Duration::from_millis(20);
+        let token = cancellations.register(metadata.job_id);
+        let sink = ResultSink::new(tx, metadata.clone(), None, cancellations);
+        spawn_job_lifecycle_monitor(sink.clone(), token);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(JobResult::TimedOut { id, .. }) if id == metadata.job_id
+        ));
+        sink.send(JobResult::Pong).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cancellation_emits_once_and_suppresses_late_results() {
+        let (tx, rx) = mpsc::channel();
+        let cancellations = CancellationRegistry::new();
+        let metadata = JobMetadata::for_job(&Job::Ping);
+        let token = cancellations.register(metadata.job_id);
+        let sink = ResultSink::new(tx, metadata.clone(), None, cancellations);
+        spawn_job_lifecycle_monitor(sink.clone(), token.clone());
+
+        token.cancel();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(JobResult::Cancelled { id }) if id == metadata.job_id
+        ));
+        sink.send(JobResult::Pong).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]
