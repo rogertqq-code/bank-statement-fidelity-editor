@@ -21,8 +21,6 @@ fn main() {
                 .map(|p| p.join("Resources"))
             {
                 let _ = dotenvy::from_path_override(resources_dir.join(".env"));
-                // Set working directory to Resources so other relative paths work for now
-                let _ = std::env::set_current_dir(&resources_dir);
             }
         }
     }
@@ -62,13 +60,18 @@ fn main() {
         std::process::exit(exit_code::GENERAL);
     }
 
-    // Determine standard app data directory for logs/audit
-    let mut data_dir = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    data_dir.push("BankStatementFidelityEditor");
-    let audit_dir = data_dir.join("audit");
+    let app_paths = match app::paths::AppPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::error!("[PATHS] Failed to initialize platform application root: {error}");
+            std::process::exit(exit_code::IO);
+        }
+    };
 
     // Open Audit Log
-    let audit_log = match app::audit::AuditLog::open(audit_dir.to_str().unwrap_or("audit")) {
+    let audit_log = match app::audit::AuditLog::open(
+        app_paths.audit_dir().to_string_lossy().as_ref(),
+    ) {
         Ok(log) => log,
         Err(e) => {
             tracing::error!("[AUDIT] Failed to open audit log: {}", e);
@@ -77,9 +80,18 @@ fn main() {
     };
 
     // Start Runtime (Unified Worker)
-    let (_runtime, job_tx, job_rx) = app::runtime::Runtime::start(audit_log, config.clone());
+    let (mut runtime, job_tx, job_rx) = app::runtime::Runtime::start(audit_log, config.clone());
 
     // Dispatch to CLI module
     let code = app::cli::run(cli, job_tx, job_rx, config.clone());
-    std::process::exit(code);
+    let shutdown_clean = runtime.shutdown(std::time::Duration::from_secs(5));
+    drop(runtime);
+    drop(_telemetry_guard);
+    drop(_sentry);
+    let final_code = if shutdown_clean || code != 0 {
+        code
+    } else {
+        exit_code::GENERAL
+    };
+    std::process::exit(final_code);
 }
