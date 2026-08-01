@@ -8686,13 +8686,21 @@ mod tests {
         let sink = ResultSink::new(tx, metadata.clone(), None, cancellations);
         spawn_job_lifecycle_monitor(sink.clone(), token);
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        let (terminal, rx) = tokio::task::spawn_blocking(move || {
+            let terminal = rx.recv_timeout(Duration::from_secs(1));
+            (terminal, rx)
+        })
+        .await
+        .unwrap();
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)),
+            terminal,
             Ok(JobResult::TimedOut { id, .. }) if id == metadata.job_id
         ));
         sink.send(JobResult::Pong).unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        let late = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert!(late.is_err());
     }
 
     #[tokio::test]
@@ -8705,13 +8713,21 @@ mod tests {
         spawn_job_lifecycle_monitor(sink.clone(), token.clone());
 
         token.cancel();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (terminal, rx) = tokio::task::spawn_blocking(move || {
+            let terminal = rx.recv_timeout(Duration::from_secs(1));
+            (terminal, rx)
+        })
+        .await
+        .unwrap();
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)),
+            terminal,
             Ok(JobResult::Cancelled { id }) if id == metadata.job_id
         ));
         sink.send(JobResult::Pong).unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        let late = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert!(late.is_err());
     }
 
     #[test]
