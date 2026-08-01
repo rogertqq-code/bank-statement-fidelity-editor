@@ -1796,38 +1796,18 @@ impl AppModals for MyApp {
                         .on_hover_text("Discard edits and re-read the current environment")
                         .clicked()
                     {
-                        let _ = dotenvy::dotenv_override();
-                        let new_config = crate::app::config::AppConfig::from_env().unwrap_or_default();
-                        self.edit_gemini_api_key = new_config.gemini_api_key.clone().unwrap_or_default();
-
-                        if let Some(doc) = &new_config.document_ai {
-                            self.edit_docai_project_id = doc.project_id.clone();
-                            self.edit_docai_location = doc.location.clone();
-                            self.edit_docai_processor_id = doc.processor_id.clone();
-                            self.edit_docai_service_account = doc.service_account_path.clone();
-                            self.edit_docai_api_key = doc.api_key.clone();
+                        if let Err(error) = self.job_tx.send(Job::ReloadConfig) {
+                            self.toast(
+                                ToastKind::Error,
+                                format!("Could not request configuration reload: {error}"),
+                            );
                         } else {
-                            self.edit_docai_project_id.clear();
-                            self.edit_docai_location = "us".to_string();
-                            self.edit_docai_processor_id.clear();
-                            self.edit_docai_service_account.clear();
-                            self.edit_docai_api_key.clear();
+                            self.in_flight += 1;
+                            self.toast(
+                                ToastKind::Info,
+                                "Reloading and validating configuration...",
+                            );
                         }
-
-                        self.edit_pymupdf_pro_key = new_config.pymupdf_pro_key.clone().unwrap_or_default();
-                        self.edit_gemini_use_vertex = matches!(new_config.gemini_auth_mode, crate::app::config::GeminiAuthMode::Vertex);
-                        self.edit_llamaparse_api_key = new_config.llamaparse_api_key.clone().unwrap_or_default();
-                        self.edit_pdfrest_api_key = new_config.pdfrest_api_key.clone().unwrap_or_default();
-                        self.edit_lipi_api_key = new_config.lipi_api_key.clone().unwrap_or_default();
-                        self.edit_vision_api_key = new_config.vision_api_key.clone().unwrap_or_default();
-                        self.edit_groq_api_key = new_config.groq_api_key.clone().unwrap_or_default();
-                        self.edit_openrouter_api_key = new_config.openrouter_api_key.clone().unwrap_or_default();
-                        self.edit_openrouter_model = new_config.openrouter_model.clone();
-                        self.edit_mistral_api_key = new_config.mistral_api_key.clone().unwrap_or_default();
-                        self.edit_mistral_model = new_config.mistral_model.clone();
-                        self.edit_mindee_api_key = new_config.mindee_api_key.clone().unwrap_or_default();
-                        self.edit_applitools_api_key = new_config.applitools_api_key.clone().unwrap_or_default();
-                        self.toast(ToastKind::Info, "Reloaded keys from environment");
                     }
                     if ui
                         .button("🧪 Test Connections")
@@ -1841,26 +1821,45 @@ impl AppModals for MyApp {
                     }
                 });
 
-                // Live credential status reported by the runtime after the last
-                // Save & apply (Job::ReloadConfig -> JobResult::ConfigReloaded).
+                // Live capability status from the atomically applied runtime
+                // configuration generation. “Configured” is intentionally
+                // distinct from a locally verified “Ready” dependency.
                 ui.add_space(4.0);
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    let mark = |ok: bool| if ok { "✓" } else { "✗" };
-                    ui.small(format!("Doc AI {}", mark(self.api_availability.document_ai)));
+                    use crate::app::capabilities::{Capability, CapabilityState};
+                    let show = |ui: &mut egui::Ui, label: &str, capability: Capability| {
+                        let status = self.capability_registry.status(capability);
+                        let (mark, state, reason) = status.map_or(
+                            ("✗", "Unavailable", "Capability was not probed"),
+                            |status| match status.state {
+                                CapabilityState::Ready => {
+                                    ("✓", "Ready", status.reason.as_str())
+                                }
+                                CapabilityState::Configured => {
+                                    ("◐", "Configured", status.reason.as_str())
+                                }
+                                CapabilityState::Unavailable => {
+                                    ("✗", "Unavailable", status.reason.as_str())
+                                }
+                            },
+                        );
+                        ui.small(format!("{label} {mark} {state}"))
+                            .on_hover_text(reason);
+                    };
+                    show(ui, "Doc AI", Capability::DocumentAi);
                     ui.separator();
-                    ui.small(format!("Gemini {}", mark(self.api_availability.gemini_api_key || self.api_availability.gemini_vertex)));
+                    show(ui, "Gemini", Capability::Gemini);
                     ui.separator();
-                    ui.small(format!("Pro {}", mark(self.api_availability.pymupdf_pro)));
+                    show(ui, "Pro", Capability::PyMuPdfPro);
                     ui.separator();
+                    show(ui, "LlamaParse", Capability::LlamaParse);
                     ui.separator();
-                    ui.small(format!("LlamaParse {}", mark(self.api_availability.llamaparse)));
+                    show(ui, "pdfRest", Capability::PdfRest);
                     ui.separator();
-                    ui.small(format!("pdfRest {}", mark(self.api_availability.pdfrest)));
+                    show(ui, "Vision AI", Capability::VisionAi);
                     ui.separator();
-                    ui.small(format!("Vision AI {}", mark(self.api_availability.vision_ai)));
-                    ui.separator();
-                    ui.small(format!("Offline {}", mark(true)));
+                    show(ui, "Python", Capability::PythonPipeline);
                 });
 
                 // Render the results of the active `Test Connections` job

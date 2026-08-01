@@ -458,6 +458,7 @@ impl ConfigManager {
     }
 
     pub fn reload_from_env(&self) -> ConfigResult<ConfigSnapshot> {
+        let _ = dotenvy::dotenv_override();
         AppConfig::from_env().map(|config| self.replace(config))
     }
 }

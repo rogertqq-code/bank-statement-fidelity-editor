@@ -626,6 +626,45 @@ impl MyApp {
     /// Keys are upserted into `.env` (existing lines replaced in place,
     /// missing ones appended). Empty buffers remove the override from the live
     /// environment so a cleared field truly disables that credential.
+    pub(crate) fn sync_credential_editors_from_config(
+        &mut self,
+        config: &crate::app::config::AppConfig,
+    ) {
+        self.edit_gemini_api_key = config.gemini_api_key.clone().unwrap_or_default();
+        if let Some(document_ai) = &config.document_ai {
+            self.edit_docai_project_id = document_ai.project_id.clone();
+            self.edit_docai_location = document_ai.location.clone();
+            self.edit_docai_processor_id = document_ai.processor_id.clone();
+            self.edit_docai_service_account = document_ai.service_account_path.clone();
+            self.edit_docai_api_key = document_ai.api_key.clone();
+        } else {
+            self.edit_docai_project_id.clear();
+            self.edit_docai_location = "us".to_string();
+            self.edit_docai_processor_id.clear();
+            self.edit_docai_service_account.clear();
+            self.edit_docai_api_key.clear();
+        }
+        self.edit_pymupdf_pro_key = config.pymupdf_pro_key.clone().unwrap_or_default();
+        self.edit_gemini_use_vertex = matches!(
+            config.gemini_auth_mode,
+            crate::app::config::GeminiAuthMode::Vertex
+        );
+        self.edit_llamaparse_api_key = config.llamaparse_api_key.clone().unwrap_or_default();
+        self.edit_pdfrest_api_key = config.pdfrest_api_key.clone().unwrap_or_default();
+        self.edit_lipi_api_key = config.lipi_api_key.clone().unwrap_or_default();
+        self.edit_vision_api_key = config.vision_api_key.clone().unwrap_or_default();
+        self.edit_groq_api_key = config.groq_api_key.clone().unwrap_or_default();
+        self.edit_openrouter_api_key = config.openrouter_api_key.clone().unwrap_or_default();
+        self.edit_openrouter_model = config.openrouter_model.clone();
+        self.edit_mistral_api_key = config.mistral_api_key.clone().unwrap_or_default();
+        self.edit_mistral_model = config.mistral_model.clone();
+        self.edit_mindee_api_key = config.mindee_api_key.clone().unwrap_or_default();
+        self.edit_applitools_api_key = config.applitools_api_key.clone().unwrap_or_default();
+        self.edit_engine_mode = config.engine_mode;
+        self.settings.ai_provider = config.ai_provider;
+        self.settings.interactive_fallbacks = config.interactive_fallbacks;
+    }
+
     pub fn save_credentials(&mut self) {
         // (env var name, value) pairs to upsert.
         let pairs: Vec<(&str, String)> = vec![
@@ -1728,6 +1767,7 @@ impl MyApp {
                 self.status = format!("Configuration generation {generation} applied: {summary}");
                 // Refresh every GUI consumer from the exact immutable runtime
                 // generation instead of independently re-reading process state.
+                self.sync_credential_editors_from_config(&config);
                 let fresh_avail = config.detect_availability();
                 fresh_avail.log_summary();
                 self.api_availability = fresh_avail;
