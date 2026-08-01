@@ -118,6 +118,13 @@ jobs:
       - name: Python production-bridge smoke
         run: python python/smoke_test.py
 
+      - name: Python protocol contract and fixture parity
+        env:
+          PYTHONPATH: python
+        run: |
+          python scripts/generate_python_protocol_fixtures.py --check
+          python -m unittest -v python.test_bridge_protocol
+
       - name: Compile every host target
         run: cargo check --locked --all-targets --message-format=short
 
