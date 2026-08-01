@@ -71,6 +71,8 @@ pub struct PythonWorkerHandshake {
     pub ready: bool,
     pub bridge_error_class: Option<String>,
     pub pymupdf_version: Option<String>,
+    pub pymupdf_pro_version: Option<String>,
+    pub pro_version_compatible: bool,
     pub pro_package_available: bool,
     pub pro_import_error_class: Option<String>,
     pub operations: Vec<String>,

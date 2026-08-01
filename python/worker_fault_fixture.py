@@ -31,6 +31,8 @@ def handshake() -> dict[str, object]:
         "ready": True,
         "bridge_error_class": None,
         "pymupdf_version": "fault-fixture",
+        "pymupdf_pro_version": None,
+        "pro_version_compatible": False,
         "pro_package_available": False,
         "pro_import_error_class": None,
         "operations": list(OPERATIONS),

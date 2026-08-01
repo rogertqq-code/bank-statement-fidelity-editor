@@ -167,6 +167,8 @@ jobs:
           cache-dependency-path: requirements-pro.txt
       - name: Install pinned base and Pro packages
         run: python -m pip install --requirement requirements-pro.txt
+      - name: Verify exact core and Pro runtime versions
+        run: python python/verify_runtime_versions.py
       - name: Run production-bridge smoke with Pro package present
         run: python python/smoke_test.py
 
@@ -195,6 +197,8 @@ jobs:
           cache-dependency-path: requirements-pro.txt
       - name: Install pinned Python and PyMuPDF Pro runtime
         run: python -m pip install --requirement requirements-pro.txt
+      - name: Verify exact core and Pro runtime versions
+        run: python python/verify_runtime_versions.py
       - name: Select Python for PyO3
         shell: bash
         run: |

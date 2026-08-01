@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import importlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -69,7 +70,9 @@ class WorkerRuntime:
 
     def handshake(self) -> dict[str, Any]:
         pymupdf_version = None
+        pymupdf_pro_version = None
         pro_available = False
+        pro_version_compatible = False
         pro_error_class = None
         if self.bridge is not None:
             version = getattr(self.bridge.pymupdf, "version", None)
@@ -83,6 +86,19 @@ class WorkerRuntime:
             pro_error = getattr(self.bridge, "_PYMUPDF_PRO_IMPORT_ERROR", None)
             if pro_error is not None:
                 pro_error_class = type(pro_error).__name__
+            try:
+                pymupdf_pro_version = importlib.metadata.version("PyMuPDFPro")
+            except importlib.metadata.PackageNotFoundError:
+                pymupdf_pro_version = None
+            pro_version_compatible = bool(
+                pro_available
+                and pymupdf_version
+                and pymupdf_pro_version
+                and pymupdf_version == pymupdf_pro_version
+            )
+            if pro_available and not pro_version_compatible:
+                pro_available = False
+                pro_error_class = "PyMuPDFProVersionMismatch"
         return {
             "event": "handshake",
             "protocol_version": PROTOCOL_VERSION,
@@ -92,6 +108,8 @@ class WorkerRuntime:
             "ready": self.bridge is not None,
             "bridge_error_class": self.bridge_error_class,
             "pymupdf_version": pymupdf_version,
+            "pymupdf_pro_version": pymupdf_pro_version,
+            "pro_version_compatible": pro_version_compatible,
             "pro_package_available": pro_available,
             "pro_import_error_class": pro_error_class,
             "operations": list(OPERATIONS),
