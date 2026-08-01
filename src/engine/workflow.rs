@@ -95,6 +95,252 @@ pub enum WorkflowStage {
     OfflineFallbackWarning,
 }
 
+/// Payload-free identity used for transition policy, telemetry, and exhaustive tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WorkflowStateKind {
+    Idle,
+    Parsing,
+    Editing,
+    Previewing,
+    Rendering,
+    Validating,
+    FinalChecking,
+    Complete,
+    Failed,
+    FontCoverageWarning,
+    VisualFidelityWarning,
+    VisualComparisonActive,
+    ImbalanceCorrectionWarning,
+    OfflineFallbackWarning,
+}
+
+/// The only events allowed to change the authoritative workflow state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowEvent {
+    Reset,
+    StartParsing,
+    ParseAccepted(ParseValidation),
+    PreviewBuilt(BalancePreview),
+    StartRendering {
+        attempt: u32,
+    },
+    StartValidation(VisualAttempt),
+    StartFinalCheck,
+    Complete(WorkflowOutcome),
+    Fail(WorkflowFailure),
+    RequireFontCoverage {
+        missing_chars: Vec<char>,
+    },
+    RequireVisualFidelity {
+        score: f64,
+        threshold: f64,
+        attempt: u32,
+        is_borderline: bool,
+    },
+    ShowVisualComparison {
+        images: Vec<(String, Vec<u8>)>,
+    },
+    RequireImbalanceCorrection {
+        imbalance: Decimal,
+        proposed_changes: Vec<crate::engine::model::ProposedChange>,
+    },
+    RequireOfflineFallback,
+    ResumePreview(BalancePreview),
+    RestoreEditing(ParseValidation),
+}
+
+impl WorkflowEvent {
+    pub fn from_stage(stage: WorkflowStage) -> Self {
+        match stage {
+            WorkflowStage::Idle => Self::Reset,
+            WorkflowStage::Parsing => Self::StartParsing,
+            WorkflowStage::Editing(validation) => Self::ParseAccepted(validation),
+            WorkflowStage::Previewing(preview) => Self::PreviewBuilt(preview),
+            WorkflowStage::Rendering { attempt } => Self::StartRendering { attempt },
+            WorkflowStage::Validating(attempt) => Self::StartValidation(attempt),
+            WorkflowStage::FinalChecking => Self::StartFinalCheck,
+            WorkflowStage::Complete(outcome) => Self::Complete(outcome),
+            WorkflowStage::Failed(failure) => Self::Fail(failure),
+            WorkflowStage::FontCoverageWarning { missing_chars } => {
+                Self::RequireFontCoverage { missing_chars }
+            }
+            WorkflowStage::VisualFidelityWarning {
+                score,
+                threshold,
+                attempt,
+                is_borderline,
+            } => Self::RequireVisualFidelity {
+                score,
+                threshold,
+                attempt,
+                is_borderline,
+            },
+            WorkflowStage::VisualComparisonActive { images } => {
+                Self::ShowVisualComparison { images }
+            }
+            WorkflowStage::ImbalanceCorrectionWarning {
+                imbalance,
+                proposed_changes,
+            } => Self::RequireImbalanceCorrection {
+                imbalance,
+                proposed_changes,
+            },
+            WorkflowStage::OfflineFallbackWarning => Self::RequireOfflineFallback,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::StartParsing => "start_parsing",
+            Self::ParseAccepted(_) => "parse_accepted",
+            Self::PreviewBuilt(_) => "preview_built",
+            Self::StartRendering { .. } => "start_rendering",
+            Self::StartValidation(_) => "start_validation",
+            Self::StartFinalCheck => "start_final_check",
+            Self::Complete(_) => "complete",
+            Self::Fail(_) => "fail",
+            Self::RequireFontCoverage { .. } => "require_font_coverage",
+            Self::RequireVisualFidelity { .. } => "require_visual_fidelity",
+            Self::ShowVisualComparison { .. } => "show_visual_comparison",
+            Self::RequireImbalanceCorrection { .. } => "require_imbalance_correction",
+            Self::RequireOfflineFallback => "require_offline_fallback",
+            Self::ResumePreview(_) => "resume_preview",
+            Self::RestoreEditing(_) => "restore_editing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("workflow event '{event}' is invalid from state {from:?}")]
+pub struct WorkflowTransitionError {
+    pub from: WorkflowStateKind,
+    pub event: &'static str,
+}
+
+impl WorkflowStage {
+    pub fn kind(&self) -> WorkflowStateKind {
+        match self {
+            Self::Idle => WorkflowStateKind::Idle,
+            Self::Parsing => WorkflowStateKind::Parsing,
+            Self::Editing(_) => WorkflowStateKind::Editing,
+            Self::Previewing(_) => WorkflowStateKind::Previewing,
+            Self::Rendering { .. } => WorkflowStateKind::Rendering,
+            Self::Validating(_) => WorkflowStateKind::Validating,
+            Self::FinalChecking => WorkflowStateKind::FinalChecking,
+            Self::Complete(_) => WorkflowStateKind::Complete,
+            Self::Failed(_) => WorkflowStateKind::Failed,
+            Self::FontCoverageWarning { .. } => WorkflowStateKind::FontCoverageWarning,
+            Self::VisualFidelityWarning { .. } => WorkflowStateKind::VisualFidelityWarning,
+            Self::VisualComparisonActive { .. } => WorkflowStateKind::VisualComparisonActive,
+            Self::ImbalanceCorrectionWarning { .. } => {
+                WorkflowStateKind::ImbalanceCorrectionWarning
+            }
+            Self::OfflineFallbackWarning => WorkflowStateKind::OfflineFallbackWarning,
+        }
+    }
+
+    pub fn apply_event(&mut self, event: WorkflowEvent) -> Result<(), WorkflowTransitionError> {
+        let from = self.kind();
+        let event_name = event.name();
+        let allowed = match (&event, from) {
+            (WorkflowEvent::Reset, _) => true,
+            (WorkflowEvent::Fail(_), WorkflowStateKind::Complete) => false,
+            (WorkflowEvent::Fail(_), _) => true,
+            (
+                WorkflowEvent::StartParsing,
+                WorkflowStateKind::Idle
+                | WorkflowStateKind::Failed
+                | WorkflowStateKind::OfflineFallbackWarning,
+            ) => true,
+            (WorkflowEvent::ParseAccepted(_), WorkflowStateKind::Parsing) => true,
+            (WorkflowEvent::PreviewBuilt(_), WorkflowStateKind::Editing) => true,
+            (
+                WorkflowEvent::StartRendering { .. },
+                WorkflowStateKind::Previewing
+                | WorkflowStateKind::Validating
+                | WorkflowStateKind::FontCoverageWarning
+                | WorkflowStateKind::VisualFidelityWarning
+                | WorkflowStateKind::VisualComparisonActive
+                | WorkflowStateKind::ImbalanceCorrectionWarning,
+            ) => true,
+            (WorkflowEvent::StartValidation(_), WorkflowStateKind::Rendering) => true,
+            (WorkflowEvent::StartFinalCheck, WorkflowStateKind::Validating) => true,
+            (WorkflowEvent::Complete(_), WorkflowStateKind::FinalChecking) => true,
+            (WorkflowEvent::RequireFontCoverage { .. }, WorkflowStateKind::Rendering) => true,
+            (WorkflowEvent::RequireVisualFidelity { .. }, WorkflowStateKind::Validating) => true,
+            (
+                WorkflowEvent::ShowVisualComparison { .. },
+                WorkflowStateKind::Validating | WorkflowStateKind::VisualFidelityWarning,
+            ) => true,
+            (
+                WorkflowEvent::RequireImbalanceCorrection { .. },
+                WorkflowStateKind::Editing | WorkflowStateKind::Previewing,
+            ) => true,
+            (WorkflowEvent::RequireOfflineFallback, WorkflowStateKind::Parsing) => true,
+            (
+                WorkflowEvent::ResumePreview(_),
+                WorkflowStateKind::FontCoverageWarning
+                | WorkflowStateKind::VisualFidelityWarning
+                | WorkflowStateKind::VisualComparisonActive
+                | WorkflowStateKind::ImbalanceCorrectionWarning,
+            ) => true,
+            (
+                WorkflowEvent::RestoreEditing(_),
+                WorkflowStateKind::Idle | WorkflowStateKind::Failed | WorkflowStateKind::Complete,
+            ) => true,
+            _ => false,
+        };
+        if !allowed {
+            return Err(WorkflowTransitionError {
+                from,
+                event: event_name,
+            });
+        }
+
+        *self = match event {
+            WorkflowEvent::Reset => WorkflowStage::Idle,
+            WorkflowEvent::StartParsing => WorkflowStage::Parsing,
+            WorkflowEvent::ParseAccepted(validation) => WorkflowStage::Editing(validation),
+            WorkflowEvent::PreviewBuilt(preview) | WorkflowEvent::ResumePreview(preview) => {
+                WorkflowStage::Previewing(preview)
+            }
+            WorkflowEvent::StartRendering { attempt } => WorkflowStage::Rendering { attempt },
+            WorkflowEvent::StartValidation(attempt) => WorkflowStage::Validating(attempt),
+            WorkflowEvent::StartFinalCheck => WorkflowStage::FinalChecking,
+            WorkflowEvent::Complete(outcome) => WorkflowStage::Complete(outcome),
+            WorkflowEvent::Fail(failure) => WorkflowStage::Failed(failure),
+            WorkflowEvent::RequireFontCoverage { missing_chars } => {
+                WorkflowStage::FontCoverageWarning { missing_chars }
+            }
+            WorkflowEvent::RequireVisualFidelity {
+                score,
+                threshold,
+                attempt,
+                is_borderline,
+            } => WorkflowStage::VisualFidelityWarning {
+                score,
+                threshold,
+                attempt,
+                is_borderline,
+            },
+            WorkflowEvent::ShowVisualComparison { images } => {
+                WorkflowStage::VisualComparisonActive { images }
+            }
+            WorkflowEvent::RequireImbalanceCorrection {
+                imbalance,
+                proposed_changes,
+            } => WorkflowStage::ImbalanceCorrectionWarning {
+                imbalance,
+                proposed_changes,
+            },
+            WorkflowEvent::RequireOfflineFallback => WorkflowStage::OfflineFallbackWarning,
+            WorkflowEvent::RestoreEditing(validation) => WorkflowStage::Editing(validation),
+        };
+        Ok(())
+    }
+}
+
 pub fn is_borderline(score: f64, threshold: f64) -> bool {
     score >= threshold && score <= threshold * 2.5
 }
@@ -1334,5 +1580,237 @@ mod tests {
 
         // Not borderline (exceeds 2.5x threshold)
         assert!(!crate::engine::workflow::is_borderline(0.026, 0.01));
+    }
+
+    fn dummy_visual_attempt() -> VisualAttempt {
+        VisualAttempt {
+            attempt: 1,
+            max_attempts: 3,
+            diff_score: 0.0,
+            threshold: 0.02,
+            only_intended: true,
+            message: "test".into(),
+        }
+    }
+
+    fn dummy_outcome() -> WorkflowOutcome {
+        WorkflowOutcome {
+            final_pdf: std::path::PathBuf::from("output.pdf"),
+            transactions_re_parsed: 1,
+            final_imbalance: Decimal::ZERO,
+            math_valid: true,
+            visual_attempts: 1,
+            completion_summary: "complete".into(),
+        }
+    }
+
+    fn stage_for(kind: WorkflowStateKind) -> WorkflowStage {
+        match kind {
+            WorkflowStateKind::Idle => WorkflowStage::Idle,
+            WorkflowStateKind::Parsing => WorkflowStage::Parsing,
+            WorkflowStateKind::Editing => WorkflowStage::Editing(validation(1.0, 1)),
+            WorkflowStateKind::Previewing => WorkflowStage::Previewing(BalancePreview::default()),
+            WorkflowStateKind::Rendering => WorkflowStage::Rendering { attempt: 1 },
+            WorkflowStateKind::Validating => WorkflowStage::Validating(dummy_visual_attempt()),
+            WorkflowStateKind::FinalChecking => WorkflowStage::FinalChecking,
+            WorkflowStateKind::Complete => WorkflowStage::Complete(dummy_outcome()),
+            WorkflowStateKind::Failed => {
+                WorkflowStage::Failed(WorkflowFailure::Other("failed".into()))
+            }
+            WorkflowStateKind::FontCoverageWarning => WorkflowStage::FontCoverageWarning {
+                missing_chars: vec!['x'],
+            },
+            WorkflowStateKind::VisualFidelityWarning => WorkflowStage::VisualFidelityWarning {
+                score: 0.03,
+                threshold: 0.02,
+                attempt: 1,
+                is_borderline: true,
+            },
+            WorkflowStateKind::VisualComparisonActive => {
+                WorkflowStage::VisualComparisonActive { images: vec![] }
+            }
+            WorkflowStateKind::ImbalanceCorrectionWarning => {
+                WorkflowStage::ImbalanceCorrectionWarning {
+                    imbalance: dec!(1.00),
+                    proposed_changes: vec![],
+                }
+            }
+            WorkflowStateKind::OfflineFallbackWarning => WorkflowStage::OfflineFallbackWarning,
+        }
+    }
+
+    fn all_state_kinds() -> [WorkflowStateKind; 14] {
+        [
+            WorkflowStateKind::Idle,
+            WorkflowStateKind::Parsing,
+            WorkflowStateKind::Editing,
+            WorkflowStateKind::Previewing,
+            WorkflowStateKind::Rendering,
+            WorkflowStateKind::Validating,
+            WorkflowStateKind::FinalChecking,
+            WorkflowStateKind::Complete,
+            WorkflowStateKind::Failed,
+            WorkflowStateKind::FontCoverageWarning,
+            WorkflowStateKind::VisualFidelityWarning,
+            WorkflowStateKind::VisualComparisonActive,
+            WorkflowStateKind::ImbalanceCorrectionWarning,
+            WorkflowStateKind::OfflineFallbackWarning,
+        ]
+    }
+
+    #[test]
+    fn authoritative_workflow_happy_path_is_explicit() -> anyhow::Result<()> {
+        let mut stage = WorkflowStage::Idle;
+        stage.apply_event(WorkflowEvent::StartParsing)?;
+        stage.apply_event(WorkflowEvent::ParseAccepted(validation(1.0, 1)))?;
+        stage.apply_event(WorkflowEvent::PreviewBuilt(BalancePreview::default()))?;
+        stage.apply_event(WorkflowEvent::StartRendering { attempt: 1 })?;
+        stage.apply_event(WorkflowEvent::StartValidation(dummy_visual_attempt()))?;
+        stage.apply_event(WorkflowEvent::StartFinalCheck)?;
+        stage.apply_event(WorkflowEvent::Complete(dummy_outcome()))?;
+        assert_eq!(stage.kind(), WorkflowStateKind::Complete);
+        Ok(())
+    }
+
+    #[test]
+    fn authoritative_workflow_rejects_every_illegal_state_event_pair() {
+        let cases: Vec<(WorkflowEvent, Vec<WorkflowStateKind>, WorkflowStateKind)> = vec![
+            (
+                WorkflowEvent::Reset,
+                all_state_kinds().to_vec(),
+                WorkflowStateKind::Idle,
+            ),
+            (
+                WorkflowEvent::Fail(WorkflowFailure::Other("failed".into())),
+                all_state_kinds()
+                    .into_iter()
+                    .filter(|kind| *kind != WorkflowStateKind::Complete)
+                    .collect(),
+                WorkflowStateKind::Failed,
+            ),
+            (
+                WorkflowEvent::StartParsing,
+                vec![
+                    WorkflowStateKind::Idle,
+                    WorkflowStateKind::Failed,
+                    WorkflowStateKind::OfflineFallbackWarning,
+                ],
+                WorkflowStateKind::Parsing,
+            ),
+            (
+                WorkflowEvent::ParseAccepted(validation(1.0, 1)),
+                vec![WorkflowStateKind::Parsing],
+                WorkflowStateKind::Editing,
+            ),
+            (
+                WorkflowEvent::PreviewBuilt(BalancePreview::default()),
+                vec![WorkflowStateKind::Editing],
+                WorkflowStateKind::Previewing,
+            ),
+            (
+                WorkflowEvent::StartRendering { attempt: 1 },
+                vec![
+                    WorkflowStateKind::Previewing,
+                    WorkflowStateKind::Validating,
+                    WorkflowStateKind::FontCoverageWarning,
+                    WorkflowStateKind::VisualFidelityWarning,
+                    WorkflowStateKind::VisualComparisonActive,
+                    WorkflowStateKind::ImbalanceCorrectionWarning,
+                ],
+                WorkflowStateKind::Rendering,
+            ),
+            (
+                WorkflowEvent::StartValidation(dummy_visual_attempt()),
+                vec![WorkflowStateKind::Rendering],
+                WorkflowStateKind::Validating,
+            ),
+            (
+                WorkflowEvent::StartFinalCheck,
+                vec![WorkflowStateKind::Validating],
+                WorkflowStateKind::FinalChecking,
+            ),
+            (
+                WorkflowEvent::Complete(dummy_outcome()),
+                vec![WorkflowStateKind::FinalChecking],
+                WorkflowStateKind::Complete,
+            ),
+            (
+                WorkflowEvent::RequireFontCoverage {
+                    missing_chars: vec!['x'],
+                },
+                vec![WorkflowStateKind::Rendering],
+                WorkflowStateKind::FontCoverageWarning,
+            ),
+            (
+                WorkflowEvent::RequireVisualFidelity {
+                    score: 0.03,
+                    threshold: 0.02,
+                    attempt: 1,
+                    is_borderline: true,
+                },
+                vec![WorkflowStateKind::Validating],
+                WorkflowStateKind::VisualFidelityWarning,
+            ),
+            (
+                WorkflowEvent::ShowVisualComparison { images: vec![] },
+                vec![
+                    WorkflowStateKind::Validating,
+                    WorkflowStateKind::VisualFidelityWarning,
+                ],
+                WorkflowStateKind::VisualComparisonActive,
+            ),
+            (
+                WorkflowEvent::RequireImbalanceCorrection {
+                    imbalance: dec!(1.00),
+                    proposed_changes: vec![],
+                },
+                vec![WorkflowStateKind::Editing, WorkflowStateKind::Previewing],
+                WorkflowStateKind::ImbalanceCorrectionWarning,
+            ),
+            (
+                WorkflowEvent::RequireOfflineFallback,
+                vec![WorkflowStateKind::Parsing],
+                WorkflowStateKind::OfflineFallbackWarning,
+            ),
+            (
+                WorkflowEvent::ResumePreview(BalancePreview::default()),
+                vec![
+                    WorkflowStateKind::FontCoverageWarning,
+                    WorkflowStateKind::VisualFidelityWarning,
+                    WorkflowStateKind::VisualComparisonActive,
+                    WorkflowStateKind::ImbalanceCorrectionWarning,
+                ],
+                WorkflowStateKind::Previewing,
+            ),
+            (
+                WorkflowEvent::RestoreEditing(validation(1.0, 1)),
+                vec![
+                    WorkflowStateKind::Idle,
+                    WorkflowStateKind::Failed,
+                    WorkflowStateKind::Complete,
+                ],
+                WorkflowStateKind::Editing,
+            ),
+        ];
+
+        for (event, allowed_from, expected_to) in cases {
+            for kind in all_state_kinds() {
+                let mut stage = stage_for(kind);
+                let before = stage.clone();
+                let result = stage.apply_event(event.clone());
+                let should_succeed = allowed_from.contains(&kind);
+                assert_eq!(
+                    result.is_ok(),
+                    should_succeed,
+                    "event '{}' from {kind:?}",
+                    event.name()
+                );
+                if should_succeed {
+                    assert_eq!(stage.kind(), expected_to);
+                } else {
+                    assert_eq!(stage, before, "illegal transition mutated state");
+                }
+            }
+        }
     }
 }

@@ -10,7 +10,6 @@ pub mod env_spec;
 pub mod error;
 pub mod fontcache;
 pub mod gui;
-pub mod gui_state;
 pub mod modals;
 pub mod notify;
 pub mod paths;
@@ -20,7 +19,3 @@ pub mod server;
 pub mod telemetry;
 pub mod theme;
 pub mod watchdog;
-pub mod workflow_state;
-
-#[cfg(test)]
-pub mod e2e_tests;

@@ -22,5 +22,6 @@ pub use engine::verification::{verify_edit, VerificationReport};
 pub use engine::verification_v2::{EnhancedVerificationReport, VisualFidelityEngine};
 
 pub use app::config_v2::EnhancedConfig;
-pub use app::gui_state::GuiState;
-pub use app::workflow_state::{WorkflowError, WorkflowStage, WorkflowStateMachine};
+pub use engine::workflow::{
+    WorkflowEvent, WorkflowFailure, WorkflowStage, WorkflowStateKind, WorkflowTransitionError,
+};

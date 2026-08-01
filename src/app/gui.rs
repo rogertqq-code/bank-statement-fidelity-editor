@@ -731,6 +731,27 @@ impl MyApp {
         }
     }
 
+    fn apply_workflow_event(&mut self, event: crate::engine::workflow::WorkflowEvent) -> bool {
+        let event_name = event.name();
+        match self.workflow_stage.apply_event(event) {
+            Ok(()) => {
+                self.status = format!("Workflow: {}", self.workflow_stage.label());
+                true
+            }
+            Err(error) => {
+                let message = format!("Rejected workflow event '{event_name}': {error}");
+                tracing::error!(
+                    event = event_name,
+                    state = ?self.workflow_stage.kind(),
+                    "{message}"
+                );
+                self.status = message.clone();
+                self.toast(ToastKind::Error, message);
+                false
+            }
+        }
+    }
+
     /// Pair edited PDFs with their corresponding originals for batch verification.
     ///
     /// Convention: an edited file is named `<base>_edited.pdf`. Its original is
@@ -1774,26 +1795,23 @@ impl MyApp {
 
             // ---- Multi-stage workflow ----------------------------------
             JobResult::WorkflowStageChanged { stage } => {
-                self.status = format!("Workflow: {}", stage.label());
-                self.workflow_stage = stage.clone();
-                match &stage {
+                let opens_modal = matches!(
+                    &stage,
                     crate::engine::workflow::WorkflowStage::VisualFidelityWarning { .. }
-                    | crate::engine::workflow::WorkflowStage::ImbalanceCorrectionWarning {
-                        ..
-                    }
-                    | crate::engine::workflow::WorkflowStage::FontCoverageWarning { .. }
-                    | crate::engine::workflow::WorkflowStage::OfflineFallbackWarning => {
-                        self.active_modal = ActiveModal::WorkflowHitl;
-                    }
-                    _ => {}
+                        | crate::engine::workflow::WorkflowStage::ImbalanceCorrectionWarning { .. }
+                        | crate::engine::workflow::WorkflowStage::FontCoverageWarning { .. }
+                        | crate::engine::workflow::WorkflowStage::OfflineFallbackWarning
+                );
+                let event = crate::engine::workflow::WorkflowEvent::from_stage(stage);
+                if self.apply_workflow_event(event) && opens_modal {
+                    self.active_modal = ActiveModal::WorkflowHitl;
                 }
             }
             JobResult::VisualAlternativesReady(images) => {
-                let stage =
-                    crate::engine::workflow::WorkflowStage::VisualComparisonActive { images };
-                self.status = format!("Workflow: {}", stage.label());
-                self.workflow_stage = stage;
-                self.active_modal = ActiveModal::WorkflowHitl;
+                let event = crate::engine::workflow::WorkflowEvent::ShowVisualComparison { images };
+                if self.apply_workflow_event(event) {
+                    self.active_modal = ActiveModal::WorkflowHitl;
+                }
             }
             JobResult::WorkflowParseValidated {
                 validation,
@@ -1904,7 +1922,7 @@ impl MyApp {
                 }
 
                 self.toast(ToastKind::Error, &msg);
-                self.workflow_stage = crate::engine::workflow::WorkflowStage::Failed(failure);
+                self.apply_workflow_event(crate::engine::workflow::WorkflowEvent::Fail(failure));
 
                 let dir = std::path::PathBuf::from("audit/error_reports");
                 let _ = std::fs::create_dir_all(&dir);
@@ -3867,7 +3885,10 @@ impl MyApp {
                         self.dispatch_confirm_and_render(true, true); // true for deep, true for ignore_font_coverage
                     }
                     if ui.button("Cancel Edits").clicked() {
-                        self.workflow_stage = crate::engine::workflow::WorkflowStage::Previewing(self.workflow_preview.clone().unwrap_or_default());
+                        let preview = self.workflow_preview.clone().unwrap_or_default();
+                        self.apply_workflow_event(
+                            crate::engine::workflow::WorkflowEvent::ResumePreview(preview),
+                        );
                     }
                 });
             }
@@ -5080,10 +5101,12 @@ impl MyApp {
         self.workflow_preview = None;
         self.workflow_visual = None;
         self.workflow_outcome = None;
-        self.workflow_stage = match draft.validation.clone() {
-            Some(v) => crate::engine::workflow::WorkflowStage::Editing(v),
-            None => crate::engine::workflow::WorkflowStage::Idle,
-        };
+        self.apply_workflow_event(crate::engine::workflow::WorkflowEvent::Reset);
+        if let Some(validation) = draft.validation.clone() {
+            self.apply_workflow_event(crate::engine::workflow::WorkflowEvent::RestoreEditing(
+                validation,
+            ));
+        }
         self.workflow_dirty = false;
 
         // Trigger a render of the PDF.
